@@ -1,0 +1,33 @@
+{
+  "name": "crypto-influencer-tracker",
+  "version": "1.0.0",
+  "description": "A project to track cryptocurrency prices based on influencer tweets and calculate maximum gains.",
+  "main": "src/app.ts",
+  "scripts": {
+    "start": "ts-node src/app.ts",
+    "test": "jest"
+  },
+  "dependencies": {
+    "express": "^4.17.1",
+    "axios": "^0.21.1",
+    "dotenv": "^10.0.0",
+    "mongoose": "^5.10.9",
+    "typescript": "^4.1.2"
+  },
+  "devDependencies": {
+    "ts-node": "^9.1.1",
+    "jest": "^26.6.3",
+    "ts-jest": "^26.5.0",
+    "@types/jest": "^26.0.0",
+    "@types/node": "^14.14.31"
+  },
+  "keywords": [
+    "cryptocurrency",
+    "price tracking",
+    "influencer",
+    "tweets",
+    "max gain"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}

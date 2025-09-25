@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Crypto Sentiment Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg:#0b1220; --panel:#121a2b; --card:#141f36; --txt:#e7eefc; --muted:#9fb1d1;
+      --pos:#27c281; --neg:#ff5c5c; --neu:#6ea8fe; --border:#233152; --accent:#6ea8fe;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto}
+    header{padding:18px 24px;border-bottom:1px solid #1f2a44;background:var(--panel);position:sticky;top:0;z-index:10}
+    header h1{margin:0;font-size:18px}
+    .wrap{max-width:1280px;margin:24px auto;padding:0 16px}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .row-3{display:grid;grid-template-columns:2fr 1fr 1fr;gap:16px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
+    .muted{color:var(--muted)} .num{font-weight:700;font-size:20px}
+    .tiny{font-size:12px}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th,td{padding:8px 10px;border-bottom:1px solid #213050}
+    th{text-align:left;color:#bcd0f7}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:600;font-size:12px}
+    .pospill{background:#123726;color:#7ff0b9}
+    .negpill{background:#3a1515;color:#ffb3b3}
+    .neupill{background:#1b2947;color:#cfe2ff}
+    input,select,button{background:#0f1627;color:var(--txt);border:1px solid #283a63;border-radius:8px;padding:8px 10px}
+    button{cursor:pointer}
+    .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+    .grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+    .err{background:#3a1515;border:1px solid #6a2b2b;color:#ffb3b3;padding:8px 10px;border-radius:8px}
+    .badge{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:10px;padding:4px 8px}
+    .gradeSplus{background:linear-gradient(90deg,#0c2a18,#123726);color:#7ff0b9;border-color:#1e5a3c}
+    .gradeS{background:#0f223a;color:#9fd1ff;border-color:#244a7a}
+    .gradeA{background:#1c253d;color:#cfe2ff;border-color:#324164}
+    .gradeB{background:#2a223b;color:#d8bfff;border-color:#503d78}
+    .gradeC{background:#3a1515;color:#ffb3b3;border-color:#6a2b2b}
+    .streak{font-weight:700;padding:2px 8px;border-radius:999px}
+    .streak1{background:#253049}
+    .streak3{background:#2d3f2e;color:#8be39d}
+    .streak5{background:#3a2a10;color:#ffcf6e}
+    .bar{height:8px;background:#1b2947;border-radius:6px;overflow:hidden}
+    .bar>span{display:block;height:100%;background:linear-gradient(90deg,#1cc286,#2ee6a1)}
+    .ghost{opacity:.8}
+    .btnrow{display:flex;gap:8px}
+    .btn{padding:6px 10px;border-radius:6px;border:1px solid #2a3d64;background:#0f1627}
+    .btn:hover{border-color:#3e5a94}
+    .emoji{font-size:16px}
+    .link{color:var(--accent);text-decoration:none}
+    @media(max-width:1100px){ .row,.row-3{grid-template-columns:1fr} }
+  </style>
+</head>
+<body>
+<header>
+  <h1>📊 Crypto Sentiment Dashboard <span class="muted tiny" id="envTag">local</span></h1>
+</header>
+
+<div class="wrap">
+
+  <!-- Controls -->
+  <div class="card">
+    <div class="controls">
+      <label>API <input id="apiBase" value="http://127.0.0.1:8000" style="min-width:280px"/></label>
+      <label>User @ <input id="userHandle" placeholder="e.g. CredibleCrypto"/></label>
+      <button id="btnLoadUser">Load User Profile & Tweets</button>
+      <span class="muted" id="health">checking…</span>
+    </div>
+  </div>
+
+  <!-- Top row: User Profile Facing + Browsing Recent Tweets -->
+  <div class="row" style="margin-top:16px">
+    <!-- User Profile Facing -->
+    <div class="card" id="userProfileCard">
+      <h3 style="margin:0 0 8px">User Profile Facing (Leaderboards etc)</h3>
+      <div class="grid-4">
+        <div class="card ghost"><div class="muted">Profit Grade</div><div id="profGrade" class="num">—</div></div>
+        <div class="card ghost"><div class="muted">Points</div><div id="points" class="num">—</div></div>
+        <div class="card ghost"><div class="muted">Results</div><div id="resultsPct" class="num">—</div></div>
+        <div class="card ghost"><div class="muted">Rank</div><div id="rankNum" class="num">—</div></div>
+      </div>
+      <div style="margin-top:12px">
+        <span class="muted">Streak</span>
+        <span id="streakBadge" class="streak streak1">0</span>
+        <span id="streakHint" class="muted tiny">(color/🔥 changes with size)</span>
+      </div>
+    </div>
+
+    <!-- Browsing Recent Tweets -->
+    <div class="card" id="recentTweetsCard">
+      <h3 style="margin:0 0 8px">Browsing Recent Tweets</h3>
+      <div id="recentList"></div>
+    </div>
+  </div>
+
+  <!-- All Endpoints style table -->
+  <div class="card" style="margin-top:16px">
+    <h3 style="margin:0 0 8px">All Endpoints</h3>
+    <div class="controls">
+      <label>Hours <input id="aeHours" type="number" min="1" max="720" value="168"/></label>
+      <label>ε % <input id="aeEps" type="number" step="0.01" value="2"/></label>
+      <label>Min calls <input id="aeMin" type="number" min="1" value="3"/></label>
+      <label>TopN <input id="aeTopN" type="number" min="1" max="200" value="20"/></label>
+      <button id="btnAllEp">Refresh</button>
+    </div>
+    <table id="allEpTable"><thead>
+      <tr>
+        <th>X @</th><th>Bull or Bear?</th><th>Win Rate</th><th>Total Tweets</th><th>Signal/Noise</th>
+        <th>Results %</th><th>Ticker</th><th>Direction</th><th>How Long Ago</th><th>Tweet Performance</th><th>Copy</th><th>Counter</th>
+      </tr>
+    </thead><tbody></tbody></table>
+  </div>
+
+  <!-- Existing analytics row -->
+  <div class="row-3" style="margin-top:16px">
+    <!-- Summary -->
+    <div class="card">
+      <div class="controls">
+        <label>Summary hours <input id="hours" type="number" min="1" max="720" value="120" /></label>
+        <label>ε (zero band, %) <input id="eps" type="number" step="0.01" value="2" /></label>
+        <button id="btnSummary">Refresh Summary</button>
+      </div>
+      <div id="overall" style="margin-top:12px"></div>
+      <div class="row" style="margin-top:12px">
+        <div class="card">
+          <h4 style="margin:0 0 6px">By Sentiment</h4>
+          <table id="sentTable"><thead>
+            <tr><th>Sentiment</th><th>Avg Perf (%)</th><th>Count</th></tr>
+          </thead><tbody></tbody></table>
+        </div>
+        <div class="card">
+          <h4 style="margin:0 0 6px">Top Tickers</h4>
+          <table id="topTable"><thead>
+            <tr><th>Ticker</th><th>S</th><th>Avg Perf (%)</th><th>Tweets</th></tr>
+          </thead><tbody></tbody></table>
+        </div>
+      </div>
+      <div id="sumErr" style="margin-top:8px"></div>
+    </div>
+
+    <!-- Horizon -->
+    <div class="card">
+      <div class="controls">
+        <label>Horizon (h) <input id="h" type="number" min="1" max="168" value="24" /></label>
+        <label>εh (%, close) <input id="epsH" type="number" step="0.001" value="0.02" /></label>
+        <button id="btnHorizon">Refresh Horizon</button>
+      </div>
+      <div id="dist" style="margin-top:12px"></div>
+      <div class="row" style="margin-top:12px">
+        <div class="card">
+          <h4 style="margin:0 0 6px">Winners</h4>
+          <table id="winTable"><thead>
+            <tr><th>User</th><th>Ticker</th><th>S</th><th>ret%</th><th>MFE%</th><th>MAE%</th><th>α%</th></tr>
+          </thead><tbody></tbody></table>
+        </div>
+        <div class="card">
+          <h4 style="margin:0 0 6px">Losers</h4>
+          <table id="loseTable"><thead>
+            <tr><th>User</th><th>Ticker</th><th>S</th><th>ret%</th><th>MFE%</th><th>MAE%</th><th>α%</th></tr>
+          </thead><tbody></tbody></table>
+        </div>
+      </div>
+      <div id="horErr" style="margin-top:8px"></div>
+    </div>
+
+    <!-- Best calls -->
+    <div class="card">
+      <div class="controls">
+        <label>Best limit <input id="bestLimit" type="number" min="1" max="200" value="20" /></label>
+        <label>Sentiment
+          <select id="bestSent">
+            <option value="">All</option>
+            <option value="bullish">bullish</option>
+            <option value="bearish">bearish</option>
+            <option value="neutral">neutral</option>
+          </select>
+        </label>
+        <button id="btnBest">Refresh Best</button>
+      </div>
+      <table id="bestTable"><thead>
+        <tr><th>User</th><th>Ticker</th><th>S</th><th>Δ%</th><th>Entry → Now</th><th>Tweet</th></tr>
+      </thead><tbody></tbody></table>
+      <div id="bestErr" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+  <p class="muted" style="text-align:center;margin:24px 0">
+    API: <code id="apiBaseText">http://127.0.0.1:8000</code> · <span id="apiHealth">checking…</span>
+  </p>
+</div>
+
+<script>
+(function(){
+  const $ = sel => document.querySelector(sel);
+  const el = id => document.getElementById(id);
+  const fmt = (x,d=2)=> (x==null||Number.isNaN(x)) ? '—' : Number(x).toFixed(d);
+  const pct = (x,d=2)=> (x==null||Number.isNaN(x)) ? '—' : `${Number(x).toFixed(d)}%`;
+  const pill = s => {
+    const span = document.createElement('span');
+    const m = (s||'').toLowerCase();
+    span.className = 'pill ' + (m==='bullish'?'pospill':m==='bearish'?'negpill':'neupill');
+    span.textContent = s || '—';
+    return span;
+  };
+  const gradeBadgeClass = g => g==='S+'?'gradeSplus':g==='S'?'gradeS':g==='A'?'gradeA':g==='B'?'gradeB':'gradeC';
+  const streakClass = n => n>=5?'streak5':n>=3?'streak3':'streak1';
+  const dirFromSent = s => s==='bullish'?'long':(s==='bearish'?'short':'none');
+
+  function setAPIBase() {
+    const base = el('apiBase').value.trim() || 'http://127.0.0.1:8000';
+    el('apiBaseText').textContent = base;
+    return base;
+  }
+
+  async function checkHealth(){
+    const API = setAPIBase();
+    const out = el('apiHealth');
+    try{
+      const r = await fetch(`${API}/api/health`);
+      const j = await r.json();
+      out.textContent = `OK · db=${j.db}`;
+    }catch(e){
+      out.innerHTML = `<span class="negpill pill">API down</span>`;
+    }
+  }
+
+  // ---------- USER PROFILE & RECENT TWEETS ----------
+  async function loadUser(){
+    const API = setAPIBase();
+    const u = el('userHandle').value.trim();
+    if(!u){ alert('Enter a username (X handle)'); return; }
+
+    // summary
+    try{
+      const r = await fetch(`${API}/api/user/${encodeURIComponent(u)}/summary`);
+      if(!r.ok){ throw new Error('summary not found'); }
+      const j = await r.json();
+
+      // Profit Grade / Points / Results / Rank / Streak
+      el('profGrade').innerHTML = `<span class="badge ${gradeBadgeClass(j.profit_grade||'C')}">${j.profit_grade||'—'}</span>`;
+      el('points').textContent = fmt(j.points, 2);
+      el('resultsPct').textContent = pct(j.results_pct, 2);
+      el('rankNum').textContent = j.rank ?? '—';
+
+      const st = Number(j.streak||0);
+      const sb = el('streakBadge');
+      sb.textContent = st;
+      sb.className = `streak ${streakClass(st)}`;
+      if(st>=5){ el('streakHint').innerHTML = `<span class="emoji">🔥</span> hot streak`; }
+      else if(st>=3){ el('streakHint').textContent = 'good streak'; }
+      else{ el('streakHint').textContent = '—'; }
+    }catch(e){
+      // reset
+      el('profGrade').textContent = '—'; el('points').textContent='—'; el('resultsPct').textContent='—'; el('rankNum').textContent='—';
+      const sb = el('streakBadge'); sb.textContent = '0'; sb.className='streak streak1'; el('streakHint').textContent='—';
+    }
+
+    // signals (recent tweets)
+    try{
+      const r2 = await fetch(`${API}/api/user/${encodeURIComponent(u)}/signals?limit=20`);
+      if(!r2.ok){ throw new Error('signals not found'); }
+      const arr = await r2.json();
+
+      const box = el('recentList'); box.innerHTML = '';
+      if(!Array.isArray(arr) || !arr.length){
+        box.innerHTML = `<div class="muted">No recent signals</div>`;
+        return;
+      }
+      arr.forEach(item=>{
+        const wrap = document.createElement('div'); wrap.className='card'; wrap.style.marginBottom='10px';
+
+        const head = document.createElement('div');
+        const aUser = document.createElement('div');
+        aUser.innerHTML = `<strong>User @</strong> ${item.user_handle||u}`;
+        const grade = document.createElement('div');
+        const g = item.profit_grade_single || '—';
+        grade.innerHTML = `<strong>Profit Grade:</strong> <span class="badge ${gradeBadgeClass(g)}">${g}</span>`;
+        head.appendChild(aUser); head.appendChild(grade);
+        head.style.display='flex'; head.style.justifyContent='space-between'; head.style.gap='8px';
+
+        const sig = document.createElement('div');
+        const sid = item.signal_id || '';
+        const link = document.createElement('a'); link.className='link'; link.textContent = `Signal # ${sid.slice(0,8)}`; link.href=`#sig-${sid}`; link.title = sid;
+        sig.appendChild(link);
+
+        const perf = document.createElement('div');
+        perf.innerHTML = `<strong>Tweet Entry Price + (% Change So Far)</strong>: ${fmt(item.entry_price,6)} &nbsp; | &nbsp; ${pct(item.pct_change_now,2)}`;
+
+        const streak = document.createElement('div');
+        streak.innerHTML = `<strong>Win Streak</strong>: ${item.win_streak ?? '—'}`;
+
+        // progress bar
+        const pb = document.createElement('div'); pb.innerHTML = `<strong>Progress</strong>`;
+        const bar = document.createElement('div'); bar.className='bar'; bar.style.marginTop='6px';
+        const span = document.createElement('span');
+        const pnow = Number(item.pct_change_now || 0);
+        const width = Math.max(0, Math.min(100, pnow)); // simple proxy if no ATH/MAE provided
+        span.style.width = `${width}%`;
+        bar.appendChild(span); pb.appendChild(bar);
+
+        const weekly = document.createElement('div');
+        weekly.innerHTML = `<strong>User's Performance This Week Total %</strong>: ${pct(item.user_week_total_pct,2)}`;
+
+        wrap.appendChild(head);
+        wrap.appendChild(sig);
+        wrap.appendChild(perf);
+        wrap.appendChild(streak);
+        wrap.appendChild(pb);
+        wrap.appendChild(weekly);
+        box.appendChild(wrap);
+      });
+    }catch(e){
+      el('recentList').innerHTML = `<div class="err">Failed to load recent tweets</div>`;
+    }
+  }
+
+  // ---------- ALL ENDPOINTS TABLE ----------
+  async function loadAllEndpoints(){
+    const API = setAPIBase();
+    const hours = +el('aeHours').value || 168;
+    const eps = +el('aeEps').value || 2;
+    const minC = +el('aeMin').value || 3;
+    const topn = +el('aeTopN').value || 20;
+
+    const tbody = el('allEpTable').querySelector('tbody');
+    tbody.innerHTML = '';
+
+    try{
+      const r = await fetch(`${API}/api/leaderboard?hours=${hours}&eps=${eps}&min_calls=${minC}&topn=${topn}`);
+      if(!r.ok) throw new Error(r.status);
+      const j = await r.json();
+
+      // Support both shapes:
+      // NEW: array of rows with x_handle, bull_or_bear, win_rate, total_tweets, signal_to_noise, results_pct, ticker, direction, how_long_ago, tweet_performance
+      // LEGACY: { rows: [ { username, hit_rate, tweet_count, ... } ] } → we’ll adapt minimal fields
+      const rows = Array.isArray(j) ? j : (Array.isArray(j.rows) ? j.rows : []);
+      if(!rows.length){
+        tbody.innerHTML = `<tr><td colspan="12" class="muted">No data</td></tr>`;
+        return;
+      }
+
+      rows.forEach(r=>{
+        const tr = document.createElement('tr');
+
+        const xhandle = r.x_handle || r.username || '—';
+        const bullbear = r.bull_or_bear || (r.sentiment ?? '—');
+        const winRate = (typeof r.win_rate === 'number') ? r.win_rate*100 : (typeof r.hit_rate === 'number' ? r.hit_rate : null);
+        const totalTweets = r.total_tweets ?? r.tweet_count ?? '—';
+        const sn = r.signal_to_noise ?? r.signal_noise ?? null;
+        const resPct = r.results_pct ?? null;
+        const ticker = r.ticker ?? '—';
+        const direction = r.direction ?? (bullbear ? dirFromSent(bullbear) : '—');
+        const ago = r.how_long_ago ?? '—';
+        const perf = r.tweet_performance ?? r.avg_perf ?? null;
+
+        const pp = document.createElement('td'); pp.textContent = '@'+xhandle; tr.appendChild(pp);
+        const bb = document.createElement('td'); bb.appendChild(pill(bullbear)); tr.appendChild(bb);
+        const wr = document.createElement('td'); wr.textContent = winRate==null ? '—' : pct(winRate,1); tr.appendChild(wr);
+        const tt = document.createElement('td'); tt.textContent = totalTweets; tr.appendChild(tt);
+        const snr = document.createElement('td'); snr.textContent = sn==null?'—':fmt(sn,2); tr.appendChild(snr);
+        const rp = document.createElement('td'); rp.textContent = resPct==null?'—':fmt(resPct,2); tr.appendChild(rp);
+        const tk = document.createElement('td'); tk.textContent = ticker; tr.appendChild(tk);
+        const dr = document.createElement('td'); dr.textContent = direction; tr.appendChild(dr);
+        const ag = document.createElement('td'); ag.textContent = ago; tr.appendChild(ag);
+        const pf = document.createElement('td'); pf.textContent = perf==null?'—':fmt(perf,2); tr.appendChild(pf);
+
+        // Copy / Counter Buttons (MVP: placeholder)
+        const c1 = document.createElement('td'); const b1 = document.createElement('button'); b1.className='btn'; b1.textContent='Copy'; c1.appendChild(b1); tr.appendChild(c1);
+        const c2 = document.createElement('td'); const b2 = document.createElement('button'); b2.className='btn'; b2.textContent='Counter'; c2.appendChild(b2); tr.appendChild(c2);
+
+        tbody.appendChild(tr);
+      });
+
+    }catch(e){
+      tbody.innerHTML = `<tr><td colspan="12"><div class="err">Failed to load leaderboard: ${e.message||e}</div></td></tr>`;
+    }
+  }
+
+  // ---------- SUMMARY ----------
+  async function loadSummary(){
+    const API = setAPIBase();
+    try{
+      const hours = +el('hours').value || 120;
+      const eps = +el('eps').value || 2;
+      const res = await fetch(`${API}/api/summary?hours=${hours}&eps=${eps}`);
+      if(!res.ok) throw new Error(res.status);
+      const data = await res.json();
+
+      const o = data.overall || {};
+      el('overall').innerHTML = `
+        <div class="grid-3">
+          <div class="card ghost"><div class="muted">Total Tweets</div><div class="num">${o.total_tweets??0}</div></div>
+          <div class="card ghost"><div class="muted">Avg Performance</div><div class="num">${fmt(o.avg_performance,3)}%</div></div>
+          <div class="card ghost"><div class="muted">Hit / Miss / Zero (ε=${fmt(o.eps??eps,2)}%)</div><div class="num">${o.positive??0} / ${o.negative??0} / ${o.zero??0}</div></div>
+        </div>`;
+
+      const stBody = $('#sentTable tbody'); stBody.innerHTML = '';
+      (data.by_sentiment||[]).forEach(r=>{
+        const tr=document.createElement('tr');
+        const s=document.createElement('td'); s.appendChild(pill(r.sentiment)); tr.appendChild(s);
+        tr.appendChild(td(fmt(r.avg_performance,3)+'%')); tr.appendChild(td(r.tweet_count??0));
+        stBody.appendChild(tr);
+      });
+
+      const topBody = $('#topTable tbody'); topBody.innerHTML='';
+      (data.top_tickers||[]).forEach(r=>{
+        const tr=document.createElement('tr');
+        tr.appendChild(td(r.ticker||'—'));
+        const s=document.createElement('td'); s.appendChild(pill(r.sentiment)); tr.appendChild(s);
+        tr.appendChild(td(fmt(r.avg_performance,3)+'%')); tr.appendChild(td(r.tweet_count??0));
+        topBody.appendChild(tr);
+      });
+    }catch(e){
+      el('sumErr').innerHTML = `<div class="err">${e.message||e}</div>`;
+    }
+  }
+  function td(t){ const d=document.createElement('td'); d.textContent=t; return d; }
+
+  // ---------- HORIZON ----------
+  async function loadHorizon(){
+    const API = setAPIBase();
+    try{
+      el('horErr').innerHTML='';
+      const h = +el('h').value || 24;
+      const eps = +el('epsH').value || 0.02;
+      const res = await fetch(`${API}/api/horizon?h=${h}&eps=${eps}`);
+      if(!res.ok) throw new Error(res.status);
+      const data = await res.json();
+
+      const d = data.dist;
+      if(!d){ el('dist').innerHTML = '<span class="muted">No H data</span>'; }
+      else{
+        el('dist').innerHTML = `
+          <div class="grid-3">
+            <div class="card ghost"><div class="muted">Samples</div><div class="num">${d.samples}</div></div>
+            <div class="card ghost"><div class="muted">Hit/Miss/Zero (ε=${fmt(d.eps_pct,2)}%)</div><div class="num">${d.hit} / ${d.miss} / ${d.zero}</div></div>
+            <div class="card ghost"><div class="muted">Mean / Median</div><div class="num">${fmt(d.mean_pct)}% / ${fmt(d.median_pct)}%</div></div>
+          </div>
+          <div class="grid-3" style="margin-top:8px">
+            <div class="card ghost"><div class="muted">P25</div><div class="num">${fmt(d.p25_pct)}%</div></div>
+            <div class="card ghost"><div class="muted">P75</div><div class="num">${fmt(d.p75_pct)}%</div></div>
+            <div class="card ghost"><div class="muted">Horizon</div><div class="num">${d.h}h</div></div>
+          </div>`;
+      }
+
+      function fill(tbodySel, rows){
+        const body=document.querySelector(tbodySel); body.innerHTML='';
+        (rows||[]).forEach(r=>{
+          const tr=document.createElement('tr');
+          tr.appendChild(td('@'+(r.username||'')));
+          tr.appendChild(td(r.ticker||'')); const s=document.createElement('td'); s.appendChild(pill(r.sentiment)); tr.appendChild(s);
+          tr.appendChild(td(fmt((r.ret_close??0)*100))); tr.appendChild(td(fmt((r.ret_high??0)*100)));
+          tr.appendChild(td(fmt((r.ret_low??0)*100))); tr.appendChild(td(r.alpha==null?'—':fmt((r.alpha??0)*100)));
+          body.appendChild(tr);
+        });
+      }
+      fill('#winTable tbody', data.winners);
+      fill('#loseTable tbody', data.losers);
+    }catch(e){
+      el('horErr').innerHTML = `<div class="err">${e.message||e}</div>`;
+    }
+  }
+
+  // ---------- BEST ----------
+  async function loadBest(){
+    const API = setAPIBase();
+    try{
+      el('bestErr').innerHTML='';
+      const limit= +el('bestLimit').value || 20;
+      const sent = el('bestSent').value || '';
+      const r = await fetch(`${API}/api/best?limit=${limit}&sentiment=${encodeURIComponent(sent)}`);
+      if(!r.ok) throw new Error(r.status);
+      const j = await r.json();
+
+      const body = $('#bestTable tbody'); body.innerHTML='';
+      (j.rows||[]).forEach(row=>{
+        const tr=document.createElement('tr');
+        tr.appendChild(td('@'+row.username));
+        tr.appendChild(td(row.ticker));
+        const s=document.createElement('td'); s.appendChild(pill(row.sentiment)); tr.appendChild(s);
+        tr.appendChild(td(fmt(row.delta_pct,4)));  // already %
+        tr.appendChild(td(`${fmt(row.entry_price,6)} → ${fmt(row.current_price,6)}`));
+        const txt = (row.tweet_text||'').slice(0,90).replace(/\n/g,' ');
+        tr.appendChild(td(txt + ((row.tweet_text||'').length>90 ? '…' : '')));
+        body.appendChild(tr);
+      });
+    }catch(e){
+      el('bestErr').innerHTML = `<div class="err">${e.message||e}</div>`;
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', ()=>{
+    // init API base from query ?api=
+    const params = new URLSearchParams(location.search);
+    if(params.get('api')){ el('apiBase').value = params.get('api'); }
+    el('apiBaseText').textContent = el('apiBase').value;
+
+    el('btnLoadUser').addEventListener('click', loadUser);
+    el('btnAllEp').addEventListener('click', loadAllEndpoints);
+    el('btnSummary').addEventListener('click', loadSummary);
+    el('btnHorizon').addEventListener('click', loadHorizon);
+    el('btnBest').addEventListener('click', loadBest);
+
+    checkHealth();
+    loadAllEndpoints();
+    loadSummary();
+    loadHorizon();
+    loadBest();
+  });
+})();
+</script>
+</body>
+</html>
