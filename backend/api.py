@@ -131,6 +131,22 @@ def health():
 
 # user profile
 @app.get("/api/user/{username}/summary")
+
+# interface IKolItem {
+#   id: string;
+#   name: string;
+#   // timestamp
+#   latestUpdateTime: string;
+#   tweetsCount: number;
+#   grade: string;
+#   points: number;
+#   result: number;
+#   streak: number;
+#   rank: number;
+# }
+
+# type KolList = IKolItem[];
+
 def user_summary(username: str, window_h: int = Query(168, ge=1, le=720)):
     """
     Prefer leaderboard_cache / user_daily_stats; fallback to quick estimate from tweets.
