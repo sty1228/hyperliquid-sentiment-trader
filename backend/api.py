@@ -125,6 +125,12 @@ def _direction_from_sentiment(sentiment: Optional[str]) -> str:
     if s == "bearish": return "short"
     return "none"
 
+def _direction_int_from_sentiment(sentiment: Optional[str]) -> int:
+    s = (sentiment or "").lower()
+    if s == "bullish": return 1
+    if s == "bearish": return -1
+    return 0
+
 @app.get("/api/health")
 def health():
     return {"ok": True, "db": DB_PATH}
@@ -225,6 +231,28 @@ def user_summary(username: str, window_h: int = Query(168, ge=1, le=720)):
         "rank": (lb or {}).get("rank"),
     }
 
+# interface IKolSignalItem {
+#   // timestamp
+#   updateTime: string;
+#   // -1: bearish, 0: neutral, 1: bullish
+#   emotionType: 0 | 1 | -1;
+#   // 这里会涉及到一些关键词的解析，比如 BTC +6.92 +34.65%
+#   // 在实际返回时可能要对这些字符加上标签，便于前端解析
+#   content: string;
+#   commentsCount: number;
+#   retweetsCount: number;
+#   likesCount: number;
+#   token: string;
+#   change: number;
+# }
+
+# type KolSignals = {
+#   id: string;
+#   name: string;
+#   tweetsCount: number;
+#   signals: IKolSignalItem[];
+# };
+
 @app.get("/api/user/{username}/signals")
 def user_signals(username: str, limit: int = Query(50, ge=1, le=200)):
     """
@@ -232,7 +260,7 @@ def user_signals(username: str, limit: int = Query(50, ge=1, le=200)):
     """
     base = _rows(
         """
-        SELECT id as tweet_id, username, sentiment, ticker,
+        SELECT id as tweet_id, username, sentiment, ticker, tweet_text,
                entry_price, current_price, price_change_percent, tweet_time
         FROM tweets
         WHERE username=?
@@ -246,7 +274,7 @@ def user_signals(username: str, limit: int = Query(50, ge=1, le=200)):
 
     uds_latest = _one(
         """
-        SELECT streak FROM user_daily_stats
+        SELECT id, streak FROM user_daily_stats
         WHERE username=?
         ORDER BY date DESC
         LIMIT 1
@@ -325,17 +353,28 @@ def user_signals(username: str, limit: int = Query(50, ge=1, le=200)):
                 "profit_grade": grade_single,
                 "signal_id": r.get("tweet_id"),
                 "entry_price": r.get("entry_price"),
-                "pct_change_so_far": r.get("price_change_percent"),
                 "win_streak": user_streak,
                 "progress_bar": progress_fraction,
                 "user_week_total_pct": user_week_total_pct,
                 "ticker": r.get("ticker"),
                 "bull_or_bear": r.get("sentiment"),
-                "direction": _direction_from_sentiment(r.get("sentiment")),
-                "how_long_ago": _how_long_ago(r.get("tweet_time")),
+                #
+                "emotionType": _direction_int_from_sentiment(r.get("sentiment")),
+                "updateTime": _how_long_ago(r.get("tweet_time")),
+                "content": r.get("tweet_text"),
+                "commentsCount": 0, #place holder
+                "retweetsCount": 0, #place holder
+                "likesCount": 0, #place holder
+                "token": "", #place holder
+                "change_since_tweet": r.get("price_change_percent"),
             }
         )
-    return out
+    return {
+        "id": uds_latest.get("id") if uds_latest else None,
+        "name": username,
+        "tweetsCount": len(out),
+        "signals": out,
+    }
 
 # leaderboard
 @app.get("/api/leaderboard")
