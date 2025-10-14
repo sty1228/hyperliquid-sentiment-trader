@@ -365,7 +365,6 @@ def user_signals(username: str, limit: int = Query(50, ge=1, le=200)):
                 "commentsCount": 0, #place holder
                 "retweetsCount": 0, #place holder
                 "likesCount": 0, #place holder
-                "token": "", #place holder
                 "change_since_tweet": r.get("price_change_percent"),
             }
         )
