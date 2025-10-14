@@ -153,7 +153,7 @@ def user_summary(username: str, window_h: int = Query(168, ge=1, le=720)):
     """
     lb = _one(
         """
-        SELECT profit_grade, points, rank, score
+        SELECT id, profit_grade, points, rank, score, updated_at
         FROM leaderboard_cache
         WHERE username=? AND window_h=?
         LIMIT 1
@@ -171,6 +171,17 @@ def user_summary(username: str, window_h: int = Query(168, ge=1, le=720)):
         """,
         (username,),
     )
+    
+    # find tweet count from the tweets table
+    tweet_count = _one(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM tweets
+        WHERE username=?
+        """,
+        (username,),
+    )
+    tweet_count = int((tweet_count or {}).get("cnt") or 0)
 
     if not lb:
         agg = _one(
@@ -201,6 +212,10 @@ def user_summary(username: str, window_h: int = Query(168, ge=1, le=720)):
         streak_color, streak_emoji = "gray", ""
 
     return {
+        "id": (lb or {}).get("id"),
+        "name": username,
+        "latestUpdateTime": (lb or {}).get("updated_at"),
+        "tweetsCount": tweet_count,
         "profit_grade": (lb or {}).get("profit_grade") or _grade_from_score((lb or {}).get("score")),
         "points": float((lb or {}).get("points") or 0.0),
         "results_pct": (uds or {}).get("results_pct"),
