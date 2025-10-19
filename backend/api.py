@@ -715,6 +715,81 @@ def best(
         )
     return {"rows": rows}
 
+@app.post("/api/set_risk")
+def set_risk(
+    user_id: str = Query(...),  # Mandatory
+    leader_username: Optional[str] = Query(None),  # Optional
+    symbol: Optional[str] = Query(None),  # Optional
+    tp_decimal_long: Optional[float] = Query(None),  # Optional
+    sl_decimal_long: Optional[float] = Query(None),  # Optional
+    tp_decimal_short: Optional[float] = Query(None),  # Optional
+    sl_decimal_short: Optional[float] = Query(None),  # Optional
+):
+    if leader_username == "all_leader_usernames":
+        return {"success": False, "error": "Invalid leader_username"}
+    if symbol == "all_symbols":
+        return {"success": False, "error": "Invalid symbol"}
+    if user_id is None or user_id.strip() == "":
+        return {"success": False, "error": "user_id is required"}
+    if tp_decimal_long is None and sl_decimal_long is None and tp_decimal_short is None and sl_decimal_short is None:
+        return {"success": False, "error": "At least one of tp_decimal_long, sl_decimal_long, tp_decimal_short, sl_decimal_short must be provided"}
+    if leader_username is None:
+        return {"success": False, "error": "leader_username is required"}
+    if symbol is None:
+        return {"success": False, "error": "symbol is required"}
+        
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO risk_config (user_id, leader_username, symbol, tp_decimal_long, sl_decimal_long, tp_decimal_short, sl_decimal_short)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, leader_username, symbol) DO UPDATE SET
+                tp_decimal_long = CASE WHEN excluded.tp_decimal_long IS NOT NULL THEN excluded.tp_decimal_long ELSE risk_config.tp_decimal_long END,
+                sl_decimal_long = CASE WHEN excluded.sl_decimal_long IS NOT NULL THEN excluded.sl_decimal_long ELSE risk_config.sl_decimal_long END,
+                tp_decimal_short = CASE WHEN excluded.tp_decimal_short IS NOT NULL THEN excluded.tp_decimal_short ELSE risk_config.tp_decimal_short END,
+                sl_decimal_short = CASE WHEN excluded.sl_decimal_short IS NOT NULL THEN excluded.sl_decimal_short ELSE risk_config.sl_decimal_short END;
+            """,
+            (user_id, leader_username, symbol, tp_decimal_long, sl_decimal_long, tp_decimal_short, sl_decimal_short),
+        )
+        conn.commit()
+        return {"success": True}
+
+    return {"success": False}
+
+@app.get("/api/get_risk")
+def get_risk(
+    user_id: str = Query(...),  # Mandatory
+    leader_username: Optional[str] = Query(None),  # Optional
+    symbol: Optional[str] = Query(None),  # Optional
+):
+    if user_id is None or user_id.strip() == "":
+        return {"success": False, "error": "user_id is required"}
+    if leader_username is None:
+        return {"success": False, "error": "leader_username is required"}
+    if symbol is None:
+        return {"success": False, "error": "symbol is required"}
+
+    row = _one(
+        """
+        SELECT tp_decimal_long, sl_decimal_long, tp_decimal_short, sl_decimal_short
+        FROM risk_config
+        WHERE user_id = ? AND leader_username = ? AND symbol = ?
+        LIMIT 1
+        """,
+        (user_id, leader_username, symbol),
+    )
+
+    if row:
+        return {
+            "success": True,
+            "tp_decimal_long": row.get("tp_decimal_long"),
+            "sl_decimal_long": row.get("sl_decimal_long"),
+            "tp_decimal_short": row.get("tp_decimal_short"),
+            "sl_decimal_short": row.get("sl_decimal_short"),
+        }
+    else:
+        return {"success": False, "error": "No risk configuration found"}
+
 from fastapi import APIRouter
 debug_router = APIRouter(prefix="/api", tags=["debug"])
 @debug_router.get("/debug/routes")

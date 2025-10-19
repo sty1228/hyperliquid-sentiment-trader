@@ -9,6 +9,7 @@ DATA_DIR = env("DATA_DIR", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, "execution.sqlite")
+# DB_PATH = os.path.join(DATA_DIR, "crypto_tracker.db")
 
 def connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
