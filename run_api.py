@@ -21,4 +21,10 @@ if __name__ == '__main__':
     if root not in sys.path:
         sys.path.insert(0, root)
 
-    uvicorn.run('backend.api:app', host=host, port=port, reload=reload)
+    uvicorn.run('backend.api:app', 
+                host=host,
+                port=port,
+                reload=reload,
+                # ssl_keyfile="key.pem",  # Path to your private key
+                # ssl_certfile="cert.pem"  # Path to your certificate
+                )
