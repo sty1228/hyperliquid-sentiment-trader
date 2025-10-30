@@ -391,6 +391,7 @@ def leaderboard(window_h: int = Query(168, ge=1, le=720),
           L.score,
           L.rank,
           U.results_pct_cum AS results_pct
+          U.streak AS streak
         FROM leaderboard_cache L
         LEFT JOIN user_daily_stats U
           ON U.username = L.username
@@ -431,6 +432,11 @@ def leaderboard(window_h: int = Query(168, ge=1, le=720),
                     "tweet_performance": (latest or {}).get("price_change_percent"),
                     "copy_button": True,
                     "counter_button": True,
+                    #
+                    "profit_grade": float(row.get("profit_grade") or 0.01),
+                    "points": float(row.get("points") or 0.0),
+                    "streak": int(row.get("streak") or 0),
+                    "rank": int(row.get("rank") or 0),
                 }
             )
         return out
@@ -472,6 +478,11 @@ def leaderboard(window_h: int = Query(168, ge=1, le=720),
         n = int(row["n"])
         win_rate = (float(row["wins"]) / n) if n else 0.0
         results_pct = float(row["avg_perf"]) if row["avg_perf"] is not None else None
+        profit_grade = _grade_from_score(results_pct / 100.0 if results_pct is not None else None)
+        points = (results_pct or 0.0) * win_rate
+        streak = 0
+        rank = 0
+        
         out.append(
             {
                 "x_handle": row["username"],
@@ -486,6 +497,11 @@ def leaderboard(window_h: int = Query(168, ge=1, le=720),
                 "tweet_performance": (latest or {}).get("price_change_percent"),
                 "copy_button": True,
                 "counter_button": True,
+                #
+                "profit_grade": profit_grade,
+                "points": points,
+                "streak": streak,
+                "rank": rank,
             }
         )
     return out
