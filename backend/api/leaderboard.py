@@ -74,7 +74,7 @@ def get_leaderboard(
     from datetime import datetime, timezone
 
     result = []
-    for stats in rows:
+    for idx, stats in enumerate(rows, 1):
         trader = stats.trader
 
         # 获取最新 signal
@@ -115,7 +115,7 @@ def get_leaderboard(
                 win_rate=stats.win_rate,
                 total_tweets=stats.total_signals,
                 signal_to_noise=stats.signal_to_noise,
-                results_pct=stats.avg_return_pct,
+                results_pct=stats.total_profit_usd,
                 ticker=ticker,
                 direction=direction,
                 how_long_ago=how_long_ago,
@@ -125,7 +125,7 @@ def get_leaderboard(
                 profit_grade=stats.profit_grade,
                 points=stats.points,
                 streak=stats.streak,
-                rank=stats.rank or 0,
+                rank=idx,
                 total_signals=stats.total_signals,
                 avg_return=stats.avg_return_pct,
                 copiers=stats.copiers_count,
