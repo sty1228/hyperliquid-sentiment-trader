@@ -1066,7 +1066,7 @@ DEFAULT_USERS = [
     "EmperorBTC","PeterLBrandt","TrueCrypto28","MoonOverlord","TheCryptoDog",
     "bitcoinjack","insomniacxbt","Tom__Capital","flopxbt","docXBT",
     "Danny_Crypton","dailytradr","CryptoWizardd","trader_koala","LomahCrypto",
-    "CredibleCrypto","galaxyBTC","CryptoCaesarTA","Crypto_Chase","crypto_goos",
+    "CredibleCrypto","galaxyBTC","CryptoCaesarTA","Crypto_Chase","cryptogoos",
     "ThinkingUSD","PriorXBT","yourQuantGuy","0xThoor","coinmamba",
     "CryptoPoseidonn","papagiorgioXBT","PillageCapital","macklorden",
     "kaceohhh","PhoenixBtcFire",
@@ -1075,13 +1075,13 @@ DEFAULT_USERS = [
     "ConnorJBates_","LightCrypto",
     # ── Hyperliquid Ecosystem ──
     "MomentumKevin","TheWhiteWhaleHL","JamesWynnReal","KeyboardMonkey3",
-    "lBattleRhino","basedkarbon","Rijk__","HYPEconomist","MizerXBT",
+    "lBattleRhino","karbonbased","Rijk__","HYPEconomist","MizerXBT",
     # ── On-chain Actionable (whale alerts, breaking data) ──
     "lookonchain","OnChainWizard","whale_alert",
     "spot_on_chain","Arkham","tier10k","smartestmoney","DefiIgnas",
     # ── Meme / Degen Signal Hunters ──
     "MustStopMurad","blknoiz06","GiganticRebirth","CryptoAnup","TedPillows",
-    "Ashcryptoreal","izebel_eth","defi_mochi",
+    "izebel_eth","defi_mochi",
     # ── Active Traders with Macro Edge (still post entries) ──
     "CryptoHayes","arthur0x","Rewkang","QwQiao",
     "Darrenlautf","ThinkingBitmex","TheBootMex","BastilleBtc",

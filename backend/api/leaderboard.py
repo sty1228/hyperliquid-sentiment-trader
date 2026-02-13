@@ -47,7 +47,7 @@ class LeaderboardItemResponse(BaseModel):
 def get_leaderboard(
     window: str = Query("24h", regex="^(24h|7d|30d)$"),
     sort_by: str = Query("total_profit_usd", regex="^(points|win_rate|total_profit_usd|copiers_count)$"),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(200, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
@@ -62,7 +62,7 @@ def get_leaderboard(
     rows = (
         db.query(TraderStats)
         .options(joinedload(TraderStats.trader))
-        .filter(TraderStats.window == window)
+        .filter(TraderStats.window == window, TraderStats.total_signals > 0)
         .order_by(desc(sort_col))
         .offset(offset)
         .limit(limit)

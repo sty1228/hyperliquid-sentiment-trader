@@ -165,9 +165,6 @@ def backfill_prices(db: Session) -> int:
         if entry_price is None:
             entry_price = cur_price
 
-        # Handle kPEPE etc: HL returns price in thousands, so kPEPE=0.003854 means PEPE=0.000003854
-        # But since both entry and current use the same scale, pct_change is still correct
-
         pct = _calc_pct(entry_price, cur_price, sig.direction or "long")
 
         sig.entry_price = round(entry_price, 8)
@@ -196,10 +193,18 @@ def _window_hours(w: str) -> int:
     return {"24h": 24, "7d": 168, "30d": 720}.get(w, 168)
 
 def _grade(points: float) -> str:
-    if points >= 85: return "S+"
-    if points >= 70: return "S"
-    if points >= 55: return "A"
-    if points >= 35: return "B"
+    """
+    Grade thresholds (adjusted for realistic score distribution):
+      S+: 60+   — elite traders
+      S:  45+   — top performers
+      A:  30+   — above average
+      B:  15+   — decent
+      C:  <15   — below average / new
+    """
+    if points >= 60: return "S+"
+    if points >= 45: return "S"
+    if points >= 30: return "A"
+    if points >= 15: return "B"
     return "C"
 
 def compute_stats(db: Session) -> int:
@@ -240,11 +245,20 @@ def compute_stats(db: Session) -> int:
                 Follow.trader_id == trader.id, Follow.is_copy_trading.is_(True)
             ).scalar() or 0
 
-            wr_score = min(win_rate, 100) * 0.4
-            ret_score = min(max(avg_ret, -50), 50) * 0.6
-            vol_score = min(total, 50) * 0.4
-            streak_score = min(streak, 10) * 1.0
-            points = max(0, wr_score + ret_score + vol_score + streak_score)
+            # ── Scoring formula ──
+            # win_rate: 0-100, weight 0.35 → max ~35 pts
+            wr_score = min(win_rate, 100) * 0.35
+
+            # profit: use total_profit_usd, clamp to [-200, 200], scale → max ~20 pts
+            profit_score = min(max(total_profit, -200), 200) * 0.1
+
+            # volume: reward active traders → max ~24 pts at 30 signals
+            vol_score = min(total, 30) * 0.8
+
+            # streak: consecutive wins → max ~20 pts
+            streak_score = min(streak, 10) * 2.0
+
+            points = max(0, wr_score + profit_score + vol_score + streak_score)
             grade = _grade(points)
 
             existing = (
@@ -267,11 +281,12 @@ def compute_stats(db: Session) -> int:
                 db.add(TraderStats(trader_id=trader.id, window=window, **vals))
             written += 1
 
+    # Rank by total_profit_usd (not points) — matches leaderboard sort
     for window in WINDOWS:
         rows = (
             db.query(TraderStats)
             .filter(TraderStats.window == window)
-            .order_by(sa_desc(TraderStats.points))
+            .order_by(sa_desc(TraderStats.total_profit_usd))
             .all()
         )
         for rank, s in enumerate(rows, 1):
