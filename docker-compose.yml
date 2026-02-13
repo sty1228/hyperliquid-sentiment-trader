@@ -1,0 +1,17 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: hypercopy-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hypercopy
+      POSTGRES_PASSWORD: hypercopy_dev_2024
+      POSTGRES_DB: hypercopy
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

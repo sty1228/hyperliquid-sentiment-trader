@@ -1,12 +1,25 @@
-fastapi
-uvicorn
-pandas
-requests
-schedule
-selenium
-webdriver-manager
-openai
-python-dotenv
-pydantic
-hyperliquid-python-sdk
-eth-account
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# Database
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+alembic==1.14.1
+
+# Auth
+pyjwt==2.10.1
+eth-account==0.13.5
+
+# Utils
+python-dotenv==1.0.1
+httpx==0.28.1
+python-multipart==0.0.20
+
+# Existing deps (keep for pipeline)
+openai>=1.0
+pandas>=2.0
+selenium>=4.0
+webdriver-manager>=4.0
