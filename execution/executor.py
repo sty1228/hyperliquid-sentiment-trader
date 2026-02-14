@@ -1,21 +1,44 @@
-
 from __future__ import annotations
 
+import os
 import json
+import logging
 
 from execution.db import connect, query, exec as db_exec, scalar
 from execution.models import OrderPlanDTO, utcnow
 from execution.risk import check_risk, RiskError
-from execution.brokers import SimBroker
+from execution.brokers import SimBroker, HyperliquidBroker
 from execution.px_adapter import PxAdapter
+
+log = logging.getLogger(__name__)
 
 
 class Executor:
 
     def __init__(self, daily_limit: float | None = None):
         self.px = PxAdapter()
-        self.broker = SimBroker(self.px)
         self.daily_limit = daily_limit
+
+        # Use real broker if HL keys are configured, otherwise sim
+        hl_account = os.getenv("HL_ACCOUNT_ADDRESS", "")
+        hl_secret = os.getenv("HL_API_SECRET_KEY", "")
+        hl_builder = os.getenv("HL_BUILDER_ADDRESS", "")
+        hl_mainnet = os.getenv("HL_MAINNET", "false").lower() == "true"
+        hl_fee = int(os.getenv("HL_DEFAULT_BUILDER_BPS", "10"))
+
+        if hl_account and hl_secret and hl_builder:
+            self.broker = HyperliquidBroker(
+                account_address=hl_account,
+                api_secret_key=hl_secret,
+                builder_address=hl_builder,
+                builder_fee_bps=hl_fee,
+                mainnet=hl_mainnet,
+                px=self.px,
+            )
+            log.info("Executor using HyperliquidBroker (mainnet=%s)", hl_mainnet)
+        else:
+            self.broker = SimBroker(self.px)
+            log.warning("Executor using SimBroker — HL keys not configured")
 
     def _emit(self, con, plan_id: str, event: str, detail: dict | None = None):
         db_exec(
@@ -55,9 +78,7 @@ class Executor:
                 ) or 0.0
 
                 try:
-
                     check_risk(plan, float(mark), float(used), self.daily_limit)
-
 
                     ack = self.broker.place_market(
                         plan.symbol,
@@ -76,6 +97,11 @@ class Executor:
                     )
                     self._emit(con, plan.id, "sent", {"ack": ack, "mark": mark})
 
+                    log.info(
+                        "Order %s | %s %s %.6f | status=%s",
+                        plan.id[:8], plan.side, plan.symbol, plan.qty, new_status,
+                    )
+
                 except RiskError as e:
                     db_exec(
                         con,
@@ -83,9 +109,18 @@ class Executor:
                         ("rejected", utcnow(), plan.id),
                     )
                     self._emit(con, plan.id, "reject", {"reason": str(e)})
+                    log.warning("Order %s rejected by risk: %s", plan.id[:8], e)
+
+                except Exception as e:
+                    db_exec(
+                        con,
+                        "UPDATE order_plans SET status=?, updated_at=? WHERE id=?",
+                        ("rejected", utcnow(), plan.id),
+                    )
+                    self._emit(con, plan.id, "error", {"reason": str(e)})
+                    log.exception("Order %s unexpected error: %s", plan.id[:8], e)
         finally:
             con.close()
-
 
     def sl_daemon_tick(self):
         con = connect()
@@ -104,7 +139,11 @@ class Executor:
                 if not hit:
                     continue
 
-   
+                log.info(
+                    "SL triggered | plan=%s %s @ mark=%.4f sl=%.4f",
+                    r["id"][:8], r["symbol"], mark, r["sl_price"],
+                )
+
                 ack = self.broker.place_market(
                     r["symbol"],
                     "sell" if r["side"] == "buy" else "buy",
@@ -115,7 +154,6 @@ class Executor:
                 )
                 self._emit(con, r["id"], "sl_trigger", {"ack": ack, "mark": mark})
 
-   
                 db_exec(
                     con,
                     "UPDATE order_plans SET status=?, updated_at=? WHERE id=?",
