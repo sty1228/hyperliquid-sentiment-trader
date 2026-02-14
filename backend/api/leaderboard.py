@@ -56,7 +56,6 @@ def get_leaderboard(
     - window: 24h / 7d / 30d
     - sort_by: points / win_rate / total_profit_usd / copiers_count
     """
-    # 查询 TraderStats + 关联 Trader
     sort_col = getattr(TraderStats, sort_by, TraderStats.total_profit_usd)
 
     rows = (
@@ -69,7 +68,6 @@ def get_leaderboard(
         .all()
     )
 
-    # 查每个 trader 最近一条 signal（用于 how_long_ago / ticker / direction）
     from backend.models.signal import Signal
     from datetime import datetime, timezone
 
@@ -105,6 +103,22 @@ def get_leaderboard(
             direction = latest_signal.direction
             bull_or_bear = latest_signal.sentiment or "bullish"
 
+        # ── FIX 1: total_tweets 从 signal_to_noise 反算 ──
+        # signal_to_noise = total_signals / total_tweets
+        # 所以 total_tweets = total_signals / signal_to_noise
+        if stats.signal_to_noise > 0:
+            total_tweets = int(stats.total_signals / stats.signal_to_noise)
+        else:
+            total_tweets = stats.total_signals
+
+        # ── FIX 2: results_pct 用百分比，不是 USD ──
+        # total_profit_usd 基于 $100 本金，所以数值上 == 百分比
+        # 但语义上应该用 avg_return * total_signals 或直接算
+        results_pct = round(stats.total_profit_usd, 2)  # $100 base → pct == usd
+
+        # ── FIX 3: tweet_performance 用 avg_return_pct ──
+        tweet_performance = round(stats.avg_return_pct, 2)
+
         result.append(
             LeaderboardItemResponse(
                 x_handle=trader.username,
@@ -113,13 +127,13 @@ def get_leaderboard(
                 is_verified=trader.is_verified,
                 bull_or_bear=bull_or_bear,
                 win_rate=stats.win_rate,
-                total_tweets=stats.total_signals,
+                total_tweets=total_tweets,
                 signal_to_noise=stats.signal_to_noise,
-                results_pct=stats.total_profit_usd,
+                results_pct=results_pct,
                 ticker=ticker,
                 direction=direction,
                 how_long_ago=how_long_ago,
-                tweet_performance=0.0,
+                tweet_performance=tweet_performance,
                 copy_button=True,
                 counter_button=True,
                 profit_grade=stats.profit_grade,

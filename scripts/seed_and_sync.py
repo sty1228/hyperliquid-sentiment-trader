@@ -1,18 +1,14 @@
 """
 P0 Pipeline: Seed traders → Sync signals from CSV → Compute trader_stats
 Usage:
-    cd /opt/hypercopy  (or your project root)
+    cd /opt/hypercopy
     python -m scripts.seed_and_sync
-
-    # Or directly:
-    python scripts/seed_and_sync.py
 """
 from __future__ import annotations
 import os, sys, csv, hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-# Ensure project root is on path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -25,7 +21,7 @@ from backend.models.trader import Trader, TraderStats
 from backend.models.signal import Signal
 from backend.models.follow import Follow
 
-# ─── KOL list (same as ingestor/main.py DEFAULT_USERS) ───────────
+# ─── KOL list ─────────────────────────────────────────────
 
 DEFAULT_KOLS = [
     "Bluntz_Capital","TheWhiteWhaleHL","pierre_crypt0","Tradermayne","LomahCrypto",
@@ -44,10 +40,10 @@ DEFAULT_KOLS = [
 CSV_PATH = os.path.join(PROJECT_ROOT, "data", "tweets_processed_complete.csv")
 WINDOWS = ["24h", "7d", "30d"]
 
-# ─── Helpers ──────────────────────────────────────────────────────
+
+# ─── Helpers ──────────────────────────────────────────────
 
 def _parse_dt(raw: str) -> Optional[datetime]:
-    """Best-effort ISO parse, returns UTC datetime or None."""
     if not raw or raw == "nan":
         return None
     try:
@@ -70,17 +66,11 @@ def _parse_dt(raw: str) -> Optional[datetime]:
     return None
 
 
-def _tweet_hash(username: str, text: str, time_str: str) -> str:
-    """Stable dedup key for a signal row."""
-    blob = f"{username}|{text[:500]}|{time_str}"
-    return hashlib.sha256(blob.encode()).hexdigest()
-
-
 def _sentiment_to_direction(sentiment: str) -> str:
     s = (sentiment or "").lower().strip()
     if s == "bearish":
         return "short"
-    return "long"  # bullish / neutral default
+    return "long"
 
 
 def _window_hours(w: str) -> int:
@@ -99,10 +89,9 @@ def _grade(points: float) -> str:
     return "C"
 
 
-# ─── Step 1: Seed traders ────────────────────────────────────────
+# ─── Step 1: Seed traders ────────────────────────────────
 
 def seed_traders(db: Session) -> int:
-    """Upsert DEFAULT_KOLS into traders table. Returns count of new inserts."""
     created = 0
     for username in DEFAULT_KOLS:
         exists = db.query(Trader.id).filter(Trader.username == username).first()
@@ -114,18 +103,15 @@ def seed_traders(db: Session) -> int:
     return created
 
 
-# ─── Step 2: Sync CSV → signals ─────────────────────────────────
+# ─── Step 2: Sync CSV → signals ──────────────────────────
 
 def sync_signals(db: Session, csv_path: str = CSV_PATH) -> int:
-    """Read processed CSV and insert into signals table. Returns count of new signals."""
     if not os.path.exists(csv_path):
         print(f"[sync_signals] CSV not found at {csv_path} — skipping (run ingestor first)")
         return 0
 
-    # Build trader username → id map
     traders = {t.username: t.id for t in db.query(Trader).all()}
 
-    # Track existing signals to avoid duplicates
     existing_hashes: set[str] = set()
     for s in db.query(Signal.tweet_text, Signal.tweet_time).all():
         txt = (s.tweet_text or "")[:500]
@@ -144,7 +130,6 @@ def sync_signals(db: Session, csv_path: str = CSV_PATH) -> int:
             ticker = (row.get("ticker") or "").upper().strip()
             sentiment = (row.get("sentiment") or "neutral").strip()
 
-            # Skip noise
             if not username or not tweet or not ticker:
                 skipped += 1
                 continue
@@ -152,7 +137,6 @@ def sync_signals(db: Session, csv_path: str = CSV_PATH) -> int:
                 skipped += 1
                 continue
 
-            # Ensure trader exists
             if username not in traders:
                 t = Trader(username=username, display_name=username)
                 db.add(t)
@@ -161,7 +145,6 @@ def sync_signals(db: Session, csv_path: str = CSV_PATH) -> int:
 
             trader_id = traders[username]
 
-            # Dedup check
             dedup_key = hashlib.sha256(f"{tweet[:500]}|{tweet_time_str}".encode()).hexdigest()
             if dedup_key in existing_hashes:
                 skipped += 1
@@ -183,7 +166,6 @@ def sync_signals(db: Session, csv_path: str = CSV_PATH) -> int:
             db.add(signal)
             inserted += 1
 
-            # Batch commit every 500
             if inserted % 500 == 0:
                 db.commit()
                 print(f"  ... {inserted} signals inserted so far")
@@ -193,12 +175,18 @@ def sync_signals(db: Session, csv_path: str = CSV_PATH) -> int:
     return inserted
 
 
-# ─── Step 3: Compute trader_stats ────────────────────────────────
+# ─── Step 3: Compute trader_stats ────────────────────────
 
 def compute_stats(db: Session) -> int:
     """
-    For each trader × window, compute stats from signals table and upsert into trader_stats.
-    Returns total stats rows written.
+    For each trader × window, compute stats from signals table.
+
+    Evaluation model:
+    - Each signal = independent $100 trade, 1x leverage
+    - Fixed 24h evaluation window: pct_change = price move 24h after signal
+    - Direction-aware: long profits when price rises, short profits when price falls
+    - Consecutive same-direction signals: each counted independently
+    - total_profit_usd: based on $100 per trade (1% = $1)
     """
     now = datetime.now(timezone.utc)
     all_traders = db.query(Trader).all()
@@ -209,41 +197,50 @@ def compute_stats(db: Session) -> int:
             hours = _window_hours(window)
             cutoff = now - timedelta(hours=hours)
 
-            # Signals in this window
+            # ── FIX: filter by tweet_time, not created_at ──
             sigs = (
                 db.query(Signal)
                 .filter(
                     Signal.trader_id == trader.id,
-                    Signal.created_at >= cutoff,
+                    Signal.tweet_time.isnot(None),
+                    Signal.tweet_time >= cutoff,
                 )
+                .order_by(Signal.tweet_time.asc())
                 .all()
             )
 
             total = len(sigs)
-
-            # Win/loss based on pct_change (if available)
             sigs_with_pnl = [s for s in sigs if s.pct_change is not None]
-            wins = sum(1 for s in sigs_with_pnl if s.pct_change and s.pct_change > 0)
-            losses = sum(1 for s in sigs_with_pnl if s.pct_change and s.pct_change <= 0)
-            win_rate = (wins / len(sigs_with_pnl) * 100) if sigs_with_pnl else 0.0
-            avg_return = (
-                sum(s.pct_change for s in sigs_with_pnl) / len(sigs_with_pnl)
-                if sigs_with_pnl else 0.0
-            )
-            total_profit = sum(s.pct_change or 0 for s in sigs_with_pnl)
+
+            # ── FIX: Direction-aware returns ──
+            # pct_change = raw 24h price change (positive = price went up)
+            # long:  profit = +pct_change  (price up = win)
+            # short: profit = -pct_change  (price down = win)
+            effective_returns = []
+            for s in sigs_with_pnl:
+                if s.direction == "short":
+                    effective_returns.append(-s.pct_change)
+                else:
+                    effective_returns.append(s.pct_change)
+
+            wins = sum(1 for r in effective_returns if r > 0)
+            losses = sum(1 for r in effective_returns if r <= 0)
+            win_rate = (wins / len(effective_returns) * 100) if effective_returns else 0.0
+            avg_return = (sum(effective_returns) / len(effective_returns)) if effective_returns else 0.0
+
+            # total_profit_usd: $100 per trade, so 1% change = $1
+            total_profit = sum(effective_returns)
 
             # Streak: consecutive wins from most recent
             streak = 0
-            recent = sorted(sigs_with_pnl, key=lambda s: s.created_at or now, reverse=True)
-            for s in recent:
-                if s.pct_change and s.pct_change > 0:
+            for r in reversed(effective_returns):
+                if r > 0:
                     streak += 1
                 else:
                     break
 
-            # Signal-to-noise: ratio of crypto signals vs total tweets
-            # (simplified: we only have crypto signals in the table, so use total as proxy)
-            stn = min(total / max(1, total + 2), 1.0)  # simple heuristic
+            # Signal-to-noise: ratio of signals with price data vs total
+            stn = len(sigs_with_pnl) / max(total, 1) if total > 0 else 0.0
 
             # Copiers count
             copiers = (
@@ -252,12 +249,11 @@ def compute_stats(db: Session) -> int:
                 .scalar() or 0
             )
 
-            # Points: composite score
-            # Formula: win_rate_component + return_component + volume_component + streak_bonus
-            wr_score = min(win_rate, 100) * 0.4  # max 40
-            ret_score = min(max(avg_return, -50), 50) * 0.6  # max 30 (scaled)
-            vol_score = min(total, 50) * 0.4  # max 20
-            streak_score = min(streak, 10) * 1.0  # max 10
+            # Points: composite score (max ~100)
+            wr_score = min(win_rate, 100) * 0.4       # max 40
+            ret_score = min(max(avg_return, -50), 50) * 0.6  # max 30
+            vol_score = min(total, 50) * 0.4           # max 20
+            streak_score = min(streak, 10) * 1.0       # max 10
             points = max(0, wr_score + ret_score + vol_score + streak_score)
 
             grade = _grade(points)
@@ -268,44 +264,33 @@ def compute_stats(db: Session) -> int:
                 .filter(TraderStats.trader_id == trader.id, TraderStats.window == window)
                 .first()
             )
+            vals = dict(
+                total_signals=total,
+                win_count=wins,
+                loss_count=losses,
+                win_rate=round(win_rate, 2),
+                avg_return_pct=round(avg_return, 4),
+                total_profit_usd=round(total_profit, 2),
+                streak=streak,
+                points=round(points, 2),
+                profit_grade=grade,
+                copiers_count=copiers,
+                signal_to_noise=round(stn, 3),
+                computed_at=now,
+            )
             if existing:
-                existing.total_signals = total
-                existing.win_count = wins
-                existing.loss_count = losses
-                existing.win_rate = round(win_rate, 2)
-                existing.avg_return_pct = round(avg_return, 4)
-                existing.total_profit_usd = round(total_profit, 2)
-                existing.streak = streak
-                existing.points = round(points, 2)
-                existing.profit_grade = grade
-                existing.copiers_count = copiers
-                existing.signal_to_noise = round(stn, 3)
-                existing.computed_at = now
+                for k, v in vals.items():
+                    setattr(existing, k, v)
             else:
-                db.add(TraderStats(
-                    trader_id=trader.id,
-                    window=window,
-                    total_signals=total,
-                    win_count=wins,
-                    loss_count=losses,
-                    win_rate=round(win_rate, 2),
-                    avg_return_pct=round(avg_return, 4),
-                    total_profit_usd=round(total_profit, 2),
-                    streak=streak,
-                    points=round(points, 2),
-                    profit_grade=grade,
-                    copiers_count=copiers,
-                    signal_to_noise=round(stn, 3),
-                    computed_at=now,
-                ))
+                db.add(TraderStats(trader_id=trader.id, window=window, **vals))
             written += 1
 
-    # Assign ranks per window (by points descending)
+    # Assign ranks per window by total_profit_usd (Top Earners)
     for window in WINDOWS:
         stats_rows = (
             db.query(TraderStats)
             .filter(TraderStats.window == window)
-            .order_by(desc(TraderStats.points))
+            .order_by(desc(TraderStats.total_profit_usd))
             .all()
         )
         for rank, s in enumerate(stats_rows, 1):
@@ -316,40 +301,31 @@ def compute_stats(db: Session) -> int:
     return written
 
 
-# ─── Main ─────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
     print("HyperCopy P0: Seed → Sync → Stats")
     print("=" * 60)
 
-    # Ensure tables exist
     Base.metadata.create_all(bind=engine)
     print("[init] Database tables verified\n")
 
     db = SessionLocal()
     try:
-        # Step 1
         seed_traders(db)
         print()
-
-        # Step 2
         sync_signals(db)
         print()
-
-        # Step 3
         compute_stats(db)
         print()
 
-        # Summary
         trader_count = db.query(func.count(Trader.id)).scalar()
         signal_count = db.query(func.count(Signal.id)).scalar()
         stats_count = db.query(func.count(TraderStats.id)).scalar()
         print("=" * 60)
         print(f"DONE  traders={trader_count}  signals={signal_count}  stats={stats_count}")
         print("=" * 60)
-        print("\nVerify: curl https://your-domain/api/leaderboard?window=7d")
-
     finally:
         db.close()
 
