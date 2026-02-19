@@ -18,7 +18,6 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 # ── Request / Response 模型 ──────────────────────────────
 
 class ConnectWalletRequest(BaseModel):
-    """前端发来的钱包地址"""
     wallet_address: str
 
     @field_validator("wallet_address")
@@ -27,18 +26,16 @@ class ConnectWalletRequest(BaseModel):
         v = v.strip()
         if not v.startswith("0x") or len(v) != 42:
             raise ValueError("Invalid wallet address format")
-        return v.lower()  # 统一小写存储
+        return v.lower()
 
 
 class AuthResponse(BaseModel):
-    """返回给前端的 token + 用户信息"""
     access_token: str
     token_type: str = "bearer"
     user: dict
 
 
 class MeResponse(BaseModel):
-    """当前用户信息"""
     id: str
     wallet_address: str
     display_name: str | None
@@ -46,10 +43,21 @@ class MeResponse(BaseModel):
     created_at: datetime
 
 
+class SubAccountBody(BaseModel):
+    sub_account_address: str
+
+    @field_validator("sub_account_address")
+    @classmethod
+    def validate_address(cls, v: str) -> str:
+        v = v.strip()
+        if not v.startswith("0x") or len(v) != 42:
+            raise ValueError("Invalid sub-account address format")
+        return v.lower()
+
+
 # ── 工具函数 ─────────────────────────────────────────────
 
 def create_jwt_token(user_id: str) -> str:
-    """生成 JWT token"""
     expire = datetime.now(timezone.utc) + timedelta(hours=settings.JWT_EXPIRE_HOURS)
     payload = {
         "sub": user_id,
@@ -63,11 +71,6 @@ def create_jwt_token(user_id: str) -> str:
 
 @router.post("/connect-wallet", response_model=AuthResponse)
 def connect_wallet(body: ConnectWalletRequest, db: Session = Depends(get_db)):
-    """
-    钱包连接登录
-    - 如果钱包地址已存在 → 直接登录
-    - 如果是新地址 → 自动注册 + 登录
-    """
     user = db.query(User).filter(
         User.wallet_address == body.wallet_address
     ).first()
@@ -92,10 +95,6 @@ def connect_wallet(body: ConnectWalletRequest, db: Session = Depends(get_db)):
 
 @router.get("/me", response_model=MeResponse)
 def get_me(current_user: User = Depends(get_current_user)):
-    """
-    获取当前登录用户信息
-    需要 Header: Authorization: Bearer <token>
-    """
     return MeResponse(
         id=current_user.id,
         wallet_address=current_user.wallet_address,
@@ -105,9 +104,25 @@ def get_me(current_user: User = Depends(get_current_user)):
     )
 
 
+@router.get("/sub-account")
+def get_sub_account(
+    current_user: User = Depends(get_current_user),
+):
+    return {"sub_account_address": current_user.sub_account_address}
+
+
+@router.put("/sub-account")
+def save_sub_account(
+    body: SubAccountBody,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user.sub_account_address = body.sub_account_address
+    db.commit()
+    db.refresh(current_user)
+    return {"sub_account_address": current_user.sub_account_address}
+
+
 @router.post("/logout")
 def logout():
-    """
-    登出 — JWT 是无状态的，前端删除 token 即可
-    """
     return {"message": "Logged out successfully"}
