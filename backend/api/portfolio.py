@@ -158,13 +158,42 @@ def get_balance_history(
         .all()
     )
 
-    return [
+    result: list[BalanceHistoryItem] = []
+
+    # ── 补零余额点：数据点不足 7 个时，在第一个快照前补 $0 ──
+    if snapshots and len(snapshots) < 7:
+        first_date = snapshots[0].snapshot_date
+        days_available = (first_date - since.date()).days
+        points_needed = 7 - len(snapshots)
+        pad_count = min(points_needed, days_available)
+
+        for i in range(pad_count, 0, -1):
+            pad_date = first_date - timedelta(days=i)
+            result.append(
+                BalanceHistoryItem(
+                    acconutValue=0.0,
+                    timestamp=int(
+                        datetime.combine(pad_date, datetime.min.time())
+                        .replace(tzinfo=timezone.utc)
+                        .timestamp()
+                    ),
+                )
+            )
+
+    # ── 真实数据点 ──
+    result.extend(
         BalanceHistoryItem(
             acconutValue=s.balance,
-            timestamp=int(datetime.combine(s.snapshot_date, datetime.min.time()).replace(tzinfo=timezone.utc).timestamp()),
+            timestamp=int(
+                datetime.combine(s.snapshot_date, datetime.min.time())
+                .replace(tzinfo=timezone.utc)
+                .timestamp()
+            ),
         )
         for s in snapshots
-    ]
+    )
+
+    return result
 
 
 @router.get("/portfolio/positions", response_model=list[PositionItem])
