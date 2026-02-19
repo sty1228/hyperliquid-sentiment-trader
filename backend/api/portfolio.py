@@ -200,8 +200,17 @@ def get_balance_history(
         while evt_idx < len(events):
             bal = events[evt_idx].balance_after
             evt_idx += 1
+
+        # 最后一个点始终用最新余额（从 BalanceSnapshot）
+        latest_snap = (
+            db.query(BalanceSnapshot)
+            .filter(BalanceSnapshot.user_id == current_user.id)
+            .order_by(desc(BalanceSnapshot.snapshot_date))
+            .first()
+        )
+        final_bal = latest_snap.balance if latest_snap else bal
         if result:
-            result[-1] = BalanceHistoryItem(acconutValue=bal, timestamp=result[-1].timestamp)
+            result[-1] = BalanceHistoryItem(acconutValue=final_bal, timestamp=result[-1].timestamp)
 
         return result
 
