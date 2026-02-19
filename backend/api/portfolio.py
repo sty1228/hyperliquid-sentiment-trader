@@ -153,14 +153,17 @@ def get_balance_history(
         if latest_before:
             opening_balance = latest_before.balance_after
         else:
-            # 没有事件记录，用最早的快照
-            first_snap = (
+            # 没有 24h 前的事件，用 24h 前的快照
+            snap_before = (
                 db.query(BalanceSnapshot)
-                .filter(BalanceSnapshot.user_id == current_user.id)
-                .order_by(BalanceSnapshot.snapshot_date)
+                .filter(
+                    BalanceSnapshot.user_id == current_user.id,
+                    BalanceSnapshot.snapshot_date < since_24h.date(),
+                )
+                .order_by(desc(BalanceSnapshot.snapshot_date))
                 .first()
             )
-            opening_balance = first_snap.balance if first_snap else 0.0
+            opening_balance = snap_before.balance if snap_before else 0.0
 
         # 过去 24 小时的所有事件
         events = (
@@ -173,14 +176,13 @@ def get_balance_history(
             .all()
         )
 
-        # 构建每小时的点
-        # 起始时间对齐到整点
+        # 构建每 2 小时的点（12 个点覆盖 24 小时）
         start_hour = since_24h.replace(minute=0, second=0, microsecond=0)
         evt_idx = 0
         bal = opening_balance
         result: list[BalanceHistoryItem] = []
 
-        for h in range(25):  # 0..24 = 25 个点覆盖 24 小时
+        for h in range(0, 25, 2):  # 0, 2, 4, ..., 24 = 13 个点
             hour_time = start_hour + timedelta(hours=h)
             if hour_time > now:
                 break
@@ -196,16 +198,10 @@ def get_balance_history(
                 timestamp=hour_ts,
             ))
 
-        # 终点：当前时间
+        # 应用剩余事件
         while evt_idx < len(events):
             bal = events[evt_idx].balance_after
             evt_idx += 1
-        now_ts = int(now.timestamp())
-        if not result or result[-1].timestamp != now_ts:
-            result.append(BalanceHistoryItem(
-                acconutValue=bal,
-                timestamp=now_ts,
-            ))
 
         return result
 
