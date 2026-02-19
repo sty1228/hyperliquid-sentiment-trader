@@ -160,7 +160,18 @@ def get_balance_history(
 
     result: list[BalanceHistoryItem] = []
 
-    # ── 补零余额点：数据点不足 7 个时，在第一个快照前补 $0 ──
+    if timeRange == "D":
+        # ── "D" 视图：按天存的数据只有1个点，复制成两个时间点画平线 ──
+        if snapshots:
+            val = snapshots[-1].balance
+            # 当天 0:00
+            day_start = datetime.combine(snapshots[-1].snapshot_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+            result.append(BalanceHistoryItem(acconutValue=val, timestamp=int(day_start.timestamp())))
+            # 当前时间
+            result.append(BalanceHistoryItem(acconutValue=val, timestamp=int(now.timestamp())))
+        return result
+
+    # ── 非 D 视图：数据点不足 7 个时，在第一个快照前补 $0 ──
     if snapshots and len(snapshots) < 7:
         first_date = snapshots[0].snapshot_date
         days_available = (first_date - since.date()).days
