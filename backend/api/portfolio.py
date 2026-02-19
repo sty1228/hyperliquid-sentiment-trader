@@ -136,70 +136,74 @@ def get_balance_history(
     """盈亏曲线（匹配前端 BalanceHistoryResponse）"""
     now = datetime.now(timezone.utc)
 
-    # ── "D" 视图：用事件日志重建当天时间线 ──
+    # ── "D" 视图：过去 24 小时，每小时一个点 ──
     if timeRange == "D":
-        today = now.date()
-        midnight = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
+        since_24h = now - timedelta(hours=24)
 
-        # 昨天收盘余额 = 今天的起始余额
-        prev_snap = (
-            db.query(BalanceSnapshot)
+        # 找 24 小时前最近的余额作为起始
+        latest_before = (
+            db.query(BalanceEvent)
             .filter(
-                BalanceSnapshot.user_id == current_user.id,
-                BalanceSnapshot.snapshot_date < today,
+                BalanceEvent.user_id == current_user.id,
+                BalanceEvent.created_at <= since_24h,
             )
-            .order_by(desc(BalanceSnapshot.snapshot_date))
+            .order_by(desc(BalanceEvent.created_at))
             .first()
         )
-        opening_balance = prev_snap.balance if prev_snap else 0.0
+        if latest_before:
+            opening_balance = latest_before.balance_after
+        else:
+            # 没有事件记录，用最早的快照
+            first_snap = (
+                db.query(BalanceSnapshot)
+                .filter(BalanceSnapshot.user_id == current_user.id)
+                .order_by(BalanceSnapshot.snapshot_date)
+                .first()
+            )
+            opening_balance = first_snap.balance if first_snap else 0.0
 
-        # 今天的事件
+        # 过去 24 小时的所有事件
         events = (
             db.query(BalanceEvent)
             .filter(
                 BalanceEvent.user_id == current_user.id,
-                BalanceEvent.created_at >= midnight,
+                BalanceEvent.created_at > since_24h,
             )
             .order_by(BalanceEvent.created_at)
             .all()
         )
 
-        # 把事件按时间戳存成 dict: { timestamp_seconds: balance_after }
-        event_map: dict[int, float] = {}
-        running = opening_balance
-        for evt in events:
-            evt_ts = int(evt.created_at.timestamp())
-            running = evt.balance_after
-            event_map[evt_ts] = running
-
-        # 当前余额
-        current_balance = running
-
-        # 构建每小时的点：0:00, 1:00, 2:00, ... 到当前小时
-        result: list[BalanceHistoryItem] = []
+        # 构建每小时的点
+        # 起始时间对齐到整点
+        start_hour = since_24h.replace(minute=0, second=0, microsecond=0)
+        evt_idx = 0
         bal = opening_balance
+        result: list[BalanceHistoryItem] = []
 
-        for h in range(0, now.hour + 1):
-            hour_ts = int((midnight + timedelta(hours=h)).timestamp())
+        for h in range(25):  # 0..24 = 25 个点覆盖 24 小时
+            hour_time = start_hour + timedelta(hours=h)
+            if hour_time > now:
+                break
+            hour_ts = int(hour_time.timestamp())
 
-            # 应用这个小时之前（含）发生的所有事件
-            for evt_ts in sorted(event_map.keys()):
-                if evt_ts <= hour_ts:
-                    bal = event_map.pop(evt_ts)
+            # 应用这个小时之前（含）的事件
+            while evt_idx < len(events) and int(events[evt_idx].created_at.timestamp()) <= hour_ts:
+                bal = events[evt_idx].balance_after
+                evt_idx += 1
 
             result.append(BalanceHistoryItem(
                 acconutValue=bal,
                 timestamp=hour_ts,
             ))
 
-        # 终点：当前时间（如果不是整点）
+        # 终点：当前时间
+        while evt_idx < len(events):
+            bal = events[evt_idx].balance_after
+            evt_idx += 1
         now_ts = int(now.timestamp())
-        # 应用剩余事件
-        for evt_ts in sorted(event_map.keys()):
-            bal = event_map[evt_ts]
         if not result or result[-1].timestamp != now_ts:
             result.append(BalanceHistoryItem(
-                acconutValue=current_balance,
+                acconutValue=bal,
                 timestamp=now_ts,
             ))
 
