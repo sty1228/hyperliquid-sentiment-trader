@@ -176,16 +176,14 @@ def get_balance_history(
             .all()
         )
 
-        # 构建每 2 小时的点（12 个点覆盖 24 小时）
+        # 构建固定 12 个点，每 2 小时一个（覆盖 24 小时）
         start_hour = since_24h.replace(minute=0, second=0, microsecond=0)
         evt_idx = 0
         bal = opening_balance
         result: list[BalanceHistoryItem] = []
 
-        for h in range(0, 25, 2):  # 0, 2, 4, ..., 24 = 13 个点
+        for h in range(0, 25, 2):  # 0, 2, 4, ..., 24 = 13 个时间点
             hour_time = start_hour + timedelta(hours=h)
-            if hour_time > now:
-                break
             hour_ts = int(hour_time.timestamp())
 
             # 应用这个小时之前（含）的事件
@@ -198,10 +196,12 @@ def get_balance_history(
                 timestamp=hour_ts,
             ))
 
-        # 应用剩余事件
+        # 应用剩余事件到最后一个点
         while evt_idx < len(events):
             bal = events[evt_idx].balance_after
             evt_idx += 1
+        if result:
+            result[-1] = BalanceHistoryItem(acconutValue=bal, timestamp=result[-1].timestamp)
 
         return result
 
