@@ -164,56 +164,44 @@ def get_balance_history(
             .all()
         )
 
-        result: list[BalanceHistoryItem] = []
-
-        # 起点：今天 12:00 AM
-        result.append(BalanceHistoryItem(
-            acconutValue=opening_balance,
-            timestamp=int(midnight.timestamp()),
-        ))
-
-        # 每个事件前加一个同余额的点（画阶梯），再加事件后的余额
+        # 把事件按时间戳存成 dict: { timestamp_seconds: balance_after }
+        event_map: dict[int, float] = {}
         running = opening_balance
         for evt in events:
             evt_ts = int(evt.created_at.timestamp())
-            # 事件前一秒（保持旧余额，形成阶梯效果）
-            result.append(BalanceHistoryItem(
-                acconutValue=running,
-                timestamp=evt_ts - 1,
-            ))
             running = evt.balance_after
-            # 事件后（新余额）
+            event_map[evt_ts] = running
+
+        # 当前余额
+        current_balance = running
+
+        # 构建每小时的点：0:00, 1:00, 2:00, ... 到当前小时
+        result: list[BalanceHistoryItem] = []
+        bal = opening_balance
+
+        for h in range(0, now.hour + 1):
+            hour_ts = int((midnight + timedelta(hours=h)).timestamp())
+
+            # 应用这个小时之前（含）发生的所有事件
+            for evt_ts in sorted(event_map.keys()):
+                if evt_ts <= hour_ts:
+                    bal = event_map.pop(evt_ts)
+
             result.append(BalanceHistoryItem(
-                acconutValue=running,
-                timestamp=evt_ts,
+                acconutValue=bal,
+                timestamp=hour_ts,
             ))
 
-        # 终点：当前时间
-        result.append(BalanceHistoryItem(
-            acconutValue=running,
-            timestamp=int(now.timestamp()),
-        ))
-
-        # 如果一天没事件（只有起点+终点），在中间补几个点让图好看
-        if not events:
-            current_snap = (
-                db.query(BalanceSnapshot)
-                .filter(
-                    BalanceSnapshot.user_id == current_user.id,
-                    BalanceSnapshot.snapshot_date == today,
-                )
-                .first()
-            )
-            bal = current_snap.balance if current_snap else opening_balance
-            # 每 4 小时加个点
-            for h in range(4, now.hour + 1, 4):
-                t = midnight + timedelta(hours=h)
-                result.append(BalanceHistoryItem(
-                    acconutValue=bal,
-                    timestamp=int(t.timestamp()),
-                ))
-            result[-1] = BalanceHistoryItem(acconutValue=bal, timestamp=int(now.timestamp()))
-            result.sort(key=lambda x: x.timestamp)
+        # 终点：当前时间（如果不是整点）
+        now_ts = int(now.timestamp())
+        # 应用剩余事件
+        for evt_ts in sorted(event_map.keys()):
+            bal = event_map[evt_ts]
+        if not result or result[-1].timestamp != now_ts:
+            result.append(BalanceHistoryItem(
+                acconutValue=current_balance,
+                timestamp=now_ts,
+            ))
 
         return result
 
