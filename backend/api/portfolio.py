@@ -13,7 +13,7 @@ from backend.deps import get_db, get_current_user
 from backend.models.user import User
 from backend.models.trade import Trade
 from backend.models.follow import Follow
-from backend.models.setting import BalanceSnapshot
+from backend.models.setting import BalanceSnapshot, BalanceEvent
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
 
@@ -86,7 +86,6 @@ def get_profile_data(
     )
     total_trades = db.query(Trade).filter(Trade.user_id == current_user.id).count()
 
-    # 最新余额
     latest_snapshot = (
         db.query(BalanceSnapshot)
         .filter(BalanceSnapshot.user_id == current_user.id)
@@ -95,7 +94,6 @@ def get_profile_data(
     )
     account_value = latest_snapshot.balance if latest_snapshot else 0.0
 
-    # 计算连胜
     recent_trades = (
         db.query(Trade)
         .filter(Trade.user_id == current_user.id, Trade.status == "closed")
@@ -137,9 +135,90 @@ def get_balance_history(
 ):
     """盈亏曲线（匹配前端 BalanceHistoryResponse）"""
     now = datetime.now(timezone.utc)
+
+    # ── "D" 视图：用事件日志重建当天时间线 ──
     if timeRange == "D":
-        since = now - timedelta(days=1)
-    elif timeRange == "W":
+        today = now.date()
+        midnight = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
+
+        # 昨天收盘余额 = 今天的起始余额
+        prev_snap = (
+            db.query(BalanceSnapshot)
+            .filter(
+                BalanceSnapshot.user_id == current_user.id,
+                BalanceSnapshot.snapshot_date < today,
+            )
+            .order_by(desc(BalanceSnapshot.snapshot_date))
+            .first()
+        )
+        opening_balance = prev_snap.balance if prev_snap else 0.0
+
+        # 今天的事件
+        events = (
+            db.query(BalanceEvent)
+            .filter(
+                BalanceEvent.user_id == current_user.id,
+                BalanceEvent.created_at >= midnight,
+            )
+            .order_by(BalanceEvent.created_at)
+            .all()
+        )
+
+        result: list[BalanceHistoryItem] = []
+
+        # 起点：今天 12:00 AM
+        result.append(BalanceHistoryItem(
+            acconutValue=opening_balance,
+            timestamp=int(midnight.timestamp()),
+        ))
+
+        # 每个事件前加一个同余额的点（画阶梯），再加事件后的余额
+        running = opening_balance
+        for evt in events:
+            evt_ts = int(evt.created_at.timestamp())
+            # 事件前一秒（保持旧余额，形成阶梯效果）
+            result.append(BalanceHistoryItem(
+                acconutValue=running,
+                timestamp=evt_ts - 1,
+            ))
+            running = evt.balance_after
+            # 事件后（新余额）
+            result.append(BalanceHistoryItem(
+                acconutValue=running,
+                timestamp=evt_ts,
+            ))
+
+        # 终点：当前时间
+        result.append(BalanceHistoryItem(
+            acconutValue=running,
+            timestamp=int(now.timestamp()),
+        ))
+
+        # 如果一天没事件（只有起点+终点），在中间补几个点让图好看
+        if not events:
+            current_snap = (
+                db.query(BalanceSnapshot)
+                .filter(
+                    BalanceSnapshot.user_id == current_user.id,
+                    BalanceSnapshot.snapshot_date == today,
+                )
+                .first()
+            )
+            bal = current_snap.balance if current_snap else opening_balance
+            # 每 4 小时加个点
+            for h in range(4, now.hour + 1, 4):
+                t = midnight + timedelta(hours=h)
+                result.append(BalanceHistoryItem(
+                    acconutValue=bal,
+                    timestamp=int(t.timestamp()),
+                ))
+            result[-1] = BalanceHistoryItem(acconutValue=bal, timestamp=int(now.timestamp()))
+            result.sort(key=lambda x: x.timestamp)
+
+        return result
+
+    # ── 非 D 视图 ──
+    if timeRange == "W":
         since = now - timedelta(weeks=1)
     elif timeRange == "M":
         since = now - timedelta(days=30)
@@ -160,18 +239,7 @@ def get_balance_history(
 
     result: list[BalanceHistoryItem] = []
 
-    if timeRange == "D":
-        # ── "D" 视图：按天存的数据只有1个点，复制成两个时间点画平线 ──
-        if snapshots:
-            val = snapshots[-1].balance
-            # 当天 0:00
-            day_start = datetime.combine(snapshots[-1].snapshot_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-            result.append(BalanceHistoryItem(acconutValue=val, timestamp=int(day_start.timestamp())))
-            # 当前时间
-            result.append(BalanceHistoryItem(acconutValue=val, timestamp=int(now.timestamp())))
-        return result
-
-    # ── 非 D 视图：数据点不足 7 个时，在第一个快照前补 $0 ──
+    # 补零余额点：数据点不足 7 个时，在第一个快照前补 $0
     if snapshots and len(snapshots) < 7:
         first_date = snapshots[0].snapshot_date
         days_available = (first_date - since.date()).days
@@ -191,7 +259,7 @@ def get_balance_history(
                 )
             )
 
-    # ── 真实数据点 ──
+    # 真实数据点
     result.extend(
         BalanceHistoryItem(
             acconutValue=s.balance,

@@ -57,3 +57,18 @@ class BalanceSnapshot(Base):
 
     # Relationships
     user = relationship("User", back_populates="balance_snapshots")
+
+
+class BalanceEvent(Base):
+    """Individual deposit/withdraw event with exact timestamp for intraday chart."""
+    __tablename__ = "balance_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)  # 'deposit' | 'withdraw'
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    balance_after: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    # Relationships
+    user = relationship("User", back_populates="balance_events")
