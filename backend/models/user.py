@@ -25,3 +25,4 @@ class User(Base):
     alerts = relationship("Alert", back_populates="user", cascade="all, delete-orphan")
     copy_settings = relationship("CopySetting", back_populates="user", cascade="all, delete-orphan")
     balance_snapshots = relationship("BalanceSnapshot", back_populates="user", cascade="all, delete-orphan")
+    balance_events = relationship("BalanceEvent", back_populates="user")
