@@ -16,7 +16,7 @@ from backend.database import SessionLocal
 from backend.models.wallet import UserWallet, WalletDeposit
 from backend.models.setting import BalanceSnapshot, BalanceEvent
 from backend.services.wallet_manager import (
-    get_usdc_balance, bridge_usdc_to_hl, decrypt_key,
+    get_usdc_balance, bridge_usdc_to_hl, decrypt_key, ensure_gas,
 )
 
 logging.basicConfig(
@@ -54,6 +54,13 @@ def check_and_bridge():
                     db.commit()
 
                     try:
+                        # Ensure wallet has ETH for gas
+                        if not ensure_gas(w.address):
+                            deposit.status = "failed"
+                            db.commit()
+                            logger.error(f"[{w.address[:10]}...] No gas, skipping bridge")
+                            continue
+
                         tx_hash = bridge_usdc_to_hl(private_key, balance)
 
                         deposit.bridge_tx_hash = tx_hash

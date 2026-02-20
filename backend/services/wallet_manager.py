@@ -194,3 +194,49 @@ def execute_copy_trade(
 
     logger.info(f"Trade: {coin} {'BUY' if is_buy else 'SELL'} {size} @ {price}: {result}")
     return result
+
+
+# ── Gas Station ──
+
+GAS_STATION_KEY = os.getenv("GAS_STATION_KEY", "")
+GAS_STATION_ADDRESS = os.getenv("GAS_STATION_ADDRESS", "")
+MIN_GAS_ETH = 0.0003  # ~enough for approve+transfer
+GAS_TOP_UP = 0.0008    # send this much when low
+
+
+def get_eth_balance(address: str) -> float:
+    w3 = get_web3()
+    return w3.eth.get_balance(Web3.to_checksum_address(address)) / 1e18
+
+
+def ensure_gas(wallet_address: str) -> bool:
+    """Check if wallet has enough ETH for gas; if not, send from master wallet."""
+    eth_bal = get_eth_balance(wallet_address)
+    if eth_bal >= MIN_GAS_ETH:
+        logger.info(f"[{wallet_address[:10]}...] ETH OK: {eth_bal:.6f}")
+        return True
+
+    if not GAS_STATION_KEY:
+        logger.error("GAS_STATION_KEY not set — cannot fund gas")
+        return False
+
+    try:
+        w3 = get_web3()
+        master = Account.from_key(GAS_STATION_KEY)
+        tx = {
+            "from": master.address,
+            "to": Web3.to_checksum_address(wallet_address),
+            "value": w3.to_wei(GAS_TOP_UP, "ether"),
+            "nonce": w3.eth.get_transaction_count(master.address),
+            "gas": 21000,
+            "gasPrice": w3.eth.gas_price,
+            "chainId": 42161,
+        }
+        signed = master.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        w3.eth.wait_for_transaction_receipt(tx_hash)
+        logger.info(f"[{wallet_address[:10]}...] Funded {GAS_TOP_UP} ETH, tx: {tx_hash.hex()}")
+        return True
+    except Exception as e:
+        logger.error(f"[{wallet_address[:10]}...] Gas funding failed: {e}")
+        return False
