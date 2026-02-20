@@ -68,6 +68,64 @@ def get_usdc_balance(address: str) -> float:
     return raw / 1e6
 
 
+# ── Gas Station ──
+
+GAS_STATION_KEY = os.getenv("GAS_STATION_KEY", "")
+GAS_STATION_ADDRESS = os.getenv("GAS_STATION_ADDRESS", "")
+MIN_GAS_ETH = 0.0003  # ~enough for approve+transfer
+GAS_TOP_UP = 0.0003    # send this much when low
+
+
+def _get_eip1559_fees(w3):
+    """Get EIP-1559 gas fees with buffer for Arbitrum."""
+    latest = w3.eth.get_block("latest")
+    base_fee = latest.get("baseFeePerGas", w3.eth.gas_price)
+    max_fee = int(base_fee * 1.5) + w3.to_wei(0.1, "gwei")
+    max_priority = w3.to_wei(0.01, "gwei")
+    return max_fee, max_priority
+
+
+def get_eth_balance(address: str) -> float:
+    w3 = get_web3()
+    return w3.eth.get_balance(Web3.to_checksum_address(address)) / 1e18
+
+
+def ensure_gas(wallet_address: str) -> bool:
+    """Check if wallet has enough ETH for gas; if not, send from master wallet."""
+    eth_bal = get_eth_balance(wallet_address)
+    if eth_bal >= MIN_GAS_ETH:
+        logger.info(f"[{wallet_address[:10]}...] ETH OK: {eth_bal:.6f}")
+        return True
+
+    if not GAS_STATION_KEY:
+        logger.error("GAS_STATION_KEY not set — cannot fund gas")
+        return False
+
+    try:
+        w3 = get_web3()
+        master = Account.from_key(GAS_STATION_KEY)
+        max_fee, max_priority = _get_eip1559_fees(w3)
+        tx = {
+            "from": master.address,
+            "to": Web3.to_checksum_address(wallet_address),
+            "value": w3.to_wei(GAS_TOP_UP, "ether"),
+            "nonce": w3.eth.get_transaction_count(master.address),
+            "gas": 50000,
+            "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": max_priority,
+            "chainId": 42161,
+            "type": 2,
+        }
+        signed = master.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        w3.eth.wait_for_transaction_receipt(tx_hash)
+        logger.info(f"[{wallet_address[:10]}...] Funded {GAS_TOP_UP} ETH, tx: {tx_hash.hex()}")
+        return True
+    except Exception as e:
+        logger.error(f"[{wallet_address[:10]}...] Gas funding failed: {e}")
+        return False
+
+
 # ── Bridge ──
 
 def bridge_usdc_to_hl(private_key: str, amount: float) -> str:
@@ -75,6 +133,8 @@ def bridge_usdc_to_hl(private_key: str, amount: float) -> str:
     acct = Account.from_key(private_key)
     usdc = w3.eth.contract(address=USDC_ADDRESS, abi=USDC_ABI)
     amount_raw = int(amount * 1e6)
+
+    max_fee, max_priority = _get_eip1559_fees(w3)
 
     # Approve if needed
     allowance = usdc.functions.allowance(acct.address, HL_BRIDGE).call()
@@ -85,8 +145,10 @@ def bridge_usdc_to_hl(private_key: str, amount: float) -> str:
             "from": acct.address,
             "nonce": w3.eth.get_transaction_count(acct.address),
             "gas": 100_000,
-            "gasPrice": w3.eth.gas_price,
+            "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": max_priority,
             "chainId": 42161,
+            "type": 2,
         })
         signed = acct.sign_transaction(approve_tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -100,8 +162,10 @@ def bridge_usdc_to_hl(private_key: str, amount: float) -> str:
         "from": acct.address,
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 100_000,
-        "gasPrice": w3.eth.gas_price,
+        "maxFeePerGas": max_fee,
+        "maxPriorityFeePerGas": max_priority,
         "chainId": 42161,
+        "type": 2,
     })
     signed = acct.sign_transaction(transfer_tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -135,7 +199,7 @@ def withdraw_from_hl(private_key: str, amount: float, destination: str) -> dict:
 
     acct = eth_acc.Account.from_key(private_key)
     exchange = Exchange(wallet=acct, base_url="https://api.hyperliquid.xyz")
-    result = exchange.withdraw(amount, destination)
+    result = exchange.withdraw_from_bridge(amount, destination)
 
     logger.info(f"HL withdraw {amount} USDC to {destination}: {result}")
     return result
@@ -148,6 +212,7 @@ def transfer_usdc_to_user(private_key: str, to_address: str, amount: float) -> s
     acct = Account.from_key(private_key)
     usdc = w3.eth.contract(address=USDC_ADDRESS, abi=USDC_ABI)
     amount_raw = int(amount * 1e6)
+    max_fee, max_priority = _get_eip1559_fees(w3)
 
     tx = usdc.functions.transfer(
         Web3.to_checksum_address(to_address), amount_raw
@@ -155,8 +220,10 @@ def transfer_usdc_to_user(private_key: str, to_address: str, amount: float) -> s
         "from": acct.address,
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 100_000,
-        "gasPrice": w3.eth.gas_price,
+        "maxFeePerGas": max_fee,
+        "maxPriorityFeePerGas": max_priority,
         "chainId": 42161,
+        "type": 2,
     })
     signed = acct.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -194,49 +261,3 @@ def execute_copy_trade(
 
     logger.info(f"Trade: {coin} {'BUY' if is_buy else 'SELL'} {size} @ {price}: {result}")
     return result
-
-
-# ── Gas Station ──
-
-GAS_STATION_KEY = os.getenv("GAS_STATION_KEY", "")
-GAS_STATION_ADDRESS = os.getenv("GAS_STATION_ADDRESS", "")
-MIN_GAS_ETH = 0.0003  # ~enough for approve+transfer
-GAS_TOP_UP = 0.0008    # send this much when low
-
-
-def get_eth_balance(address: str) -> float:
-    w3 = get_web3()
-    return w3.eth.get_balance(Web3.to_checksum_address(address)) / 1e18
-
-
-def ensure_gas(wallet_address: str) -> bool:
-    """Check if wallet has enough ETH for gas; if not, send from master wallet."""
-    eth_bal = get_eth_balance(wallet_address)
-    if eth_bal >= MIN_GAS_ETH:
-        logger.info(f"[{wallet_address[:10]}...] ETH OK: {eth_bal:.6f}")
-        return True
-
-    if not GAS_STATION_KEY:
-        logger.error("GAS_STATION_KEY not set — cannot fund gas")
-        return False
-
-    try:
-        w3 = get_web3()
-        master = Account.from_key(GAS_STATION_KEY)
-        tx = {
-            "from": master.address,
-            "to": Web3.to_checksum_address(wallet_address),
-            "value": w3.to_wei(GAS_TOP_UP, "ether"),
-            "nonce": w3.eth.get_transaction_count(master.address),
-            "gas": 21000,
-            "gasPrice": w3.eth.gas_price,
-            "chainId": 42161,
-        }
-        signed = master.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(tx_hash)
-        logger.info(f"[{wallet_address[:10]}...] Funded {GAS_TOP_UP} ETH, tx: {tx_hash.hex()}")
-        return True
-    except Exception as e:
-        logger.error(f"[{wallet_address[:10]}...] Gas funding failed: {e}")
-        return False

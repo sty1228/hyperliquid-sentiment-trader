@@ -1,9 +1,13 @@
 import time
 import logging
+import threading
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from backend.deps import get_db
+from backend.database import SessionLocal
+from backend.models.setting import BalanceSnapshot, BalanceEvent
 from backend.api.auth import get_current_user
 from backend.models.wallet import UserWallet, WalletDeposit
 from backend.services.wallet_manager import (
@@ -115,6 +119,51 @@ def get_deposit_history(
     ]
 
 
+def _process_withdraw_background(user_id: str, wallet_address: str, withdraw_address: str, private_key: str, amount: float):
+    """Background thread: wait for USDC on Arb, then transfer to user wallet."""
+    db = SessionLocal()
+    try:
+        from backend.services.wallet_manager import get_usdc_balance, transfer_usdc_to_user, ensure_gas
+
+        # Wait for USDC to land on Arb (up to 5 min)
+        for i in range(60):
+            time.sleep(5)
+            bal = get_usdc_balance(wallet_address)
+            if bal >= amount * 0.99:
+                logger.info(f"[Withdraw] USDC landed: {bal:.2f} for user {user_id}")
+                break
+        else:
+            logger.error(f"[Withdraw] Timeout waiting for USDC on Arb for user {user_id}")
+            return
+
+        # Ensure gas for transfer
+        ensure_gas(wallet_address)
+
+        # Transfer to user wallet
+        tx_hash = transfer_usdc_to_user(private_key, withdraw_address, amount)
+        logger.info(f"[Withdraw] Sent {amount:.2f} USDC to {withdraw_address}, tx: {tx_hash}")
+
+        # Update BalanceSnapshot
+        snapshot = db.query(BalanceSnapshot).filter(BalanceSnapshot.user_id == user_id).first()
+        if snapshot:
+            snapshot.balance = max(0, snapshot.balance - amount)
+            snapshot.available = max(0, snapshot.available - amount)
+
+        event = BalanceEvent(
+            user_id=user_id,
+            event_type="withdraw",
+            amount=amount,
+            balance_after=snapshot.balance if snapshot else 0,
+        )
+        db.add(event)
+        db.commit()
+
+    except Exception as e:
+        logger.error(f"[Withdraw] Background failed for user {user_id}: {e}")
+    finally:
+        db.close()
+
+
 @router.post("/withdraw", response_model=WithdrawResponse)
 def withdraw_to_user(
     req: WithdrawRequest,
@@ -138,27 +187,20 @@ def withdraw_to_user(
         )
 
     try:
-        # 1. Withdraw from HL to dedicated wallet on Arb
+        # 1. Withdraw from HL (this is fast — just a signed API call)
         withdraw_from_hl(private_key, req.amount, wallet.address)
 
-        # 2. Wait for USDC to land on Arb
-        for _ in range(60):
-            time.sleep(5)
-            bal = get_usdc_balance(wallet.address)
-            if bal >= req.amount * 0.99:
-                break
-        else:
-            return WithdrawResponse(
-                status="pending",
-                message="HL withdrawal initiated but USDC hasn't landed yet. It will be sent automatically.",
-            )
-
-        # 3. Transfer to user's whitelisted wallet
-        tx_hash = transfer_usdc_to_user(private_key, wallet.withdraw_address, req.amount)
+        # 2. Start background thread to wait for USDC and transfer to user
+        t = threading.Thread(
+            target=_process_withdraw_background,
+            args=(user.id, wallet.address, wallet.withdraw_address, private_key, req.amount),
+            daemon=True,
+        )
+        t.start()
 
         return WithdrawResponse(
-            status="success",
-            message=f"Sent {req.amount:.2f} USDC to {wallet.withdraw_address}. Tx: {tx_hash}",
+            status="processing",
+            message=f"Withdrawal of {req.amount:.2f} USDC initiated. Funds will arrive in your wallet in ~5 minutes.",
         )
 
     except Exception as e:
