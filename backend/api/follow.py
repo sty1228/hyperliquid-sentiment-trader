@@ -1,15 +1,15 @@
 """
-Follow API — 关注/取关 Trader
+Follow API — 关注/取关 Trader，含 stats
 """
 from __future__ import annotations
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from backend.deps import get_db, get_current_user
 from backend.models.user import User
-from backend.models.trader import Trader
+from backend.models.trader import Trader, TraderStats
 from backend.models.follow import Follow
 
 router = APIRouter(prefix="/api", tags=["follow"])
@@ -36,6 +36,12 @@ class FollowListItem(BaseModel):
     avatar_url: str | None = None
     is_copy_trading: bool
     created_at: datetime
+    # Stats
+    win_rate: float = 0.0
+    total_profit_usd: float = 0.0
+    total_signals: int = 0
+    avg_return_pct: float = 0.0
+    profit_grade: str | None = None
 
 
 # ── API 端点 ─────────────────────────────────────────────
@@ -102,28 +108,44 @@ def unfollow_trader(
 
 @router.get("/follows", response_model=list[FollowListItem])
 def get_my_follows(
+    window: str = Query("30d", regex="^(24h|7d|30d)$"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取我关注的所有 Trader"""
+    """获取我关注的所有 Trader（含 stats）"""
     follows = (
         db.query(Follow)
         .filter(Follow.user_id == current_user.id)
+        .order_by(Follow.created_at.desc())
         .all()
     )
 
     result = []
     for f in follows:
         trader = db.query(Trader).filter(Trader.id == f.trader_id).first()
-        if trader:
-            result.append(FollowListItem(
-                id=f.id,
-                trader_username=trader.username,
-                display_name=trader.display_name,
-                avatar_url=trader.avatar_url,
-                is_copy_trading=f.is_copy_trading,
-                created_at=f.created_at,
-            ))
+        if not trader:
+            continue
+
+        # 取对应窗口的 stats
+        stats = (
+            db.query(TraderStats)
+            .filter(TraderStats.trader_id == trader.id, TraderStats.window == window)
+            .first()
+        )
+
+        result.append(FollowListItem(
+            id=f.id,
+            trader_username=trader.username,
+            display_name=trader.display_name,
+            avatar_url=trader.avatar_url,
+            is_copy_trading=f.is_copy_trading,
+            created_at=f.created_at,
+            win_rate=stats.win_rate if stats else 0.0,
+            total_profit_usd=stats.total_profit_usd if stats else 0.0,
+            total_signals=stats.total_signals if stats else 0,
+            avg_return_pct=stats.avg_return_pct if stats else 0.0,
+            profit_grade=stats.profit_grade if stats else None,
+        ))
     return result
 
 
