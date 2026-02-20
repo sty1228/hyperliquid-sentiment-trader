@@ -13,6 +13,7 @@ from backend.api.portfolio import router as portfolio_router
 from backend.api.trades import router as trades_router
 from backend.api.alerts import router as alerts_router
 from backend.api.deposit import router as deposit_router
+from backend.api.wallet import router as wallet_router          # ← NEW
 
 settings = get_settings()
 
@@ -37,6 +38,7 @@ app.include_router(portfolio_router)
 app.include_router(trades_router)
 app.include_router(alerts_router)
 app.include_router(deposit_router)
+app.include_router(wallet_router)                                # ← NEW
 
 @app.get("/")
 def root():

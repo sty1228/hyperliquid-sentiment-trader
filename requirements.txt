@@ -18,6 +18,10 @@ python-dotenv==1.0.1
 httpx==0.28.1
 python-multipart==0.0.20
 
+# Dedicated wallet system
+web3>=6.0.0
+cryptography>=41.0.0
+
 # Existing deps (keep for pipeline)
 openai>=1.0
 pandas>=2.0
