@@ -13,7 +13,8 @@ from backend.api.portfolio import router as portfolio_router
 from backend.api.trades import router as trades_router
 from backend.api.alerts import router as alerts_router
 from backend.api.deposit import router as deposit_router
-from backend.api.wallet import router as wallet_router          # ← NEW
+from backend.api.wallet import router as wallet_router  
+from backend.api.explore import router as explore_router
 
 settings = get_settings()
 
@@ -39,7 +40,13 @@ app.include_router(trades_router)
 app.include_router(alerts_router)
 app.include_router(deposit_router)
 app.include_router(wallet_router)                                # ← NEW
+app.include_router(explore_router)
+
 
 @app.get("/")
 def root():
     return {"ok": True, "message": "HyperCopy API v3", "docs": "/docs"}
+
+
+
+
