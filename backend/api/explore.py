@@ -67,15 +67,17 @@ def get_token_sentiment(
     for r in rows:
         total = r.total or 0
         bull = r.bull or 0
-        result.append(TokenSentimentItem(
-            ticker=r.ticker,
-            total_signals=total,
-            bull_count=bull,
-            bear_count=(r.bear or 0),
-            bull_pct=round((bull / max(bull + (r.bear or 0), 1) * 100), 1),
-            avg_pnl=float(r.avg_pnl or 0),
-            latest_price=float(r.latest_price) if r.latest_price else None,
-        ))
+        result.append(
+            TokenSentimentItem(
+                ticker=r.ticker,
+                total_signals=total,
+                bull_count=bull,
+                bear_count=(r.bear or 0),
+                bull_pct=round((bull / max(bull + (r.bear or 0), 1) * 100), 1),
+                avg_pnl=float(r.avg_pnl or 0),
+                latest_price=float(r.latest_price) if r.latest_price else None,
+            )
+        )
     return result
 
 
@@ -111,15 +113,17 @@ def get_rising_traders(
         trader = db.query(Trader).filter(Trader.id == tid).first()
         if not trader:
             continue
-        result.append(RisingTraderItem(
-            username=trader.username,
-            display_name=trader.display_name,
-            avatar_url=trader.avatar_url,
-            profit_grade=s7.profit_grade,
-            win_rate=s7.win_rate,
-            avg_return_pct=s7.avg_return_pct or 0,
-            total_signals=s7.total_signals,
-            streak=s7.streak,
-            points_change=round(change, 2),
-        ))
+        result.append(
+            RisingTraderItem(
+                username=trader.username,
+                display_name=trader.display_name,
+                avatar_url=trader.avatar_url,
+                profit_grade=s7.profit_grade,
+                win_rate=s7.win_rate,
+                avg_return_pct=s7.avg_return_pct or 0,
+                total_signals=s7.total_signals,
+                streak=s7.streak,
+                points_change=round(change, 2),
+            )
+        )
     return result
