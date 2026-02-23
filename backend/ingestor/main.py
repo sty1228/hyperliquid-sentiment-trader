@@ -269,6 +269,7 @@ def _state_db_connect() -> sqlite3.Connection:
         ("empty_polls",        "INTEGER NOT NULL DEFAULT 0"),
         ("poll_interval_h",    "REAL NOT NULL DEFAULT 2.0"),
         ("last_polled_at",     "TEXT"),
+        ("last_profile_at",    "TEXT"),
     ]:
         try:
             con.execute(f"ALTER TABLE user_state ADD COLUMN {col} {defn}")
@@ -310,6 +311,30 @@ def _state_should_poll(con: sqlite3.Connection, username: str) -> bool:
     next_poll = last_polled + timedelta(hours=interval_h)
     return datetime.now(timezone.utc) >= next_poll
 
+PROFILE_REFRESH_DAYS = 7  # only fetch profile once a week
+
+
+def _state_needs_profile_refresh(con: sqlite3.Connection, username: str) -> bool:
+    row = con.execute(
+        "SELECT last_profile_at FROM user_state WHERE username = ?",
+        (username,),
+    ).fetchone()
+    if not row or not row[0]:
+        return True
+    try:
+        last = datetime.fromisoformat(row[0])
+        return datetime.now(timezone.utc) - last > timedelta(days=PROFILE_REFRESH_DAYS)
+    except Exception:
+        return True
+
+
+def _state_update_profile_time(con: sqlite3.Connection, username: str):
+    now = datetime.now(timezone.utc).isoformat()
+    con.execute(
+        "UPDATE user_state SET last_profile_at = ? WHERE username = ?",
+        (now, username),
+    )
+    con.commit()
 
 def _state_save(con: sqlite3.Connection, username: str, user_id: str,
                 last_tweet_id: Optional[str] = None,
@@ -893,16 +918,22 @@ def run_once(max_days: int = 7, batch_size: int = 20, force_all: bool = False):
         print(f"[{i+1}/{len(users)}] Fetching @{username}")
         print(f"{'='*50}")
 
-        profile = _resolve_user_profile(username, state_con)
-        if not profile:
-            print(f"  ✗ Could not resolve @{username}, skipping")
-            continue
+        cached_uid = _state_get_user_id(state_con, username)
+        needs_profile = _state_needs_profile_refresh(state_con, username)
 
-        uid = profile["user_id"]
-        user_profiles[username] = profile
-
-        if _state_get_user_id(state_con, username):
+        if needs_profile or not cached_uid:
+            profile = _resolve_user_profile(username, state_con)
+            if not profile:
+                print(f"  ✗ Could not resolve @{username}, skipping")
+                continue
+            uid = profile["user_id"]
+            user_profiles[username] = profile
+            _state_update_profile_time(state_con, username)
+            print(f"  ↻ Profile refreshed (weekly)")
+        else:
+            uid = cached_uid
             api_calls_saved += 1
+            print(f"  ✓ Using cached uid (profile fresh)")
 
         since_id = _state_get_since_id(state_con, username)
         tweets = _fetch_user_tweets(uid, username, since_id=since_id, max_days=max_days)
