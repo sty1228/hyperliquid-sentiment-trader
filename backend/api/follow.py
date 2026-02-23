@@ -44,6 +44,11 @@ class FollowListItem(BaseModel):
     profit_grade: str | None = None
 
 
+class FollowStatusResponse(BaseModel):
+    is_following: bool
+    is_copy_trading: bool
+
+
 # ── API 端点 ─────────────────────────────────────────────
 
 @router.post("/follow", response_model=FollowResponse)
@@ -52,7 +57,7 @@ def follow_trader(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """关注一个 Trader"""
+    """关注一个 Trader（幂等：已关注则返回现有记录，按需更新 copy_trading）"""
     trader = db.query(Trader).filter(Trader.username == body.trader_username).first()
     if not trader:
         raise HTTPException(404, f"Trader @{body.trader_username} not found")
@@ -63,7 +68,17 @@ def follow_trader(
         .first()
     )
     if existing:
-        raise HTTPException(400, "Already following this trader")
+        # 幂等：如果请求开启 copy trading 但当前未开启，则更新
+        if body.is_copy_trading and not existing.is_copy_trading:
+            existing.is_copy_trading = True
+            db.commit()
+            db.refresh(existing)
+        return FollowResponse(
+            id=existing.id,
+            trader_username=trader.username,
+            is_copy_trading=existing.is_copy_trading,
+            created_at=existing.created_at,
+        )
 
     follow = Follow(
         user_id=current_user.id,
@@ -79,6 +94,28 @@ def follow_trader(
         trader_username=trader.username,
         is_copy_trading=follow.is_copy_trading,
         created_at=follow.created_at,
+    )
+
+
+@router.get("/follow/check/{trader_username}", response_model=FollowStatusResponse)
+def check_follow_status(
+    trader_username: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """检查是否已关注某 Trader"""
+    trader = db.query(Trader).filter(Trader.username == trader_username).first()
+    if not trader:
+        return FollowStatusResponse(is_following=False, is_copy_trading=False)
+
+    follow = (
+        db.query(Follow)
+        .filter(Follow.user_id == current_user.id, Follow.trader_id == trader.id)
+        .first()
+    )
+    return FollowStatusResponse(
+        is_following=follow is not None,
+        is_copy_trading=follow.is_copy_trading if follow else False,
     )
 
 
@@ -126,7 +163,6 @@ def get_my_follows(
         if not trader:
             continue
 
-        # 取对应窗口的 stats
         stats = (
             db.query(TraderStats)
             .filter(TraderStats.trader_id == trader.id, TraderStats.window == window)
