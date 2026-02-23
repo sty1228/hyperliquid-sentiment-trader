@@ -1,3 +1,16 @@
+"""
+HyperCopy Trading Engine
+=========================
+Background service handling the full trade lifecycle:
+  1. Signal Processing   — new KOL signals → copy trades for followers
+  2. Position Management — live PnL, TP/SL enforcement, auto-close
+  3. Signal Price Update  — keep pct_change fresh for leaderboard
+  4. Balance Sync         — HL equity → BalanceSnapshot
+  5. Stats Recompute      — refresh TraderStats for leaderboard
+
+Run:  python -m backend.services.trading_engine
+"""
+
 import os, sys, time, math, logging, requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -235,6 +248,17 @@ def _execute_for_user(
     if dup:
         return
 
+    # ── prevent duplicate: already have open position on same coin from same trader ──
+    existing_pos = db.query(Trade).filter(
+        Trade.user_id == user_id,
+        Trade.ticker == coin,
+        Trade.trader_username == (db.query(Trader.username).filter(Trader.id == sig.trader_id).scalar()),
+        Trade.status == "open",
+    ).first()
+    if existing_pos:
+        log.debug(f"  skip user {user_id[:8]}… already has open {coin} from same trader")
+        return
+
     # ── size calculation ──
     if settings and settings.size_type == "fixed_usd":
         usd_alloc = min(settings.size_value, equity * 0.9)
@@ -252,9 +276,10 @@ def _execute_for_user(
     slip = SLIPPAGE_BPS / 10_000
     price = round(mid * (1 + slip) if is_buy else mid * (1 - slip), 6)
 
-    # ── set leverage ──
+    # ── set leverage (respect cross/isolated setting) ──
     pk = decrypt_key(wallet.encrypted_private_key)
-    _hl_set_leverage(pk, coin, int(leverage))
+    is_cross = (settings.margin_mode == "cross") if settings else True
+    _hl_set_leverage(pk, coin, int(leverage), cross=is_cross)
 
     # ── place order ──
     result = execute_copy_trade(
