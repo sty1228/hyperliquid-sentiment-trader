@@ -1,52 +1,52 @@
 from __future__ import annotations
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from typing import Generator, Optional
+from fastapi import Depends, HTTPException, Header
+from sqlalchemy.orm import Session
+import jwt
 
+from backend.database import SessionLocal
 from backend.config import get_settings
-from backend.api.health import router as health_router
-from backend.api.auth import router as auth_router
-from backend.api.leaderboard import router as leaderboard_router
-from backend.api.trader import router as trader_router
-from backend.api.follow import router as follow_router
-from backend.api.settings import router as settings_router
-from backend.api.portfolio import router as portfolio_router
-from backend.api.trades import router as trades_router
-from backend.api.alerts import router as alerts_router
-from backend.api.deposit import router as deposit_router
-from backend.api.wallet import router as wallet_router  
-from backend.api.explore import router as explore_router
+from backend.models.user import User
 
 settings = get_settings()
 
-app = FastAPI(title="HyperCopy API", version="3.0.0")
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def get_current_user(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+) -> User:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Not authenticated")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGO])
+        user_id: str = payload.get("sub")
+        if not user_id:
+            raise HTTPException(401, "Invalid token")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
 
-# Mount routers
-app.include_router(health_router)
-app.include_router(auth_router)
-app.include_router(leaderboard_router)
-app.include_router(trader_router)
-app.include_router(follow_router)
-app.include_router(settings_router)
-app.include_router(portfolio_router)
-app.include_router(trades_router)
-app.include_router(alerts_router)
-app.include_router(deposit_router)
-app.include_router(wallet_router)                                # ← NEW
-app.include_router(explore_router)
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(401, "User not found")
+    return user
 
-
-@app.get("/")
-def root():
-    return {"ok": True, "message": "HyperCopy API v3", "docs": "/docs"}
-
-
-
-
+def get_optional_user(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+) -> Optional[User]:
+    """Same as get_current_user but returns None instead of 401."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    try:
+        return get_current_user(authorization=authorization, db=db)
+    except HTTPException:
+        return None
