@@ -9,9 +9,9 @@ from backend.models.setting import BalanceSnapshot, BalanceEvent
 from backend.api.auth import get_current_user
 from backend.models.wallet import UserWallet, WalletDeposit
 from backend.services.wallet_manager import (
-    generate_wallet, encrypt_key, decrypt_key,
+    generate_wallet, encrypt_key,
     get_usdc_balance, get_hl_balance,
-    withdraw_from_hl, CHAIN_ID_TO_LZ_EID,
+    CHAIN_ID_TO_LZ_EID,
 )
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,11 @@ router = APIRouter(prefix="/api/wallet", tags=["wallet"])
 
 # Allowed withdraw destination chain IDs
 ALLOWED_WITHDRAW_CHAINS = {42161} | set(CHAIN_ID_TO_LZ_EID.keys())
+
+CHAIN_NAMES = {
+    42161: "Arbitrum", 1: "Ethereum", 10: "Optimism", 137: "Polygon",
+    8453: "Base", 43114: "Avalanche", 5000: "Mantle", 534352: "Scroll",
+}
 
 
 class WalletResponse(BaseModel):
@@ -37,7 +42,7 @@ class BalanceResponse(BaseModel):
 
 class WithdrawRequest(BaseModel):
     amount: float
-    chain_id: int = 42161  # Default: Arbitrum (direct transfer)
+    chain_id: int = 42161
 
 
 class WithdrawResponse(BaseModel):
@@ -168,7 +173,14 @@ def get_transactions(
 
 
 # ═══════════════════════════════════════════════════════
-# Withdraw — supports multi-chain via Stargate V2
+# Withdraw — just set flag, deposit_monitor handles everything
+#
+# Flow:
+#   1. API: validate balance, record tx, set withdraw_pending=True
+#   2. Monitor detects withdraw_pending + HL balance:
+#      a) usd_transfer to master wallet (free, instant)
+#      b) master Arb USDC → user's wallet (15s)
+#   3. No $1 HL bridge fee in normal path
 # ═══════════════════════════════════════════════════════
 
 @router.post("/withdraw", response_model=WithdrawResponse)
@@ -193,19 +205,19 @@ def withdraw_to_user(
             detail="A withdrawal is already in progress. Please wait.",
         )
 
-    private_key = decrypt_key(wallet.encrypted_private_key)
-
+    # Check HL balance (this is where the funds are)
     hl_state = get_hl_balance(wallet.address)
     if hl_state["withdrawable"] < req.amount:
         raise HTTPException(
             status_code=400,
-            detail=f"Insufficient HL balance. Available: {hl_state['withdrawable']:.2f}",
+            detail=f"Insufficient balance. Available: {hl_state['withdrawable']:.2f}",
         )
 
     is_cross_chain = req.chain_id != 42161
+    chain_name = CHAIN_NAMES.get(req.chain_id, f"chain {req.chain_id}")
 
     try:
-        # 1. Record transaction with target chain info
+        # 1. Record transaction
         tx_record = WalletDeposit(
             user_id=user.id,
             wallet_address=wallet.address,
@@ -217,44 +229,40 @@ def withdraw_to_user(
         )
         db.add(tx_record)
 
-        # 2. Set withdraw_pending — deposit_monitor will handle the transfer
+        # 2. Set withdraw_pending — monitor will handle everything
         wallet.withdraw_pending = True
         db.commit()
 
-        # 3. Call HL withdraw (signed API call, USDC lands on Arb in ~2 min)
-        withdraw_from_hl(private_key, req.amount, wallet.address)
-
-        # 4. Update status
-        tx_record.status = "hl_withdrawn"
-        db.commit()
+        # NOTE: We do NOT call withdraw_from_hl here anymore.
+        # The deposit_monitor will:
+        #   1. Detect HL balance + withdraw_pending
+        #   2. usd_transfer to master wallet (free)
+        #   3. Master pays user from Arb USDC
 
         if is_cross_chain:
-            chain_names = {
-                1: "Ethereum", 10: "Optimism", 137: "Polygon",
-                8453: "Base", 43114: "Avalanche", 5000: "Mantle", 534352: "Scroll",
-            }
-            chain_name = chain_names.get(req.chain_id, f"chain {req.chain_id}")
             msg = (
                 f"Withdrawal of {req.amount:.2f} USDC initiated. "
                 f"Bridging to {chain_name} via Stargate V2. "
-                f"Funds will arrive in ~5-8 minutes."
+                f"Funds will arrive in ~3-5 minutes."
             )
         else:
             msg = (
                 f"Withdrawal of {req.amount:.2f} USDC initiated. "
-                f"Funds will arrive in your Arbitrum wallet in ~3-5 minutes."
+                f"Funds will arrive in your Arbitrum wallet in ~1-2 minutes."
             )
 
         logger.info(
             f"[Withdraw] User {user.id}: {req.amount:.2f} USDC "
-            f"→ chain {req.chain_id} ({wallet.withdraw_address[:10]}...)"
+            f"→ {chain_name} ({wallet.withdraw_address[:10]}...). "
+            f"Monitor will process via zero-fee path."
         )
 
         return WithdrawResponse(status="processing", message=msg)
 
     except Exception as e:
         wallet.withdraw_pending = False
-        tx_record.status = "failed"
+        if tx_record:
+            tx_record.status = "failed"
         db.commit()
         logger.error(f"[Withdraw] Failed for user {user.id}: {e}")
         raise HTTPException(status_code=500, detail=f"Withdrawal failed: {str(e)}")
