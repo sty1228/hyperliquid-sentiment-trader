@@ -28,6 +28,11 @@ USDC_ABI = json.loads(
     '"name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}]'
 )
 
+# ── Master Wallet (gas station + USDC pool for withdrawals) ──
+
+MASTER_WALLET_KEY = os.getenv("GAS_STATION_KEY", "")
+MASTER_WALLET_ADDRESS = os.getenv("GAS_STATION_ADDRESS", "")
+
 # ── Stargate V2 Outbound Config (from Arbitrum) ──
 
 ARB_STARGATE_POOL_USDC = Web3.to_checksum_address(
@@ -110,7 +115,9 @@ STARGATE_POOL_ABI = json.loads("""[
 ]""")
 
 
-# ── Encryption ──
+# ═══════════════════════════════════════════════════════
+# Encryption
+# ═══════════════════════════════════════════════════════
 
 def get_fernet():
     if not WALLET_ENCRYPTION_KEY:
@@ -126,7 +133,9 @@ def decrypt_key(encrypted: str) -> str:
     return get_fernet().decrypt(encrypted.encode()).decode()
 
 
-# ── Wallet ──
+# ═══════════════════════════════════════════════════════
+# Wallet
+# ═══════════════════════════════════════════════════════
 
 def generate_wallet() -> dict:
     acct = Account.create()
@@ -136,7 +145,9 @@ def generate_wallet() -> dict:
     }
 
 
-# ── Web3 ──
+# ═══════════════════════════════════════════════════════
+# Web3
+# ═══════════════════════════════════════════════════════
 
 def get_web3() -> Web3:
     return Web3(Web3.HTTPProvider(ARB_RPC))
@@ -149,10 +160,10 @@ def get_usdc_balance(address: str) -> float:
     return raw / 1e6
 
 
-# ── Gas Station ──
+# ═══════════════════════════════════════════════════════
+# Gas Station
+# ═══════════════════════════════════════════════════════
 
-GAS_STATION_KEY = os.getenv("GAS_STATION_KEY", "")
-GAS_STATION_ADDRESS = os.getenv("GAS_STATION_ADDRESS", "")
 MIN_GAS_ETH = 0.0003
 GAS_TOP_UP = 0.0003
 
@@ -178,13 +189,13 @@ def ensure_gas(wallet_address: str, min_eth: float = MIN_GAS_ETH, top_up_eth: fl
         logger.info(f"[{wallet_address[:10]}...] ETH OK: {eth_bal:.6f}")
         return True
 
-    if not GAS_STATION_KEY:
+    if not MASTER_WALLET_KEY:
         logger.error("GAS_STATION_KEY not set — cannot fund gas")
         return False
 
     try:
         w3 = get_web3()
-        master = Account.from_key(GAS_STATION_KEY)
+        master = Account.from_key(MASTER_WALLET_KEY)
         max_fee, max_priority = _get_eip1559_fees(w3)
         tx = {
             "from": master.address,
@@ -207,7 +218,9 @@ def ensure_gas(wallet_address: str, min_eth: float = MIN_GAS_ETH, top_up_eth: fl
         return False
 
 
-# ── Bridge USDC to HyperLiquid ──
+# ═══════════════════════════════════════════════════════
+# Bridge USDC to HyperLiquid (deposit flow)
+# ═══════════════════════════════════════════════════════
 
 def bridge_usdc_to_hl(private_key: str, amount: float) -> str:
     w3 = get_web3()
@@ -254,20 +267,12 @@ def bridge_usdc_to_hl(private_key: str, amount: float) -> str:
     return receipt.transactionHash.hex()
 
 
-# ── Stargate V2 Bridge Out (Arb → other chain) ──
+# ═══════════════════════════════════════════════════════
+# Stargate V2 Bridge Out (Arb → other chain)
+# ═══════════════════════════════════════════════════════
 
 def stargate_bridge_out(private_key: str, amount: float, dest_chain_id: int, dest_address: str) -> str:
-    """Bridge USDC from Arbitrum to destination chain via Stargate V2.
-    
-    Args:
-        private_key: Dedicated wallet private key
-        amount: USDC amount to bridge
-        dest_chain_id: EVM chain ID (e.g. 1 for Ethereum, 8453 for Base)
-        dest_address: Recipient address on destination chain
-    
-    Returns:
-        Transaction hash
-    """
+    """Bridge USDC from Arbitrum to destination chain via Stargate V2."""
     lz_eid = CHAIN_ID_TO_LZ_EID.get(dest_chain_id)
     if not lz_eid:
         raise ValueError(f"Unsupported destination chain ID: {dest_chain_id}")
@@ -276,27 +281,21 @@ def stargate_bridge_out(private_key: str, amount: float, dest_chain_id: int, des
     acct = Account.from_key(private_key)
 
     amount_raw = int(amount * 1e6)
-    min_amount = int(amount_raw * 995 // 1000)  # 0.5% slippage tolerance
+    min_amount = int(amount_raw * 995 // 1000)
 
-    # Encode destination address as bytes32 (left-pad 20-byte address to 32)
     addr_bytes = bytes.fromhex(dest_address[2:] if dest_address.startswith("0x") else dest_address)
-    dest_bytes32 = b"\x00" * 12 + addr_bytes  # 32 bytes total
+    dest_bytes32 = b"\x00" * 12 + addr_bytes
 
     send_param = (
-        lz_eid,          # dstEid
-        dest_bytes32,    # to (bytes32)
-        amount_raw,      # amountLD
-        min_amount,      # minAmountLD
-        b"",             # extraOptions
-        b"",             # composeMsg
-        b"",             # oftCmd (taxi mode)
+        lz_eid, dest_bytes32, amount_raw, min_amount,
+        b"", b"", b"",  # extraOptions, composeMsg, oftCmd (taxi mode)
     )
 
     usdc = w3.eth.contract(address=USDC_ADDRESS, abi=USDC_ABI)
     pool = w3.eth.contract(address=ARB_STARGATE_POOL_USDC, abi=STARGATE_POOL_ABI)
     max_fee, max_priority = _get_eip1559_fees(w3)
 
-    # 1. Approve USDC to Stargate pool (if needed)
+    # 1. Approve USDC to Stargate pool
     allowance = usdc.functions.allowance(acct.address, ARB_STARGATE_POOL_USDC).call()
     if allowance < amount_raw:
         approve_tx = usdc.functions.approve(
@@ -317,19 +316,17 @@ def stargate_bridge_out(private_key: str, amount: float, dest_chain_id: int, des
 
     # 2. Quote LZ messaging fee
     msg_fee, _ = pool.functions.quoteSend(send_param, False).call()
-    native_fee = int(msg_fee[0] * 110 // 100)  # 10% buffer
+    native_fee = int(msg_fee[0] * 110 // 100)
 
     logger.info(
         f"Stargate quote: native_fee={native_fee} wei "
         f"({native_fee / 1e18:.6f} ETH) for chain {dest_chain_id}"
     )
 
-    # 3. Send token via Stargate
-    fee_param = (native_fee, 0)  # (nativeFee, lzTokenFee)
-
+    # 3. Send token
     nonce = w3.eth.get_transaction_count(acct.address)
     send_tx = pool.functions.sendToken(
-        send_param, fee_param, acct.address
+        send_param, (native_fee, 0), acct.address
     ).build_transaction({
         "from": acct.address,
         "value": native_fee,
@@ -351,7 +348,9 @@ def stargate_bridge_out(private_key: str, amount: float, dest_chain_id: int, des
     return receipt.transactionHash.hex()
 
 
-# ── HyperLiquid Info ──
+# ═══════════════════════════════════════════════════════
+# HyperLiquid Info
+# ═══════════════════════════════════════════════════════
 
 def get_hl_balance(address: str) -> dict:
     resp = requests.post("https://api.hyperliquid.xyz/info", json={
@@ -367,7 +366,26 @@ def get_hl_balance(address: str) -> dict:
     }
 
 
-# ── Withdraw from HL ──
+# ═══════════════════════════════════════════════════════
+# HL Internal Transfer (zero fee — usd_transfer / usdSend)
+# ═══════════════════════════════════════════════════════
+
+def hl_internal_transfer(private_key: str, amount: float, destination: str) -> dict:
+    """Transfer USDC within HL L1 between wallets. No bridge fee."""
+    from hyperliquid.exchange import Exchange
+    import eth_account as eth_acc
+
+    acct = eth_acc.Account.from_key(private_key)
+    exchange = Exchange(wallet=acct, base_url="https://api.hyperliquid.xyz")
+    result = exchange.usd_transfer(amount, destination)
+
+    logger.info(f"HL internal transfer {amount} USDC → {destination[:10]}...: {result}")
+    return result
+
+
+# ═══════════════════════════════════════════════════════
+# Withdraw from HL via bridge ($1 fee — fallback only)
+# ═══════════════════════════════════════════════════════
 
 def withdraw_from_hl(private_key: str, amount: float, destination: str) -> dict:
     from hyperliquid.exchange import Exchange
@@ -381,7 +399,35 @@ def withdraw_from_hl(private_key: str, amount: float, destination: str) -> dict:
     return result
 
 
-# ── Transfer USDC back to user (Arb direct) ──
+# ═══════════════════════════════════════════════════════
+# Master Wallet Helpers
+# ═══════════════════════════════════════════════════════
+
+def get_master_arb_usdc_balance() -> float:
+    """Check master wallet USDC balance on Arbitrum."""
+    if not MASTER_WALLET_ADDRESS:
+        return 0.0
+    return get_usdc_balance(MASTER_WALLET_ADDRESS)
+
+
+def master_transfer_usdc(to_address: str, amount: float) -> str:
+    """Transfer USDC from master wallet on Arb to any address."""
+    if not MASTER_WALLET_KEY:
+        raise ValueError("GAS_STATION_KEY not set")
+    return transfer_usdc_to_user(MASTER_WALLET_KEY, to_address, amount)
+
+
+def master_withdraw_from_hl(amount: float) -> dict:
+    """Withdraw from master HL balance to its own Arb address ($1 fee).
+    Used for periodic replenishment of Arb USDC pool."""
+    if not MASTER_WALLET_KEY or not MASTER_WALLET_ADDRESS:
+        raise ValueError("Master wallet not configured")
+    return withdraw_from_hl(MASTER_WALLET_KEY, amount, MASTER_WALLET_ADDRESS)
+
+
+# ═══════════════════════════════════════════════════════
+# Transfer USDC on Arb (generic)
+# ═══════════════════════════════════════════════════════
 
 def transfer_usdc_to_user(private_key: str, to_address: str, amount: float) -> str:
     w3 = get_web3()
@@ -409,7 +455,9 @@ def transfer_usdc_to_user(private_key: str, to_address: str, amount: float) -> s
     return receipt.transactionHash.hex()
 
 
-# ── Execute copy trade with builder code ──
+# ═══════════════════════════════════════════════════════
+# Execute copy trade with builder code
+# ═══════════════════════════════════════════════════════
 
 def execute_copy_trade(
     private_key: str,
