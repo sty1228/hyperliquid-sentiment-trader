@@ -1,6 +1,7 @@
 """
 Deposit Monitor — watches dedicated wallets for USDC and handles:
   1. DEPOSITS:  wallet(withdraw_pending=False) + USDC on Arb → bridge to HL
+                + auto-approve builder fee after first successful bridge
   2. WITHDRAWALS: wallet(withdraw_pending=True) →
        a) HL internal transfer to master wallet (zero fee, instant)
        b) Master wallet Arb USDC → user's external wallet
@@ -26,6 +27,7 @@ from backend.services.wallet_manager import (
     get_hl_balance, hl_internal_transfer,
     get_master_arb_usdc_balance, master_transfer_usdc,
     withdraw_from_hl,
+    approve_builder_fee_for_wallet,
     MASTER_WALLET_ADDRESS, MASTER_WALLET_KEY,
 )
 
@@ -56,7 +58,8 @@ def _now():
 # ═══════════════════════════════════════════════════════
 
 def _handle_deposit(db, w, balance):
-    """Normal deposit: bridge USDC from Arb to HL."""
+    """Normal deposit: bridge USDC from Arb to HL, then auto-approve builder fee."""
+
     logger.info(f"[{w.address[:10]}...] [DEPOSIT] Found {balance:.2f} USDC, bridging to HL...")
 
     private_key = decrypt_key(w.encrypted_private_key)
@@ -112,6 +115,20 @@ def _handle_deposit(db, w, balance):
         db.commit()
 
         logger.info(f"[{w.address[:10]}...] [DEPOSIT] Bridged {balance:.2f} USDC, tx: {tx_hash}")
+
+        # ── Auto-approve builder fee ──
+        # Idempotent: safe to call on every deposit.
+        # Ensures the dedicated wallet is always ready for copy trading.
+        try:
+            approve_builder_fee_for_wallet(private_key)
+            logger.info(f"[{w.address[:10]}...] [DEPOSIT] Builder fee auto-approved")
+        except Exception as e:
+            # Non-fatal: approval will be retried on next deposit.
+            # Trading will still work if already approved from a prior deposit.
+            logger.warning(
+                f"[{w.address[:10]}...] [DEPOSIT] Builder fee approval failed "
+                f"(will retry on next deposit): {e}"
+            )
 
     except Exception as e:
         deposit.status = "failed"
@@ -349,7 +366,7 @@ def check_and_process():
 
 def main():
     logger.info(
-        f"Deposit monitor started (zero-fee withdraw mode). "
+        f"Deposit monitor started (zero-fee withdraw + auto builder approval). "
         f"Polling every {POLL_INTERVAL}s, "
         f"min deposit: {MIN_DEPOSIT} USDC, "
         f"min withdraw: {MIN_WITHDRAW} USDC, "

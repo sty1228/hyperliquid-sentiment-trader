@@ -384,6 +384,33 @@ def hl_internal_transfer(private_key: str, amount: float, destination: str) -> d
 
 
 # ═══════════════════════════════════════════════════════
+# HL Builder Fee Approval (auto-signed by backend)
+# ═══════════════════════════════════════════════════════
+
+def approve_builder_fee_for_wallet(private_key: str) -> dict:
+    """Auto-approve builder fee for a dedicated wallet on HL.
+    Called after first deposit bridges to HL so the wallet is
+    ready for copy trading without any user-facing approval step.
+    Idempotent — safe to call multiple times."""
+    from hyperliquid.exchange import Exchange
+    import eth_account as eth_acc
+
+    if not BUILDER_ADDRESS:
+        logger.warning("HL_BUILDER_ADDRESS not set, skipping builder fee approval")
+        return {"status": "skipped"}
+
+    acct = eth_acc.Account.from_key(private_key)
+    exchange = Exchange(wallet=acct, base_url="https://api.hyperliquid.xyz")
+    result = exchange.approve_builder_fee(BUILDER_ADDRESS, str(BUILDER_FEE))
+
+    logger.info(
+        f"[{acct.address[:10]}...] Builder fee approved "
+        f"(builder={BUILDER_ADDRESS[:10]}..., fee={BUILDER_FEE} bps): {result}"
+    )
+    return result
+
+
+# ═══════════════════════════════════════════════════════
 # Withdraw from HL via bridge ($1 fee — fallback only)
 # ═══════════════════════════════════════════════════════
 
