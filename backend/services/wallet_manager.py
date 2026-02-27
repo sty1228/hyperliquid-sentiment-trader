@@ -401,7 +401,7 @@ def approve_builder_fee_for_wallet(private_key: str) -> dict:
 
     acct = eth_acc.Account.from_key(private_key)
     exchange = Exchange(wallet=acct, base_url="https://api.hyperliquid.xyz")
-    result = exchange.approve_builder_fee(BUILDER_ADDRESS, str(BUILDER_FEE))
+    result = exchange.approve_builder_fee(BUILDER_ADDRESS, f"{BUILDER_FEE / 100}%")
 
     logger.info(
         f"[{acct.address[:10]}...] Builder fee approved "

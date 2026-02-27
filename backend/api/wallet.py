@@ -1,9 +1,11 @@
 import logging
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from backend.deps import get_db
 from backend.models.setting import BalanceSnapshot, BalanceEvent
 from backend.api.auth import get_current_user
@@ -16,6 +18,7 @@ from backend.services.wallet_manager import (
 
 logger = logging.getLogger(__name__)
 
+limiter = Limiter(key_func=get_remote_address)
 router = APIRouter(prefix="/api/wallet", tags=["wallet"])
 
 # Allowed withdraw destination chain IDs
@@ -66,7 +69,9 @@ class TransactionItem(BaseModel):
 # ═══════════════════════════════════════════════════════
 
 @router.post("/create", response_model=WalletResponse)
+@limiter.limit("3/minute")
 def create_or_get_wallet(
+    request: Request,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -95,7 +100,9 @@ def create_or_get_wallet(
 
 
 @router.get("/balance", response_model=BalanceResponse)
+@limiter.limit("20/minute")
 def get_wallet_balance(
+    request: Request,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -116,7 +123,9 @@ def get_wallet_balance(
 
 
 @router.get("/deposits")
+@limiter.limit("20/minute")
 def get_deposit_history(
+    request: Request,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -145,7 +154,9 @@ def get_deposit_history(
 # ═══════════════════════════════════════════════════════
 
 @router.get("/transactions", response_model=list[TransactionItem])
+@limiter.limit("20/minute")
 def get_transactions(
+    request: Request,
     limit: int = Query(30, ge=1, le=100),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
@@ -184,7 +195,9 @@ def get_transactions(
 # ═══════════════════════════════════════════════════════
 
 @router.post("/withdraw", response_model=WithdrawResponse)
+@limiter.limit("5/minute")
 def withdraw_to_user(
+    request: Request,
     req: WithdrawRequest,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
