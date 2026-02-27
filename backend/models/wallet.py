@@ -1,8 +1,6 @@
-# /opt/hypercopy/backend/models/wallet.py 完整文件
-
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Float, Boolean, ForeignKey
+from sqlalchemy import Column, String, Integer, DateTime, Float, Boolean, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from backend.database import Base
@@ -30,7 +28,9 @@ class WalletDeposit(Base):
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     wallet_address = Column(String, nullable=False)
     amount = Column(Float, nullable=False)
-    type = Column(String, default="deposit")  # "deposit" | "withdraw"
+    type = Column(String, default="deposit")            # "deposit" | "withdraw"
+    target_chain_id = Column(Integer, nullable=True)     # e.g. 42161, 1, 8453 ...
+    destination_address = Column(String, nullable=True)  # snapshot of withdraw dest
     arb_tx_hash = Column(String, nullable=True)
     bridge_tx_hash = Column(String, nullable=True)
     status = Column(String, default="detected")

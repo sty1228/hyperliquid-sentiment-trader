@@ -28,6 +28,87 @@ USDC_ABI = json.loads(
     '"name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}]'
 )
 
+# ── Stargate V2 Outbound Config (from Arbitrum) ──
+
+ARB_STARGATE_POOL_USDC = Web3.to_checksum_address(
+    "0xe8CDF27AcD73a434D661C84887215F7598e7d0d3"
+)
+
+CHAIN_ID_TO_LZ_EID = {
+    1:      30101,   # Ethereum
+    10:     30111,   # Optimism
+    137:    30109,   # Polygon
+    8453:   30184,   # Base
+    43114:  30106,   # Avalanche
+    5000:   30181,   # Mantle
+    534352: 30214,   # Scroll
+}
+
+STARGATE_POOL_ABI = json.loads("""[
+  {
+    "inputs":[
+      {"components":[
+        {"name":"dstEid","type":"uint32"},
+        {"name":"to","type":"bytes32"},
+        {"name":"amountLD","type":"uint256"},
+        {"name":"minAmountLD","type":"uint256"},
+        {"name":"extraOptions","type":"bytes"},
+        {"name":"composeMsg","type":"bytes"},
+        {"name":"oftCmd","type":"bytes"}
+      ],"name":"_sendParam","type":"tuple"},
+      {"name":"_payInLzToken","type":"bool"}
+    ],
+    "name":"quoteSend",
+    "outputs":[
+      {"components":[
+        {"name":"nativeFee","type":"uint256"},
+        {"name":"lzTokenFee","type":"uint256"}
+      ],"name":"msgFee","type":"tuple"},
+      {"components":[
+        {"name":"amountSentLD","type":"uint256"},
+        {"name":"amountReceivedLD","type":"uint256"}
+      ],"name":"oftReceipt","type":"tuple"}
+    ],
+    "stateMutability":"view",
+    "type":"function"
+  },
+  {
+    "inputs":[
+      {"components":[
+        {"name":"dstEid","type":"uint32"},
+        {"name":"to","type":"bytes32"},
+        {"name":"amountLD","type":"uint256"},
+        {"name":"minAmountLD","type":"uint256"},
+        {"name":"extraOptions","type":"bytes"},
+        {"name":"composeMsg","type":"bytes"},
+        {"name":"oftCmd","type":"bytes"}
+      ],"name":"_sendParam","type":"tuple"},
+      {"components":[
+        {"name":"nativeFee","type":"uint256"},
+        {"name":"lzTokenFee","type":"uint256"}
+      ],"name":"_fee","type":"tuple"},
+      {"name":"_refundAddress","type":"address"}
+    ],
+    "name":"sendToken",
+    "outputs":[
+      {"components":[
+        {"name":"guid","type":"bytes32"},
+        {"name":"nonce","type":"uint64"},
+        {"components":[
+          {"name":"nativeFee","type":"uint256"},
+          {"name":"lzTokenFee","type":"uint256"}
+        ],"name":"fee","type":"tuple"}
+      ],"name":"msgReceipt","type":"tuple"},
+      {"components":[
+        {"name":"amountSentLD","type":"uint256"},
+        {"name":"amountReceivedLD","type":"uint256"}
+      ],"name":"oftReceipt","type":"tuple"}
+    ],
+    "stateMutability":"payable",
+    "type":"function"
+  }
+]""")
+
 
 # ── Encryption ──
 
@@ -72,8 +153,8 @@ def get_usdc_balance(address: str) -> float:
 
 GAS_STATION_KEY = os.getenv("GAS_STATION_KEY", "")
 GAS_STATION_ADDRESS = os.getenv("GAS_STATION_ADDRESS", "")
-MIN_GAS_ETH = 0.0003  # ~enough for approve+transfer
-GAS_TOP_UP = 0.0003    # send this much when low
+MIN_GAS_ETH = 0.0003
+GAS_TOP_UP = 0.0003
 
 
 def _get_eip1559_fees(w3):
@@ -90,10 +171,10 @@ def get_eth_balance(address: str) -> float:
     return w3.eth.get_balance(Web3.to_checksum_address(address)) / 1e18
 
 
-def ensure_gas(wallet_address: str) -> bool:
+def ensure_gas(wallet_address: str, min_eth: float = MIN_GAS_ETH, top_up_eth: float = GAS_TOP_UP) -> bool:
     """Check if wallet has enough ETH for gas; if not, send from master wallet."""
     eth_bal = get_eth_balance(wallet_address)
-    if eth_bal >= MIN_GAS_ETH:
+    if eth_bal >= min_eth:
         logger.info(f"[{wallet_address[:10]}...] ETH OK: {eth_bal:.6f}")
         return True
 
@@ -108,7 +189,7 @@ def ensure_gas(wallet_address: str) -> bool:
         tx = {
             "from": master.address,
             "to": Web3.to_checksum_address(wallet_address),
-            "value": w3.to_wei(GAS_TOP_UP, "ether"),
+            "value": w3.to_wei(top_up_eth, "ether"),
             "nonce": w3.eth.get_transaction_count(master.address),
             "gas": 50000,
             "maxFeePerGas": max_fee,
@@ -119,14 +200,14 @@ def ensure_gas(wallet_address: str) -> bool:
         signed = master.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         w3.eth.wait_for_transaction_receipt(tx_hash)
-        logger.info(f"[{wallet_address[:10]}...] Funded {GAS_TOP_UP} ETH, tx: {tx_hash.hex()}")
+        logger.info(f"[{wallet_address[:10]}...] Funded {top_up_eth} ETH, tx: {tx_hash.hex()}")
         return True
     except Exception as e:
         logger.error(f"[{wallet_address[:10]}...] Gas funding failed: {e}")
         return False
 
 
-# ── Bridge ──
+# ── Bridge USDC to HyperLiquid ──
 
 def bridge_usdc_to_hl(private_key: str, amount: float) -> str:
     w3 = get_web3()
@@ -136,7 +217,6 @@ def bridge_usdc_to_hl(private_key: str, amount: float) -> str:
 
     max_fee, max_priority = _get_eip1559_fees(w3)
 
-    # Approve if needed
     allowance = usdc.functions.allowance(acct.address, HL_BRIDGE).call()
     if allowance < amount_raw:
         approve_tx = usdc.functions.approve(
@@ -155,7 +235,6 @@ def bridge_usdc_to_hl(private_key: str, amount: float) -> str:
         w3.eth.wait_for_transaction_receipt(tx_hash)
         logger.info(f"Approved USDC spending for {acct.address}")
 
-    # Transfer USDC to bridge
     transfer_tx = usdc.functions.transfer(
         HL_BRIDGE, amount_raw
     ).build_transaction({
@@ -172,6 +251,103 @@ def bridge_usdc_to_hl(private_key: str, amount: float) -> str:
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
 
     logger.info(f"Bridged {amount} USDC for {acct.address}, tx: {receipt.transactionHash.hex()}")
+    return receipt.transactionHash.hex()
+
+
+# ── Stargate V2 Bridge Out (Arb → other chain) ──
+
+def stargate_bridge_out(private_key: str, amount: float, dest_chain_id: int, dest_address: str) -> str:
+    """Bridge USDC from Arbitrum to destination chain via Stargate V2.
+    
+    Args:
+        private_key: Dedicated wallet private key
+        amount: USDC amount to bridge
+        dest_chain_id: EVM chain ID (e.g. 1 for Ethereum, 8453 for Base)
+        dest_address: Recipient address on destination chain
+    
+    Returns:
+        Transaction hash
+    """
+    lz_eid = CHAIN_ID_TO_LZ_EID.get(dest_chain_id)
+    if not lz_eid:
+        raise ValueError(f"Unsupported destination chain ID: {dest_chain_id}")
+
+    w3 = get_web3()
+    acct = Account.from_key(private_key)
+
+    amount_raw = int(amount * 1e6)
+    min_amount = int(amount_raw * 995 // 1000)  # 0.5% slippage tolerance
+
+    # Encode destination address as bytes32 (left-pad 20-byte address to 32)
+    addr_bytes = bytes.fromhex(dest_address[2:] if dest_address.startswith("0x") else dest_address)
+    dest_bytes32 = b"\x00" * 12 + addr_bytes  # 32 bytes total
+
+    send_param = (
+        lz_eid,          # dstEid
+        dest_bytes32,    # to (bytes32)
+        amount_raw,      # amountLD
+        min_amount,      # minAmountLD
+        b"",             # extraOptions
+        b"",             # composeMsg
+        b"",             # oftCmd (taxi mode)
+    )
+
+    usdc = w3.eth.contract(address=USDC_ADDRESS, abi=USDC_ABI)
+    pool = w3.eth.contract(address=ARB_STARGATE_POOL_USDC, abi=STARGATE_POOL_ABI)
+    max_fee, max_priority = _get_eip1559_fees(w3)
+
+    # 1. Approve USDC to Stargate pool (if needed)
+    allowance = usdc.functions.allowance(acct.address, ARB_STARGATE_POOL_USDC).call()
+    if allowance < amount_raw:
+        approve_tx = usdc.functions.approve(
+            ARB_STARGATE_POOL_USDC, 2**256 - 1
+        ).build_transaction({
+            "from": acct.address,
+            "nonce": w3.eth.get_transaction_count(acct.address),
+            "gas": 100_000,
+            "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": max_priority,
+            "chainId": 42161,
+            "type": 2,
+        })
+        signed = acct.sign_transaction(approve_tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        w3.eth.wait_for_transaction_receipt(tx_hash)
+        logger.info(f"Approved USDC for Stargate pool: {acct.address}")
+
+    # 2. Quote LZ messaging fee
+    msg_fee, _ = pool.functions.quoteSend(send_param, False).call()
+    native_fee = int(msg_fee[0] * 110 // 100)  # 10% buffer
+
+    logger.info(
+        f"Stargate quote: native_fee={native_fee} wei "
+        f"({native_fee / 1e18:.6f} ETH) for chain {dest_chain_id}"
+    )
+
+    # 3. Send token via Stargate
+    fee_param = (native_fee, 0)  # (nativeFee, lzTokenFee)
+
+    nonce = w3.eth.get_transaction_count(acct.address)
+    send_tx = pool.functions.sendToken(
+        send_param, fee_param, acct.address
+    ).build_transaction({
+        "from": acct.address,
+        "value": native_fee,
+        "nonce": nonce,
+        "gas": 500_000,
+        "maxFeePerGas": max_fee,
+        "maxPriorityFeePerGas": max_priority,
+        "chainId": 42161,
+        "type": 2,
+    })
+    signed = acct.sign_transaction(send_tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+    logger.info(
+        f"Stargate bridge-out {amount} USDC → chain {dest_chain_id} "
+        f"({dest_address[:10]}...), tx: {receipt.transactionHash.hex()}"
+    )
     return receipt.transactionHash.hex()
 
 
@@ -205,7 +381,7 @@ def withdraw_from_hl(private_key: str, amount: float, destination: str) -> dict:
     return result
 
 
-# ── Transfer USDC back to user ──
+# ── Transfer USDC back to user (Arb direct) ──
 
 def transfer_usdc_to_user(private_key: str, to_address: str, amount: float) -> str:
     w3 = get_web3()
