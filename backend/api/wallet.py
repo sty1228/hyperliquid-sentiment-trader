@@ -2,8 +2,9 @@ import time
 import logging
 import threading
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import desc
 from pydantic import BaseModel
 from backend.deps import get_db
 from backend.database import SessionLocal
@@ -41,6 +42,16 @@ class WithdrawRequest(BaseModel):
 class WithdrawResponse(BaseModel):
     status: str
     message: str
+
+
+class TransactionItem(BaseModel):
+    id: str
+    type: str          # "deposit" | "withdraw"
+    amount: float
+    status: str        # "bridging" | "bridged" | "failed" | "initiated" | "sending" | "completed" | "timeout"
+    tx_hash: str | None = None
+    created_at: str
+    completed_at: str | None = None
 
 
 @router.post("/create", response_model=WalletResponse)
@@ -119,6 +130,42 @@ def get_deposit_history(
     ]
 
 
+# ═══════════════════════════════════════════════════════
+# ★ Unified Transaction History (deposits + withdrawals)
+# ═══════════════════════════════════════════════════════
+
+@router.get("/transactions", response_model=list[TransactionItem])
+def get_transactions(
+    limit: int = Query(30, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Unified deposit + withdrawal history, newest first."""
+    records = (
+        db.query(WalletDeposit)
+        .filter(WalletDeposit.user_id == user.id)
+        .order_by(desc(WalletDeposit.created_at))
+        .limit(limit)
+        .all()
+    )
+    return [
+        TransactionItem(
+            id=str(r.id),
+            type=r.type or "deposit",
+            amount=r.amount,
+            status=r.status,
+            tx_hash=r.bridge_tx_hash or r.arb_tx_hash,
+            created_at=r.created_at.isoformat(),
+            completed_at=r.bridged_at.isoformat() if r.bridged_at else None,
+        )
+        for r in records
+    ]
+
+
+# ═══════════════════════════════════════════════════════
+# Withdraw — with withdraw_pending flag + transaction record
+# ═══════════════════════════════════════════════════════
+
 def _clear_withdraw_pending(user_id: str):
     """Clear the withdraw_pending flag so deposit_monitor resumes."""
     db = SessionLocal()
@@ -134,7 +181,28 @@ def _clear_withdraw_pending(user_id: str):
         db.close()
 
 
-def _process_withdraw_background(user_id: str, wallet_address: str, withdraw_address: str, private_key: str, amount: float):
+def _update_tx_status(tx_id: str, status: str, tx_hash: str | None = None):
+    """Update a wallet_deposits record status."""
+    db = SessionLocal()
+    try:
+        rec = db.query(WalletDeposit).filter(WalletDeposit.id == tx_id).first()
+        if rec:
+            rec.status = status
+            if tx_hash:
+                rec.arb_tx_hash = tx_hash
+            if status in ("completed", "failed", "timeout"):
+                rec.bridged_at = datetime.utcnow()
+            db.commit()
+    except Exception as e:
+        logger.error(f"[Withdraw] Failed to update tx status: {e}")
+    finally:
+        db.close()
+
+
+def _process_withdraw_background(
+    user_id: str, wallet_address: str, withdraw_address: str,
+    private_key: str, amount: float, tx_id: str,
+):
     """Background thread: wait for USDC on Arb, then transfer to user wallet."""
     db = SessionLocal()
     try:
@@ -144,13 +212,16 @@ def _process_withdraw_background(user_id: str, wallet_address: str, withdraw_add
         for i in range(60):
             time.sleep(5)
             bal = get_usdc_balance(wallet_address)
-            if bal >= amount * 0.95:  # 95% threshold (HL withdraw fee)
+            if bal >= amount * 0.95:
                 logger.info(f"[Withdraw] USDC landed: {bal:.2f} for user {user_id}")
                 break
         else:
             logger.error(f"[Withdraw] Timeout waiting for USDC on Arb for user {user_id}")
-            _clear_withdraw_pending(user_id)  # ← Always clear on timeout
+            _update_tx_status(tx_id, "timeout")
+            _clear_withdraw_pending(user_id)
             return
+
+        _update_tx_status(tx_id, "sending")
 
         # Ensure gas for transfer
         ensure_gas(wallet_address)
@@ -158,6 +229,8 @@ def _process_withdraw_background(user_id: str, wallet_address: str, withdraw_add
         # Transfer to user wallet
         tx_hash = transfer_usdc_to_user(private_key, withdraw_address, amount)
         logger.info(f"[Withdraw] Sent {amount:.2f} USDC to {withdraw_address}, tx: {tx_hash}")
+
+        _update_tx_status(tx_id, "completed", tx_hash)
 
         # Update BalanceSnapshot
         snapshot = db.query(BalanceSnapshot).filter(BalanceSnapshot.user_id == user_id).first()
@@ -176,8 +249,9 @@ def _process_withdraw_background(user_id: str, wallet_address: str, withdraw_add
 
     except Exception as e:
         logger.error(f"[Withdraw] Background failed for user {user_id}: {e}")
+        _update_tx_status(tx_id, "failed")
     finally:
-        _clear_withdraw_pending(user_id)  # ← Always clear when done
+        _clear_withdraw_pending(user_id)
         db.close()
 
 
@@ -194,6 +268,10 @@ def withdraw_to_user(
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount")
 
+    # Block if another withdraw is already pending
+    if wallet.withdraw_pending:
+        raise HTTPException(status_code=409, detail="A withdrawal is already in progress. Please wait.")
+
     private_key = decrypt_key(wallet.encrypted_private_key)
 
     hl_state = get_hl_balance(wallet.address)
@@ -206,15 +284,31 @@ def withdraw_to_user(
     try:
         # ★ Set withdraw_pending BEFORE initiating HL withdraw
         wallet.withdraw_pending = True
-        db.commit()
 
-        # 1. Withdraw from HL (this is fast — just a signed API call)
+        # ★ Record withdrawal transaction (for history)
+        tx_record = WalletDeposit(
+            user_id=user.id,
+            wallet_address=wallet.address,
+            amount=req.amount,
+            type="withdraw",
+            status="initiated",
+        )
+        db.add(tx_record)
+        db.commit()
+        db.refresh(tx_record)
+        tx_id = str(tx_record.id)
+
+        # 1. Withdraw from HL (fast — just a signed API call)
         withdraw_from_hl(private_key, req.amount, wallet.address)
+
+        # Update status
+        tx_record.status = "hl_withdrawn"
+        db.commit()
 
         # 2. Start background thread to wait for USDC and transfer to user
         t = threading.Thread(
             target=_process_withdraw_background,
-            args=(user.id, wallet.address, wallet.withdraw_address, private_key, req.amount),
+            args=(user.id, wallet.address, wallet.withdraw_address, private_key, req.amount, tx_id),
             daemon=True,
         )
         t.start()
@@ -225,7 +319,6 @@ def withdraw_to_user(
         )
 
     except Exception as e:
-        # Clear flag if HL withdraw itself failed
         wallet.withdraw_pending = False
         db.commit()
         logger.error(f"Withdraw failed for user {user.id}: {e}")

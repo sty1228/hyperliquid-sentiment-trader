@@ -1,3 +1,5 @@
+# /opt/hypercopy/backend/models/wallet.py 完整文件
+
 import uuid
 from datetime import datetime
 from sqlalchemy import Column, String, DateTime, Float, Boolean, ForeignKey
@@ -16,7 +18,7 @@ class UserWallet(Base):
     withdraw_address = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
-    withdraw_pending = Column(Boolean, default=False)  # ← 新增
+    withdraw_pending = Column(Boolean, default=False)
 
     user = relationship("User", backref="dedicated_wallet")
 
@@ -28,6 +30,7 @@ class WalletDeposit(Base):
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     wallet_address = Column(String, nullable=False)
     amount = Column(Float, nullable=False)
+    type = Column(String, default="deposit")  # "deposit" | "withdraw"
     arb_tx_hash = Column(String, nullable=True)
     bridge_tx_hash = Column(String, nullable=True)
     status = Column(String, default="detected")
