@@ -1,7 +1,10 @@
 """
 Portfolio API — Dashboard 数据（余额、持仓、盈亏曲线）
 匹配前端 ProfileDataResponse / BalanceHistoryResponse
-P&L 采用 Polymarket 风格：P&L = portfolio_value - cumulative_net_deposits
+
+★ P&L 公式改为纯交易盈亏:
+  P&L = sum(closed trades PnL) + sum(open trades unrealized PnL)
+  与出入金完全无关。没交易 = P&L 为 0。
 """
 from __future__ import annotations
 from datetime import datetime, timedelta, timezone, date
@@ -85,6 +88,66 @@ class PnlHistoryResponse(BaseModel):
     total_pnl: float = 0.0
 
 
+# ── 交易盈亏计算 helper ──────────────────────────────────
+
+def _calc_trade_pnl(db: Session, user_id: str, since: datetime | None = None) -> float:
+    """
+    纯交易P&L = 已平仓 realized + 持仓 unrealized
+    since: 只计算这个时间之后的交易（用于区间P&L）
+    """
+    # Realized PnL from closed trades
+    closed_q = db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+        Trade.user_id == user_id,
+        Trade.status == "closed",
+    )
+    if since:
+        closed_q = closed_q.filter(Trade.closed_at >= since)
+    realized = float(closed_q.scalar())
+
+    # Unrealized PnL from open positions
+    unrealized = float(
+        db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+            Trade.user_id == user_id,
+            Trade.status == "open",
+        ).scalar()
+    )
+
+    return round(realized + unrealized, 2)
+
+
+def _get_realtime_balance(db: Session, user_id: str) -> float:
+    """
+    取「最新余额」——优先用最新 BalanceEvent.balance_after，
+    如果没有事件则用最新 BalanceSnapshot。
+    """
+    latest_evt = (
+        db.query(BalanceEvent)
+        .filter(BalanceEvent.user_id == user_id)
+        .order_by(desc(BalanceEvent.created_at))
+        .first()
+    )
+    latest_snap = (
+        db.query(BalanceSnapshot)
+        .filter(BalanceSnapshot.user_id == user_id)
+        .order_by(desc(BalanceSnapshot.snapshot_date))
+        .first()
+    )
+
+    if latest_evt and latest_snap:
+        snap_ts = datetime.combine(
+            latest_snap.snapshot_date, datetime.min.time()
+        ).replace(tzinfo=timezone.utc).timestamp()
+        evt_ts = latest_evt.created_at.replace(tzinfo=timezone.utc).timestamp() if not latest_evt.created_at.tzinfo else latest_evt.created_at.timestamp()
+        if evt_ts >= snap_ts:
+            return float(latest_evt.balance_after)
+        return float(latest_snap.balance)
+    elif latest_evt:
+        return float(latest_evt.balance_after)
+    elif latest_snap:
+        return float(latest_snap.balance)
+    return 0.0
+
+
 # ── API 端点 ─────────────────────────────────────────────
 
 @router.get("/portfolio/profile", response_model=ProfileDataResponse)
@@ -148,7 +211,7 @@ def get_balance_history(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """盈亏曲线（匹配前端 BalanceHistoryResponse）"""
+    """余额曲线（匹配前端 BalanceHistoryResponse）"""
     now = datetime.now(timezone.utc)
 
     # ── "D" 视图：过去 24 小时，每小时一个点 ──
@@ -315,7 +378,7 @@ def get_dashboard_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Dashboard 总结数据"""
+    """Dashboard 总结数据 — ★ P&L 纯交易盈亏"""
     latest_snapshot = (
         db.query(BalanceSnapshot)
         .filter(BalanceSnapshot.user_id == current_user.id)
@@ -326,13 +389,15 @@ def get_dashboard_summary(
     total_trades = db.query(Trade).filter(Trade.user_id == current_user.id).count()
     open_positions = db.query(Trade).filter(Trade.user_id == current_user.id, Trade.status == "open").count()
 
+    # ★ P&L = realized + unrealized from trades only
+    total_pnl = _calc_trade_pnl(db, current_user.id)
+
     closed_trades = (
         db.query(Trade)
         .filter(Trade.user_id == current_user.id, Trade.status == "closed")
         .all()
     )
     wins = sum(1 for t in closed_trades if t.pnl_usd and t.pnl_usd > 0)
-    total_pnl = sum(t.pnl_usd or 0 for t in closed_trades)
     win_rate = (wins / len(closed_trades) * 100) if closed_trades else 0.0
     balance = latest_snapshot.balance if latest_snapshot else 0.0
     pnl_pct = (total_pnl / balance * 100) if balance > 0 else 0.0
@@ -348,62 +413,10 @@ def get_dashboard_summary(
 
 
 # ══════════════════════════════════════════════════════════
-# ★ P&L History — Polymarket 风格
-#   核心公式: P&L = portfolio_value − cumulative_net_deposits
-#   出入金完全剥离，只反映交易表现
+# ★ P&L History — 纯交易盈亏
+#   P&L = sum(closed trade PnL) + sum(open trade unrealized PnL)
+#   与出入金完全无关。没交易 = 0。
 # ══════════════════════════════════════════════════════════
-
-def _evt_ts(e: BalanceEvent) -> float:
-    """统一取 BalanceEvent 的 unix timestamp"""
-    if e.created_at.tzinfo:
-        return e.created_at.timestamp()
-    return e.created_at.replace(tzinfo=timezone.utc).timestamp()
-
-
-def _net_deposit_delta(e: BalanceEvent) -> float:
-    """单条事件的净入金变化量：deposit +, withdraw -"""
-    amt = float(e.amount) if e.amount else 0.0
-    if e.event_type == "deposit":
-        return amt
-    elif e.event_type == "withdraw":
-        return -amt
-    return 0.0
-
-
-def _get_realtime_balance(db: Session, user_id: str) -> float:
-    """
-    取「最新余额」——优先用最新 BalanceEvent.balance_after，
-    如果没有事件则用最新 BalanceSnapshot。
-    解决快照滞后导致入金后 P&L 虚假暴跌的问题。
-    """
-    latest_evt = (
-        db.query(BalanceEvent)
-        .filter(BalanceEvent.user_id == user_id)
-        .order_by(desc(BalanceEvent.created_at))
-        .first()
-    )
-    latest_snap = (
-        db.query(BalanceSnapshot)
-        .filter(BalanceSnapshot.user_id == user_id)
-        .order_by(desc(BalanceSnapshot.snapshot_date))
-        .first()
-    )
-
-    if latest_evt and latest_snap:
-        snap_ts = datetime.combine(
-            latest_snap.snapshot_date, datetime.min.time()
-        ).replace(tzinfo=timezone.utc).timestamp()
-        evt_ts = _evt_ts(latest_evt)
-        # 谁更新就用谁
-        if evt_ts >= snap_ts:
-            return float(latest_evt.balance_after)
-        return float(latest_snap.balance)
-    elif latest_evt:
-        return float(latest_evt.balance_after)
-    elif latest_snap:
-        return float(latest_snap.balance)
-    return 0.0
-
 
 @router.get("/portfolio/pnl-history", response_model=PnlHistoryResponse)
 def get_pnl_history(
@@ -412,133 +425,20 @@ def get_pnl_history(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Polymarket 风格 P&L 曲线。
-
-    每个数据点:
-        pnl = balance_at_that_moment − cumulative_net_deposits_at_that_moment
-
-    deposit $100 → balance +100, net_deposits +100 → pnl 不变 ✓
-    withdraw $50 → balance −50, net_deposits −50 → pnl 不变 ✓
-    trade win +$20 → balance +20, net_deposits 不变 → pnl +20 ✓
+    ★ 纯交易 P&L 曲线。
+    每个数据点的 pnl = 截至该时间点的累计交易盈亏。
+    没有任何交易 → 所有点 pnl = 0。
     """
     now = datetime.now(timezone.utc)
     user_id = current_user.id
 
-    # ── 1. 加载所有出入金事件（按时间排序） ──
-    all_events: list[BalanceEvent] = (
-        db.query(BalanceEvent)
-        .filter(BalanceEvent.user_id == user_id)
-        .order_by(BalanceEvent.created_at)
-        .all()
-    )
+    # Total P&L across all time (realized + unrealized)
+    all_time_pnl = _calc_trade_pnl(db, user_id)
 
-    # ── 2. 计算 all-time 总净入金 ──
-    total_net_deposits = sum(_net_deposit_delta(e) for e in all_events)
-
-    # ── 3. 实时余额（不依赖可能滞后的快照） ──
-    current_balance = _get_realtime_balance(db, user_id)
-    all_time_pnl = round(current_balance - total_net_deposits, 2)
-
-    # ════════════════════════════════════════════════
-    # "D" 视图：BalanceEvent 驱动，每 2h 一个点
-    # ════════════════════════════════════════════════
+    # Determine time range
     if timeRange == "D":
-        since_24h = now - timedelta(hours=24)
-
-        # 起始余额
-        latest_before = (
-            db.query(BalanceEvent)
-            .filter(BalanceEvent.user_id == user_id, BalanceEvent.created_at <= since_24h)
-            .order_by(desc(BalanceEvent.created_at))
-            .first()
-        )
-        if latest_before:
-            opening_balance = float(latest_before.balance_after)
-        else:
-            snap_before = (
-                db.query(BalanceSnapshot)
-                .filter(BalanceSnapshot.user_id == user_id, BalanceSnapshot.snapshot_date < since_24h.date())
-                .order_by(desc(BalanceSnapshot.snapshot_date))
-                .first()
-            )
-            opening_balance = float(snap_before.balance) if snap_before else 0.0
-
-        # 24h 内事件
-        recent_events: list[BalanceEvent] = (
-            db.query(BalanceEvent)
-            .filter(BalanceEvent.user_id == user_id, BalanceEvent.created_at > since_24h)
-            .order_by(BalanceEvent.created_at)
-            .all()
-        )
-
-        # 截至 24h 前的累计净入金（遍历全量事件）
-        since_24h_ts = since_24h.timestamp()
-        cum_net_before = 0.0
-        for e in all_events:
-            if _evt_ts(e) > since_24h_ts:
-                break
-            cum_net_before += _net_deposit_delta(e)
-
-        # 构建 13 个点（每 2 小时，覆盖 24h）
-        start_hour = since_24h.replace(minute=0, second=0, microsecond=0)
-        evt_idx = 0
-        bal = opening_balance
-        cum_net = cum_net_before
-        pnl_points: list[PnlHistoryItem] = []
-
-        for h in range(0, 25, 2):
-            hour_time = start_hour + timedelta(hours=h)
-            hour_ts = int(hour_time.timestamp())
-
-            # 应用该时间点之前（含）的事件
-            while evt_idx < len(recent_events):
-                e = recent_events[evt_idx]
-                if int(_evt_ts(e)) > hour_ts:
-                    break
-                bal = float(e.balance_after)
-                cum_net += _net_deposit_delta(e)
-                evt_idx += 1
-
-            # P&L = 当时余额 - 当时累计净入金
-            pnl_points.append(PnlHistoryItem(
-                timestamp=hour_ts,
-                pnl=round(bal - cum_net, 2),
-            ))
-
-        # 应用最后一个桶之后的剩余事件
-        while evt_idx < len(recent_events):
-            e = recent_events[evt_idx]
-            bal = float(e.balance_after)
-            cum_net += _net_deposit_delta(e)
-            evt_idx += 1
-
-        # 最后一个点用实时数据
-        if pnl_points:
-            pnl_points[-1] = PnlHistoryItem(
-                timestamp=pnl_points[-1].timestamp,
-                pnl=round(current_balance - total_net_deposits, 2),
-            )
-
-        # 区间 P&L 及百分比
-        range_pnl = 0.0
-        range_pnl_pct = 0.0
-        if len(pnl_points) >= 2:
-            range_pnl = round(pnl_points[-1].pnl - pnl_points[0].pnl, 2)
-            # 分母 = 区间起始时的净资产（余额），Polymarket 风格
-            if opening_balance > 0:
-                range_pnl_pct = round(range_pnl / opening_balance * 100, 2)
-
-        return PnlHistoryResponse(
-            data=pnl_points,
-            range_pnl=range_pnl,
-            range_pnl_pct=range_pnl_pct,
-            total_pnl=all_time_pnl,
-        )
-
-    # ════════════════════════════════════════════════
-    # 非 D 视图：BalanceSnapshot（日级快照）驱动
-    # ════════════════════════════════════════════════
-    if timeRange == "W":
+        since = now - timedelta(hours=24)
+    elif timeRange == "W":
         since = now - timedelta(weeks=1)
     elif timeRange == "M":
         since = now - timedelta(days=30)
@@ -547,96 +447,134 @@ def get_pnl_history(
     else:  # ALL
         since = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
-    snapshots: list[BalanceSnapshot] = (
-        db.query(BalanceSnapshot)
-        .filter(BalanceSnapshot.user_id == user_id, BalanceSnapshot.snapshot_date >= since.date())
-        .order_by(BalanceSnapshot.snapshot_date)
+    # ── Get all closed trades in range ──
+    closed_trades = (
+        db.query(Trade)
+        .filter(
+            Trade.user_id == user_id,
+            Trade.status == "closed",
+            Trade.closed_at >= since,
+        )
+        .order_by(Trade.closed_at)
         .all()
     )
 
-    # ── 双指针：snapshots × all_events ──
-    evt_idx = 0
-    cum_net = 0.0
+    # ── PnL before range start (baseline) ──
+    pnl_before = float(
+        db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+            Trade.user_id == user_id,
+            Trade.status == "closed",
+            Trade.closed_at < since,
+        ).scalar()
+    )
+
+    # ── Build P&L curve ──
     pnl_points: list[PnlHistoryItem] = []
 
-    if snapshots:
-        for snap in snapshots:
-            snap_dt = datetime.combine(snap.snapshot_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-            day_end_ts = snap_dt.timestamp() + 86400
+    if timeRange == "D":
+        # 13 points, every 2h
+        start_hour = since.replace(minute=0, second=0, microsecond=0)
+        trade_idx = 0
+        cum_pnl = pnl_before
 
-            while evt_idx < len(all_events):
-                e = all_events[evt_idx]
-                if _evt_ts(e) >= day_end_ts:
+        for h in range(0, 25, 2):
+            hour_time = start_hour + timedelta(hours=h)
+            hour_ts = int(hour_time.timestamp())
+
+            # Sum trades closed before this time point
+            while trade_idx < len(closed_trades):
+                t = closed_trades[trade_idx]
+                t_ts = int(t.closed_at.replace(tzinfo=timezone.utc).timestamp()) if not t.closed_at.tzinfo else int(t.closed_at.timestamp())
+                if t_ts > hour_ts:
                     break
-                cum_net += _net_deposit_delta(e)
-                evt_idx += 1
+                cum_pnl += float(t.pnl_usd or 0)
+                trade_idx += 1
 
-            balance = float(snap.balance)
             pnl_points.append(PnlHistoryItem(
-                timestamp=int(snap_dt.timestamp()),
-                pnl=round(balance - cum_net, 2),
+                timestamp=hour_ts,
+                pnl=round(cum_pnl, 2),
             ))
 
-        # 追加今天实时点
-        today = now.date()
-        if snapshots[-1].snapshot_date < today:
-            while evt_idx < len(all_events):
-                cum_net += _net_deposit_delta(all_events[evt_idx])
-                evt_idx += 1
-            today_dt = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
-            pnl_points.append(PnlHistoryItem(
-                timestamp=int(today_dt.timestamp()),
-                pnl=round(current_balance - total_net_deposits, 2),
-            ))
-
-    # ── 填充稀疏数据：确保 chart 至少有 5 个点 ──
-    since_dt = datetime.combine(since.date(), datetime.min.time()).replace(tzinfo=timezone.utc)
-    since_ts = int(since_dt.timestamp())
-
-    if len(pnl_points) < 5:
-        first_real_ts = pnl_points[0].timestamp if pnl_points else int(
-            datetime.combine(now.date(), datetime.min.time()).replace(tzinfo=timezone.utc).timestamp()
+        # Last point: add current unrealized PnL
+        unrealized = float(
+            db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+                Trade.user_id == user_id,
+                Trade.status == "open",
+            ).scalar()
         )
-        first_pnl = pnl_points[0].pnl if pnl_points else 0.0
+        # Process remaining trades
+        while trade_idx < len(closed_trades):
+            cum_pnl += float(closed_trades[trade_idx].pnl_usd or 0)
+            trade_idx += 1
 
-        # 根据 timeRange 决定填充间隔
-        if timeRange == "W":
-            pad_step = 86400       # 1 day
-        elif timeRange == "M":
-            pad_step = 86400 * 3   # 3 days
-        else:  # ALL
-            pad_step = 86400 * 30  # 30 days
+        if pnl_points:
+            pnl_points[-1] = PnlHistoryItem(
+                timestamp=pnl_points[-1].timestamp,
+                pnl=round(cum_pnl + unrealized, 2),
+            )
+    else:
+        # Daily points based on trade close dates
+        # Group trades by day
+        trade_idx = 0
+        cum_pnl = pnl_before
 
-        pad_points: list[PnlHistoryItem] = []
-        t = since_ts
-        while t < first_real_ts - pad_step:
-            pad_points.append(PnlHistoryItem(timestamp=t, pnl=0.0))
-            t += pad_step
-        # 在第一个真实点之前加一个 pnl=0 的衔接点
-        if pad_points and pnl_points and pad_points[-1].timestamp < first_real_ts:
-            pad_points.append(PnlHistoryItem(timestamp=first_real_ts - pad_step, pnl=0.0))
-        pnl_points = pad_points + pnl_points
+        # Generate daily points
+        current_date = since.date()
+        today = now.date()
 
-    # 如果还不够（比如 ALL 只有今天），至少在 range 开头加一个 0 点
+        while current_date <= today:
+            day_start = datetime.combine(current_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+            day_end_ts = day_start.timestamp() + 86400
+
+            while trade_idx < len(closed_trades):
+                t = closed_trades[trade_idx]
+                t_ts = t.closed_at.replace(tzinfo=timezone.utc).timestamp() if not t.closed_at.tzinfo else t.closed_at.timestamp()
+                if t_ts >= day_end_ts:
+                    break
+                cum_pnl += float(t.pnl_usd or 0)
+                trade_idx += 1
+
+            pnl_points.append(PnlHistoryItem(
+                timestamp=int(day_start.timestamp()),
+                pnl=round(cum_pnl, 2),
+            ))
+            current_date += timedelta(days=1)
+
+        # Last point: add unrealized
+        unrealized = float(
+            db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+                Trade.user_id == user_id,
+                Trade.status == "open",
+            ).scalar()
+        )
+        if pnl_points:
+            pnl_points[-1] = PnlHistoryItem(
+                timestamp=pnl_points[-1].timestamp,
+                pnl=round(pnl_points[-1].pnl + unrealized, 2),
+            )
+
+    # ── Thin out points if too many (M/ALL can produce hundreds) ──
+    max_points = 60
+    if len(pnl_points) > max_points:
+        step = len(pnl_points) / max_points
+        thinned = [pnl_points[int(i * step)] for i in range(max_points - 1)]
+        thinned.append(pnl_points[-1])  # always keep last
+        pnl_points = thinned
+
+    # Ensure at least 2 points
     if len(pnl_points) < 2:
-        pnl_points.insert(0, PnlHistoryItem(timestamp=since_ts, pnl=0.0))
+        since_ts = int(since.replace(tzinfo=timezone.utc).timestamp()) if not since.tzinfo else int(since.timestamp())
+        pnl_points.insert(0, PnlHistoryItem(timestamp=since_ts, pnl=round(pnl_before, 2)))
 
-    # 区间 P&L
+    # Range P&L
     range_pnl = 0.0
     range_pnl_pct = 0.0
     if len(pnl_points) >= 2:
         range_pnl = round(pnl_points[-1].pnl - pnl_points[0].pnl, 2)
-        # 分母 = 区间起始净资产
-        start_equity = float(snapshots[0].balance)
-        if start_equity > 0:
-            range_pnl_pct = round(range_pnl / start_equity * 100, 2)
-        elif total_net_deposits > 0:
-            # 起始余额为 0，用净入金做分母
-            range_pnl_pct = round(range_pnl / total_net_deposits * 100, 2)
-    elif len(pnl_points) == 1:
-        range_pnl = pnl_points[0].pnl
-        if total_net_deposits > 0:
-            range_pnl_pct = round(range_pnl / total_net_deposits * 100, 2)
+        # Denominator: user's balance at range start
+        balance = _get_realtime_balance(db, user_id)
+        if balance > 0:
+            range_pnl_pct = round(range_pnl / balance * 100, 2)
 
     return PnlHistoryResponse(
         data=pnl_points,

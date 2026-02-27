@@ -119,6 +119,21 @@ def get_deposit_history(
     ]
 
 
+def _clear_withdraw_pending(user_id: str):
+    """Clear the withdraw_pending flag so deposit_monitor resumes."""
+    db = SessionLocal()
+    try:
+        w = db.query(UserWallet).filter(UserWallet.user_id == user_id).first()
+        if w:
+            w.withdraw_pending = False
+            db.commit()
+            logger.info(f"[Withdraw] Cleared withdraw_pending for user {user_id}")
+    except Exception as e:
+        logger.error(f"[Withdraw] Failed to clear withdraw_pending: {e}")
+    finally:
+        db.close()
+
+
 def _process_withdraw_background(user_id: str, wallet_address: str, withdraw_address: str, private_key: str, amount: float):
     """Background thread: wait for USDC on Arb, then transfer to user wallet."""
     db = SessionLocal()
@@ -129,11 +144,12 @@ def _process_withdraw_background(user_id: str, wallet_address: str, withdraw_add
         for i in range(60):
             time.sleep(5)
             bal = get_usdc_balance(wallet_address)
-            if bal >= amount * 0.99:
+            if bal >= amount * 0.95:  # 95% threshold (HL withdraw fee)
                 logger.info(f"[Withdraw] USDC landed: {bal:.2f} for user {user_id}")
                 break
         else:
             logger.error(f"[Withdraw] Timeout waiting for USDC on Arb for user {user_id}")
+            _clear_withdraw_pending(user_id)  # ← Always clear on timeout
             return
 
         # Ensure gas for transfer
@@ -161,6 +177,7 @@ def _process_withdraw_background(user_id: str, wallet_address: str, withdraw_add
     except Exception as e:
         logger.error(f"[Withdraw] Background failed for user {user_id}: {e}")
     finally:
+        _clear_withdraw_pending(user_id)  # ← Always clear when done
         db.close()
 
 
@@ -187,6 +204,10 @@ def withdraw_to_user(
         )
 
     try:
+        # ★ Set withdraw_pending BEFORE initiating HL withdraw
+        wallet.withdraw_pending = True
+        db.commit()
+
         # 1. Withdraw from HL (this is fast — just a signed API call)
         withdraw_from_hl(private_key, req.amount, wallet.address)
 
@@ -204,5 +225,8 @@ def withdraw_to_user(
         )
 
     except Exception as e:
+        # Clear flag if HL withdraw itself failed
+        wallet.withdraw_pending = False
+        db.commit()
         logger.error(f"Withdraw failed for user {user.id}: {e}")
         raise HTTPException(status_code=500, detail=f"Withdrawal failed: {str(e)}")

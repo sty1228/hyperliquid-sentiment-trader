@@ -16,6 +16,7 @@ class UserWallet(Base):
     withdraw_address = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
+    withdraw_pending = Column(Boolean, default=False)  # ← 新增
 
     user = relationship("User", backref="dedicated_wallet")
 

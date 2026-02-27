@@ -32,7 +32,16 @@ POLL_INTERVAL = 15   # seconds
 def check_and_bridge():
     db = SessionLocal()
     try:
-        wallets = db.query(UserWallet).filter(UserWallet.is_active == True).all()
+        # ★ Skip wallets with pending withdrawals — prevents the
+        #   "withdraw → deposit_monitor re-bridges → money loops" bug
+        wallets = (
+            db.query(UserWallet)
+            .filter(
+                UserWallet.is_active == True,
+                UserWallet.withdraw_pending == False,  # ← KEY FIX
+            )
+            .all()
+        )
 
         for w in wallets:
             try:
