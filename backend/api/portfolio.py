@@ -154,7 +154,6 @@ def get_balance_history(
     if timeRange == "D":
         since_24h = now - timedelta(hours=24)
 
-        # 找 24 小时前最近的余额作为起始
         latest_before = (
             db.query(BalanceEvent)
             .filter(
@@ -167,7 +166,6 @@ def get_balance_history(
         if latest_before:
             opening_balance = latest_before.balance_after
         else:
-            # 没有 24h 前的事件，用 24h 前的快照
             snap_before = (
                 db.query(BalanceSnapshot)
                 .filter(
@@ -179,7 +177,6 @@ def get_balance_history(
             )
             opening_balance = snap_before.balance if snap_before else 0.0
 
-        # 过去 24 小时的所有事件
         events = (
             db.query(BalanceEvent)
             .filter(
@@ -190,17 +187,15 @@ def get_balance_history(
             .all()
         )
 
-        # 构建固定 12 个点，每 2 小时一个（覆盖 24 小时）
         start_hour = since_24h.replace(minute=0, second=0, microsecond=0)
         evt_idx = 0
         bal = opening_balance
         result: list[BalanceHistoryItem] = []
 
-        for h in range(0, 25, 2):  # 0, 2, 4, ..., 24 = 13 个时间点
+        for h in range(0, 25, 2):
             hour_time = start_hour + timedelta(hours=h)
             hour_ts = int(hour_time.timestamp())
 
-            # 应用这个小时之前（含）的事件
             while evt_idx < len(events) and int(events[evt_idx].created_at.timestamp()) <= hour_ts:
                 bal = events[evt_idx].balance_after
                 evt_idx += 1
@@ -210,12 +205,10 @@ def get_balance_history(
                 timestamp=hour_ts,
             ))
 
-        # 应用剩余事件到最后一个点
         while evt_idx < len(events):
             bal = events[evt_idx].balance_after
             evt_idx += 1
 
-        # 最后一个点始终用最新余额（从 BalanceSnapshot）
         latest_snap = (
             db.query(BalanceSnapshot)
             .filter(BalanceSnapshot.user_id == current_user.id)
@@ -250,7 +243,6 @@ def get_balance_history(
 
     result: list[BalanceHistoryItem] = []
 
-    # 补零余额点：数据点不足 7 个时，在第一个快照前补 $0
     if snapshots and len(snapshots) < 7:
         first_date = snapshots[0].snapshot_date
         days_available = (first_date - since.date()).days
@@ -270,7 +262,6 @@ def get_balance_history(
                 )
             )
 
-    # 真实数据点
     result.extend(
         BalanceHistoryItem(
             acconutValue=s.balance,
@@ -369,7 +360,11 @@ def _get_cumulative_net_deposits(
     """
     total = 0.0
     for e in events:
-        evt_ts = e.created_at.timestamp() if e.created_at.tzinfo else e.created_at.replace(tzinfo=timezone.utc).timestamp()
+        evt_ts = (
+            e.created_at.timestamp()
+            if e.created_at.tzinfo
+            else e.created_at.replace(tzinfo=timezone.utc).timestamp()
+        )
         if evt_ts > up_to_ts:
             break
         amt = float(e.amount) if e.amount else 0.0
@@ -479,7 +474,11 @@ def get_pnl_history(
 
             while evt_idx < len(recent_events):
                 e = recent_events[evt_idx]
-                e_ts = int(e.created_at.timestamp()) if e.created_at.tzinfo else int(e.created_at.replace(tzinfo=timezone.utc).timestamp())
+                e_ts = (
+                    int(e.created_at.timestamp())
+                    if e.created_at.tzinfo
+                    else int(e.created_at.replace(tzinfo=timezone.utc).timestamp())
+                )
                 if e_ts > hour_ts:
                     break
                 bal = float(e.balance_after)
@@ -507,11 +506,10 @@ def get_pnl_history(
             evt_idx += 1
 
         # 最后一个点用最新余额
-        final_bal = current_balance
         if pnl_points:
             pnl_points[-1] = PnlHistoryItem(
                 timestamp=pnl_points[-1].timestamp,
-                pnl=round(final_bal - total_net_deposits, 2),
+                pnl=round(current_balance - total_net_deposits, 2),
             )
 
         # 计算区间 P&L
@@ -519,9 +517,8 @@ def get_pnl_history(
         range_pnl_pct = 0.0
         if len(pnl_points) >= 2:
             range_pnl = round(pnl_points[-1].pnl - pnl_points[0].pnl, 2)
-            start_equity = opening_balance
-            if start_equity > 0:
-                range_pnl_pct = round(range_pnl / start_equity * 100, 2)
+            if opening_balance > 0:
+                range_pnl_pct = round(range_pnl / opening_balance * 100, 2)
 
         return PnlHistoryResponse(
             data=pnl_points,
@@ -572,8 +569,12 @@ def get_pnl_history(
         # 推进事件指针到该快照日期
         while evt_idx < len(all_events):
             e = all_events[evt_idx]
-            e_ts = e.created_at.timestamp() if e.created_at.tzinfo else e.created_at.replace(tzinfo=timezone.utc).timestamp()
-            if e_ts > snap_ts + 86400:  # 快照日 23:59:59 之后的事件留给下一个快照
+            e_ts = (
+                e.created_at.timestamp()
+                if e.created_at.tzinfo
+                else e.created_at.replace(tzinfo=timezone.utc).timestamp()
+            )
+            if e_ts > snap_ts + 86400:
                 break
             amt = float(e.amount) if e.amount else 0.0
             if e.event_type == "deposit":
