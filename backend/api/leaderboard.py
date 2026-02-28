@@ -46,7 +46,11 @@ class LeaderboardItemResponse(BaseModel):
 @router.get("/leaderboard", response_model=list[LeaderboardItemResponse])
 def get_leaderboard(
     window: str = Query("24h", regex="^(24h|7d|30d)$"),
-    sort_by: str = Query("total_profit_usd", regex="^(points|win_rate|total_profit_usd|copiers_count)$"),
+    sort_by: str = Query(
+        "total_profit_usd",
+        regex="^(points|win_rate|total_profit_usd|copiers_count)$",
+    ),
+    verified_only: bool = Query(False),
     limit: int = Query(200, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -54,14 +58,23 @@ def get_leaderboard(
     """
     KOL 排行榜
     - window: 24h / 7d / 30d
-    - sort_by: points / win_rate / total_profit_usd / copiers_count
+    - sort_by: points(trending) / win_rate / total_profit_usd(earners) / copiers_count(most copied)
+    - verified_only: true → 仅 is_verified=True 的 trader
     """
     sort_col = getattr(TraderStats, sort_by, TraderStats.total_profit_usd)
 
-    rows = (
+    query = (
         db.query(TraderStats)
+        .join(Trader, TraderStats.trader_id == Trader.id)
         .options(joinedload(TraderStats.trader))
         .filter(TraderStats.window == window, TraderStats.total_signals > 0)
+    )
+
+    if verified_only:
+        query = query.filter(Trader.is_verified.is_(True))
+
+    rows = (
+        query
         .order_by(desc(sort_col))
         .offset(offset)
         .limit(limit)
@@ -103,20 +116,12 @@ def get_leaderboard(
             direction = latest_signal.direction
             bull_or_bear = latest_signal.sentiment or "bullish"
 
-        # ── FIX 1: total_tweets 从 signal_to_noise 反算 ──
-        # signal_to_noise = total_signals / total_tweets
-        # 所以 total_tweets = total_signals / signal_to_noise
         if stats.signal_to_noise > 0:
             total_tweets = int(stats.total_signals / stats.signal_to_noise)
         else:
             total_tweets = stats.total_signals
 
-        # ── FIX 2: results_pct 用百分比，不是 USD ──
-        # total_profit_usd 基于 $100 本金，所以数值上 == 百分比
-        # 但语义上应该用 avg_return * total_signals 或直接算
-        results_pct = round(stats.total_profit_usd, 2)  # $100 base → pct == usd
-
-        # ── FIX 3: tweet_performance 用 avg_return_pct ──
+        results_pct = round(stats.total_profit_usd, 2)
         tweet_performance = round(stats.avg_return_pct, 2)
 
         result.append(
