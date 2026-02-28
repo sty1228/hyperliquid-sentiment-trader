@@ -569,6 +569,9 @@ def recompute_stats(db: Session):
     if not traders:
         return
 
+    # ★ cutoff for "recent" signals (trending momentum — last 48h)
+    recent_cutoff = now - timedelta(hours=48)
+
     for wname, delta in WINDOWS.items():
         cutoff = now - delta
 
@@ -617,6 +620,19 @@ def recompute_stats(db: Session):
                 .scalar()
             )
 
+            # ★ Trending score: recent activity + streak + momentum + base quality
+            recent_sigs = [s for s in tsigs if s.created_at and s.created_at >= recent_cutoff]
+            recent_count = len(recent_sigs)
+            recent_returns = [s.pct_change for s in recent_sigs if s.pct_change is not None]
+            recent_avg = sum(recent_returns) / len(recent_returns) if recent_returns else 0.0
+
+            trending = (
+                recent_count * 3.0           # signal density (last 48h)
+                + streak * 5.0               # winning streak momentum
+                + max(recent_avg, 0) * 2.0   # recent positive returns (ignore negative)
+                + wr * 10.0                  # base quality floor
+            )
+
             data = {
                 "total_signals": total,
                 "win_count": win_n,
@@ -629,6 +645,7 @@ def recompute_stats(db: Session):
                 "profit_grade": grade,
                 "copiers_count": copiers or 0,
                 "signal_to_noise": 0.0,
+                "trending_score": round(trending, 1),  # ★ NEW
             }
             scored.append((trader.id, pts, data))
 
@@ -666,7 +683,7 @@ def _empty_stats() -> dict:
         "total_signals": 0, "win_count": 0, "loss_count": 0,
         "win_rate": 0, "avg_return_pct": 0, "total_profit_usd": 0,
         "streak": 0, "points": 0, "profit_grade": "C",
-        "copiers_count": 0, "signal_to_noise": 0,
+        "copiers_count": 0, "signal_to_noise": 0, "trending_score": 0,
     }
 
 

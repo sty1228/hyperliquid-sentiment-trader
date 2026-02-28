@@ -53,6 +53,7 @@ class TraderStats(Base):
     rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
     copiers_count: Mapped[int] = mapped_column(Integer, default=0)
     signal_to_noise: Mapped[float] = mapped_column(Float, default=0.0)
+    trending_score: Mapped[float] = mapped_column(Float, default=0.0)  # ★ NEW
 
     computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 

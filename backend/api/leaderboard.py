@@ -5,15 +5,14 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import desc
+from sqlalchemy import desc, exists
 
 from backend.deps import get_db
 from backend.models.trader import Trader, TraderStats
+from backend.models.user import User
 
 router = APIRouter(prefix="/api", tags=["leaderboard"])
 
-
-# ── Response 模型（匹配前端 LeaderboardItem）─────────────
 
 class LeaderboardItemResponse(BaseModel):
     x_handle: str
@@ -41,27 +40,34 @@ class LeaderboardItemResponse(BaseModel):
     total_profit_usd: float = 0.0
 
 
-# ── API 端点 ─────────────────────────────────────────────
+# ── sort_by → column mapping ──
+_SORT_COLS = {
+    "total_profit_usd": TraderStats.total_profit_usd,
+    "copiers_count":    TraderStats.copiers_count,
+    "trending_score":   TraderStats.trending_score,
+    "points":           TraderStats.points,
+    "win_rate":         TraderStats.win_rate,
+}
+
 
 @router.get("/leaderboard", response_model=list[LeaderboardItemResponse])
 def get_leaderboard(
     window: str = Query("24h", regex="^(24h|7d|30d)$"),
     sort_by: str = Query(
         "total_profit_usd",
-        regex="^(points|win_rate|total_profit_usd|copiers_count)$",
+        regex="^(total_profit_usd|copiers_count|trending_score|points|win_rate)$",
     ),
-    verified_only: bool = Query(False),
+    registered_only: bool = Query(False),
     limit: int = Query(200, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
     """
     KOL 排行榜
-    - window: 24h / 7d / 30d
-    - sort_by: points(trending) / win_rate / total_profit_usd(earners) / copiers_count(most copied)
-    - verified_only: true → 仅 is_verified=True 的 trader
+    - sort_by: total_profit_usd (earners) | copiers_count (copied) | trending_score (trending)
+    - registered_only: true → 只显示在平台注册过的 trader (users.twitter_username 匹配)
     """
-    sort_col = getattr(TraderStats, sort_by, TraderStats.total_profit_usd)
+    sort_col = _SORT_COLS.get(sort_by, TraderStats.total_profit_usd)
 
     query = (
         db.query(TraderStats)
@@ -70,8 +76,11 @@ def get_leaderboard(
         .filter(TraderStats.window == window, TraderStats.total_signals > 0)
     )
 
-    if verified_only:
-        query = query.filter(Trader.is_verified.is_(True))
+    # ★ Verified = 注册过平台的用户 (users 表有匹配的 twitter_username)
+    if registered_only:
+        query = query.filter(
+            exists().where(User.twitter_username == Trader.username)
+        )
 
     rows = (
         query
@@ -88,7 +97,6 @@ def get_leaderboard(
     for idx, stats in enumerate(rows, 1):
         trader = stats.trader
 
-        # 获取最新 signal
         latest_signal = (
             db.query(Signal)
             .filter(Signal.trader_id == trader.id)
@@ -96,7 +104,6 @@ def get_leaderboard(
             .first()
         )
 
-        # 计算 how_long_ago
         how_long_ago = ""
         ticker = ""
         direction = ""
