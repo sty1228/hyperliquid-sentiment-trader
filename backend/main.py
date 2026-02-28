@@ -62,7 +62,3 @@ app.include_router(rewards_router)
 def root():
     return {"ok": True, "message": "HyperCopy API v3", "docs": "/docs"}
 
-
-@app.get("/sentry-debug")
-async def trigger_error():
-    division_by_zero = 1 / 0
