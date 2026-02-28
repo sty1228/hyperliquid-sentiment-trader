@@ -17,6 +17,7 @@ from backend.deps import get_db, get_current_user
 from backend.models.user import User
 from backend.models.trade import Trade
 from backend.models.follow import Follow
+from backend.models.trader import Trader
 from backend.models.setting import BalanceSnapshot, BalanceEvent
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
@@ -91,11 +92,6 @@ class PnlHistoryResponse(BaseModel):
 # ── 交易盈亏计算 helper ──────────────────────────────────
 
 def _calc_trade_pnl(db: Session, user_id: str, since: datetime | None = None) -> float:
-    """
-    纯交易P&L = 已平仓 realized + 持仓 unrealized
-    since: 只计算这个时间之后的交易（用于区间P&L）
-    """
-    # Realized PnL from closed trades
     closed_q = db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
         Trade.user_id == user_id,
         Trade.status == "closed",
@@ -104,7 +100,6 @@ def _calc_trade_pnl(db: Session, user_id: str, since: datetime | None = None) ->
         closed_q = closed_q.filter(Trade.closed_at >= since)
     realized = float(closed_q.scalar())
 
-    # Unrealized PnL from open positions
     unrealized = float(
         db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
             Trade.user_id == user_id,
@@ -116,10 +111,6 @@ def _calc_trade_pnl(db: Session, user_id: str, since: datetime | None = None) ->
 
 
 def _get_realtime_balance(db: Session, user_id: str) -> float:
-    """
-    取「最新余额」——优先用最新 BalanceEvent.balance_after，
-    如果没有事件则用最新 BalanceSnapshot。
-    """
     latest_evt = (
         db.query(BalanceEvent)
         .filter(BalanceEvent.user_id == user_id)
@@ -172,6 +163,18 @@ def get_profile_data(
     )
     account_value = latest_snapshot.balance if latest_snapshot else 0.0
 
+    # ★ Copiers: how many users are copy-trading me (if I'm also a Trader)
+    copiers_count = 0
+    if current_user.twitter_username:
+        my_trader = db.query(Trader).filter(
+            Trader.username == current_user.twitter_username
+        ).first()
+        if my_trader:
+            copiers_count = db.query(Follow).filter(
+                Follow.trader_id == my_trader.id,
+                Follow.is_copy_trading.is_(True),
+            ).count()
+
     recent_trades = (
         db.query(Trade)
         .filter(Trade.user_id == current_user.id, Trade.status == "closed")
@@ -192,9 +195,9 @@ def get_profile_data(
         name=current_user.display_name or current_user.wallet_address[:10],
         twitterId=current_user.wallet_address,
         followingCount=following_count,
-        followerCount=0,
-        accountValue=account_value,
+        followerCount=copiers_count,
         followerList=[],
+        accountValue=account_value,
         traderCopyingCount=copy_trading_count,
         signalCount=total_trades,
         noiseCount=0,
@@ -389,7 +392,6 @@ def get_dashboard_summary(
     total_trades = db.query(Trade).filter(Trade.user_id == current_user.id).count()
     open_positions = db.query(Trade).filter(Trade.user_id == current_user.id, Trade.status == "open").count()
 
-    # ★ P&L = realized + unrealized from trades only
     total_pnl = _calc_trade_pnl(db, current_user.id)
 
     closed_trades = (
@@ -414,8 +416,6 @@ def get_dashboard_summary(
 
 # ══════════════════════════════════════════════════════════
 # ★ P&L History — 纯交易盈亏
-#   P&L = sum(closed trade PnL) + sum(open trade unrealized PnL)
-#   与出入金完全无关。没交易 = 0。
 # ══════════════════════════════════════════════════════════
 
 @router.get("/portfolio/pnl-history", response_model=PnlHistoryResponse)
@@ -424,18 +424,11 @@ def get_pnl_history(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    ★ 纯交易 P&L 曲线。
-    每个数据点的 pnl = 截至该时间点的累计交易盈亏。
-    没有任何交易 → 所有点 pnl = 0。
-    """
     now = datetime.now(timezone.utc)
     user_id = current_user.id
 
-    # Total P&L across all time (realized + unrealized)
     all_time_pnl = _calc_trade_pnl(db, user_id)
 
-    # Determine time range
     if timeRange == "D":
         since = now - timedelta(hours=24)
     elif timeRange == "W":
@@ -444,10 +437,9 @@ def get_pnl_history(
         since = now - timedelta(days=30)
     elif timeRange == "YTD":
         since = datetime(now.year, 1, 1, tzinfo=timezone.utc)
-    else:  # ALL
+    else:
         since = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
-    # ── Get all closed trades in range ──
     closed_trades = (
         db.query(Trade)
         .filter(
@@ -459,7 +451,6 @@ def get_pnl_history(
         .all()
     )
 
-    # ── PnL before range start (baseline) ──
     pnl_before = float(
         db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
             Trade.user_id == user_id,
@@ -468,11 +459,9 @@ def get_pnl_history(
         ).scalar()
     )
 
-    # ── Build P&L curve ──
     pnl_points: list[PnlHistoryItem] = []
 
     if timeRange == "D":
-        # 13 points, every 2h
         start_hour = since.replace(minute=0, second=0, microsecond=0)
         trade_idx = 0
         cum_pnl = pnl_before
@@ -481,7 +470,6 @@ def get_pnl_history(
             hour_time = start_hour + timedelta(hours=h)
             hour_ts = int(hour_time.timestamp())
 
-            # Sum trades closed before this time point
             while trade_idx < len(closed_trades):
                 t = closed_trades[trade_idx]
                 t_ts = int(t.closed_at.replace(tzinfo=timezone.utc).timestamp()) if not t.closed_at.tzinfo else int(t.closed_at.timestamp())
@@ -490,19 +478,14 @@ def get_pnl_history(
                 cum_pnl += float(t.pnl_usd or 0)
                 trade_idx += 1
 
-            pnl_points.append(PnlHistoryItem(
-                timestamp=hour_ts,
-                pnl=round(cum_pnl, 2),
-            ))
+            pnl_points.append(PnlHistoryItem(timestamp=hour_ts, pnl=round(cum_pnl, 2)))
 
-        # Last point: add current unrealized PnL
         unrealized = float(
             db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
                 Trade.user_id == user_id,
                 Trade.status == "open",
             ).scalar()
         )
-        # Process remaining trades
         while trade_idx < len(closed_trades):
             cum_pnl += float(closed_trades[trade_idx].pnl_usd or 0)
             trade_idx += 1
@@ -513,12 +496,8 @@ def get_pnl_history(
                 pnl=round(cum_pnl + unrealized, 2),
             )
     else:
-        # Daily points based on trade close dates
-        # Group trades by day
         trade_idx = 0
         cum_pnl = pnl_before
-
-        # Generate daily points
         current_date = since.date()
         today = now.date()
 
@@ -534,13 +513,9 @@ def get_pnl_history(
                 cum_pnl += float(t.pnl_usd or 0)
                 trade_idx += 1
 
-            pnl_points.append(PnlHistoryItem(
-                timestamp=int(day_start.timestamp()),
-                pnl=round(cum_pnl, 2),
-            ))
+            pnl_points.append(PnlHistoryItem(timestamp=int(day_start.timestamp()), pnl=round(cum_pnl, 2)))
             current_date += timedelta(days=1)
 
-        # Last point: add unrealized
         unrealized = float(
             db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
                 Trade.user_id == user_id,
@@ -553,25 +528,21 @@ def get_pnl_history(
                 pnl=round(pnl_points[-1].pnl + unrealized, 2),
             )
 
-    # ── Thin out points if too many (M/ALL can produce hundreds) ──
     max_points = 60
     if len(pnl_points) > max_points:
         step = len(pnl_points) / max_points
         thinned = [pnl_points[int(i * step)] for i in range(max_points - 1)]
-        thinned.append(pnl_points[-1])  # always keep last
+        thinned.append(pnl_points[-1])
         pnl_points = thinned
 
-    # Ensure at least 2 points
     if len(pnl_points) < 2:
         since_ts = int(since.replace(tzinfo=timezone.utc).timestamp()) if not since.tzinfo else int(since.timestamp())
         pnl_points.insert(0, PnlHistoryItem(timestamp=since_ts, pnl=round(pnl_before, 2)))
 
-    # Range P&L
     range_pnl = 0.0
     range_pnl_pct = 0.0
     if len(pnl_points) >= 2:
         range_pnl = round(pnl_points[-1].pnl - pnl_points[0].pnl, 2)
-        # Denominator: user's balance at range start
         balance = _get_realtime_balance(db, user_id)
         if balance > 0:
             range_pnl_pct = round(range_pnl / balance * 100, 2)

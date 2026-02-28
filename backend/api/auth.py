@@ -19,6 +19,7 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 class ConnectWalletRequest(BaseModel):
     wallet_address: str
+    twitter_username: str | None = None
 
     @field_validator("wallet_address")
     @classmethod
@@ -39,6 +40,7 @@ class MeResponse(BaseModel):
     id: str
     wallet_address: str
     display_name: str | None
+    twitter_username: str | None = None
     is_active: bool
     created_at: datetime
 
@@ -76,8 +78,15 @@ def connect_wallet(body: ConnectWalletRequest, db: Session = Depends(get_db)):
     ).first()
 
     if not user:
-        user = User(wallet_address=body.wallet_address)
+        user = User(
+            wallet_address=body.wallet_address,
+            twitter_username=body.twitter_username,
+        )
         db.add(user)
+        db.commit()
+        db.refresh(user)
+    elif body.twitter_username and user.twitter_username != body.twitter_username:
+        user.twitter_username = body.twitter_username
         db.commit()
         db.refresh(user)
 
@@ -89,6 +98,7 @@ def connect_wallet(body: ConnectWalletRequest, db: Session = Depends(get_db)):
             "id": user.id,
             "wallet_address": user.wallet_address,
             "display_name": user.display_name,
+            "twitter_username": user.twitter_username,
         },
     )
 
@@ -99,6 +109,7 @@ def get_me(current_user: User = Depends(get_current_user)):
         id=current_user.id,
         wallet_address=current_user.wallet_address,
         display_name=current_user.display_name,
+        twitter_username=current_user.twitter_username,
         is_active=current_user.is_active,
         created_at=current_user.created_at,
     )
