@@ -1,10 +1,15 @@
 from __future__ import annotations
+import sentry_sdk
+sentry_sdk.init(
+    dsn="https://8ec3ec7c2d0d95a793c6357e47ead90f@o4510965336113152.ingest.us.sentry.io/4510965338537984",
+    send_default_pii=True,
+    traces_sample_rate=0.1,
+)
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-
 from backend.config import get_settings
 from backend.api.health import router as health_router
 from backend.api.auth import router as auth_router
@@ -56,3 +61,8 @@ app.include_router(rewards_router)
 @app.get("/")
 def root():
     return {"ok": True, "message": "HyperCopy API v3", "docs": "/docs"}
+
+
+@app.get("/sentry-debug")
+async def trigger_error():
+    division_by_zero = 1 / 0
