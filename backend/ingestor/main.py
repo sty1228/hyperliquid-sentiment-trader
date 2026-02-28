@@ -28,7 +28,10 @@ openai.api_key = OPENAI_API_KEY
 SCRAPE_USERS_ENV = _env("SCRAPE_USERS", "")
 
 # ── LLM model config ──────────────────────────────────────────────────
-LLM_MODEL = _env("LLM_MODEL", "gpt-4o-mini")
+LLM_MODEL   = _env("LLM_MODEL", "gpt-4o-mini")
+# ★ Vision: gpt-4o-mini supports image inputs natively
+VISION_MODEL   = _env("VISION_MODEL", "gpt-4o-mini")
+VISION_ENABLED = _env("VISION_ENABLED", "true").lower() in ("1", "true", "yes")
 
 # ── regex / constants ──────────────────────────────────────────────────
 ALNUM_RE         = re.compile(r"[^A-Z0-9]")
@@ -52,7 +55,6 @@ COMMON_CRYPTO = {
     "SUI","FTM","ROSE","AR","MINA","HNT","CHZ",
 }
 
-# ── sentiment phrases (context-aware) ─────────────────────────────────
 POS_PHRASES = [
     "longed","longing","going long","opened a long","opening long",
     "entered long","long position","long here","long from",
@@ -86,7 +88,6 @@ NEG_PHRASES = [
     "🟥","🔻","📉","⬇️","💀","🪦",
 ]
 
-# Phrases that LOOK directional but AREN'T trade signals
 FALSE_POS_PATTERNS = [
     "short term","short-term","short squeeze","short covering",
     "in short","short summary","shorts getting","shorts are",
@@ -95,7 +96,6 @@ FALSE_POS_PATTERNS = [
     "not long","no longer",
 ]
 
-# ── direction detection phrases ───────────────────────────────────────
 LONG_DIRECTION_PHRASES = [
     "longed","longing","going long","opened a long","opening long",
     "entered long","long position","long here","long from","long entry",
@@ -110,7 +110,6 @@ SHORT_DIRECTION_PHRASES = [
     "selling","sold","fading","faded","cutting losses",
 ]
 
-# ── ticker normalization ──────────────────────────────────────────────
 PAIR_SEPARATORS = ["/", "-", "_", ":"]
 STABLE_SUFFIXES = ["USDT", "USDC", "USD"]
 PERP_SUFFIXES   = ["-PERP","PERP","-PERPETUAL","PERPETUAL","_PERP",".P"]
@@ -123,9 +122,7 @@ ALIAS_TO_CANON: Dict[str, str] = {
     "SOLANA":"SOL","SOL-PERP":"SOL","SOLUSDT":"SOL",
     "ARBITRUM":"ARB","ARBIT":"ARB","ARB-USD":"ARB",
     "OPTIMISM":"OP","OP-USD":"OP",
-    "POL":"MATIC",
-    "CELESTIA":"TIA",
-    "STARKNET":"STRK",
+    "POL":"MATIC","CELESTIA":"TIA","STARKNET":"STRK",
     "BCC":"BCH","BCHABC":"BCH","BCHSV":"BSV",
     "RIPPLE":"XRP","XRP-USD":"XRP",
     "XDG":"DOGE","DOG":"DOGE","DOGECOIN":"DOGE",
@@ -134,13 +131,10 @@ ALIAS_TO_CANON: Dict[str, str] = {
     "LNK":"LINK","CHAINLINK":"LINK",
     "TRON":"TRX","TRX-USD":"TRX",
     "POLKADOT":"DOT","DOT-USD":"DOT",
-    "COSMOS":"ATOM",
-    "RENDER":"RNDR",
-    "WORLDCOIN":"WLD",
+    "COSMOS":"ATOM","RENDER":"RNDR","WORLDCOIN":"WLD",
     "FANTOM":"FTM","SONIC":"FTM",
     "IOTA-USD":"IOTA","MIOTA":"IOTA",
-    "NAN0":"NANO",
-    "BTTOLD":"BTT","BTTNEW":"BTT",
+    "NAN0":"NANO","BTTOLD":"BTT","BTTNEW":"BTT",
     "OCEAN":"FET","AGIX":"FET",
     "ONDO-PERP":"ONDO","PEPE-PERP":"PEPE","DOGE-PERP":"DOGE",
     "ARB-PERP":"ARB","SUI-PERP":"SUI","APT-PERP":"APT",
@@ -169,7 +163,6 @@ TICKER_BLACKLIST = {
     "WEEK","DAILY","TODAY","SOON",
 }
 
-# ── LLM few-shot examples ─────────────────────────────────────────────
 LLM_FEW_SHOT_EXAMPLES = [
     {"tweet": "$BTC looking strong here, longed at 67.5k. TP 72k, SL 65k 🚀",
      "label": {"ticker": "BTC", "sentiment": "bullish", "direction": "long"}},
@@ -187,6 +180,10 @@ LLM_FEW_SHOT_EXAMPLES = [
      "label": {"ticker": "BTC", "sentiment": "neutral", "direction": "long"}},
     {"tweet": "$BTC short squeeze incoming. Funding is super negative, shorts gonna get rekt 🔥",
      "label": {"ticker": "BTC", "sentiment": "bullish", "direction": "long"}},
+    {"tweet": "Just hit 100k followers! Thank you fam 🙏 Giveaway coming soon...",
+     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
+    {"tweet": "$HYPE chart looking exactly like $SOL did before its run. Accumulating heavy.",
+     "label": {"ticker": "HYPE", "sentiment": "bullish", "direction": "long"}},
 ]
 
 
@@ -285,21 +282,17 @@ BACKOFF_FACTOR      = 1.5
 SPEEDUP_FACTOR      = 0.7
 
 
-def _state_get_user_id(con: sqlite3.Connection, username: str) -> Optional[str]:
-    row = con.execute(
-        "SELECT user_id FROM user_state WHERE username = ?", (username,)
-    ).fetchone()
+def _state_get_user_id(con, username):
+    row = con.execute("SELECT user_id FROM user_state WHERE username = ?", (username,)).fetchone()
     return row[0] if row else None
 
 
-def _state_get_since_id(con: sqlite3.Connection, username: str) -> Optional[str]:
-    row = con.execute(
-        "SELECT last_tweet_id FROM user_state WHERE username = ?", (username,)
-    ).fetchone()
+def _state_get_since_id(con, username):
+    row = con.execute("SELECT last_tweet_id FROM user_state WHERE username = ?", (username,)).fetchone()
     return row[0] if row else None
 
 
-def _state_should_poll(con: sqlite3.Connection, username: str) -> bool:
+def _state_should_poll(con, username):
     row = con.execute(
         "SELECT last_polled_at, poll_interval_h FROM user_state WHERE username = ?",
         (username,),
@@ -307,44 +300,35 @@ def _state_should_poll(con: sqlite3.Connection, username: str) -> bool:
     if not row or not row[0]:
         return True
     last_polled = datetime.fromisoformat(row[0])
-    interval_h = row[1] or 2.0
-    next_poll = last_polled + timedelta(hours=interval_h)
+    next_poll = last_polled + timedelta(hours=row[1] or 2.0)
     return datetime.now(timezone.utc) >= next_poll
 
-PROFILE_REFRESH_DAYS = 7  # only fetch profile once a week
+
+PROFILE_REFRESH_DAYS = 7
 
 
-def _state_needs_profile_refresh(con: sqlite3.Connection, username: str) -> bool:
-    row = con.execute(
-        "SELECT last_profile_at FROM user_state WHERE username = ?",
-        (username,),
-    ).fetchone()
+def _state_needs_profile_refresh(con, username):
+    row = con.execute("SELECT last_profile_at FROM user_state WHERE username = ?", (username,)).fetchone()
     if not row or not row[0]:
         return True
     try:
-        last = datetime.fromisoformat(row[0])
-        return datetime.now(timezone.utc) - last > timedelta(days=PROFILE_REFRESH_DAYS)
+        return datetime.now(timezone.utc) - datetime.fromisoformat(row[0]) > timedelta(days=PROFILE_REFRESH_DAYS)
     except Exception:
         return True
 
 
-def _state_update_profile_time(con: sqlite3.Connection, username: str):
-    now = datetime.now(timezone.utc).isoformat()
-    con.execute(
-        "UPDATE user_state SET last_profile_at = ? WHERE username = ?",
-        (now, username),
-    )
+def _state_update_profile_time(con, username):
+    con.execute("UPDATE user_state SET last_profile_at = ? WHERE username = ?",
+                (datetime.now(timezone.utc).isoformat(), username))
     con.commit()
 
-def _state_save(con: sqlite3.Connection, username: str, user_id: str,
-                last_tweet_id: Optional[str] = None,
-                tweets_found: int = 0):
+
+def _state_save(con, username, user_id, last_tweet_id=None, tweets_found=0):
     now = datetime.now(timezone.utc).isoformat()
     existing = con.execute(
         "SELECT last_tweet_id, avg_tweets_per_day, empty_polls, poll_interval_h "
         "FROM user_state WHERE username = ?", (username,)
     ).fetchone()
-
     if existing:
         old_avg = existing[1] or 0.0
         old_empty = existing[2] or 0
@@ -367,8 +351,7 @@ def _state_save(con: sqlite3.Connection, username: str, user_id: str,
         con.execute(
             """UPDATE user_state SET user_id=?, last_tweet_id=COALESCE(?,last_tweet_id),
                avg_tweets_per_day=?, empty_polls=?, poll_interval_h=?,
-               last_polled_at=?, updated_at=?
-               WHERE username=?""",
+               last_polled_at=?, updated_at=? WHERE username=?""",
             (user_id, last_tweet_id, round(new_avg, 2), new_empty,
              round(new_interval, 1), now, now, username),
         )
@@ -405,17 +388,14 @@ def _label_cache_connect() -> sqlite3.Connection:
     return con
 
 
-def _label_cache_get(con: sqlite3.Connection, h: str) -> Optional[Tuple[str, str, str]]:
-    row = con.execute(
-        "SELECT ticker, sentiment, direction FROM label_cache WHERE tweet_hash = ?", (h,)
-    ).fetchone()
+def _label_cache_get(con, h):
+    row = con.execute("SELECT ticker, sentiment, direction FROM label_cache WHERE tweet_hash = ?", (h,)).fetchone()
     return (row[0], row[1], row[2]) if row else None
 
 
-def _label_cache_put(con: sqlite3.Connection, h: str, ticker: str, sentiment: str, direction: str):
+def _label_cache_put(con, h, ticker, sentiment, direction):
     con.execute(
-        "INSERT OR REPLACE INTO label_cache (tweet_hash, ticker, sentiment, direction, created_at) "
-        "VALUES (?,?,?,?,?)",
+        "INSERT OR REPLACE INTO label_cache (tweet_hash, ticker, sentiment, direction, created_at) VALUES (?,?,?,?,?)",
         (h, ticker, sentiment, direction, datetime.now(timezone.utc).isoformat()),
     )
     con.commit()
@@ -426,70 +406,44 @@ def _stable_tweet_hash(text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  CHEAP HEURISTIC LABELING (UPGRADED — context-aware)
+#  CHEAP HEURISTIC LABELING
 # ═══════════════════════════════════════════════════════════════════════
 
-def _cheap_ticker(text: str) -> Optional[str]:
-    """
-    Extract the PRIMARY ticker from tweet text.
-    When multiple $TICKERs found, pick the one closest to action words.
-    """
+def _cheap_ticker(text):
     if not text:
         return None
-
-    # 1) Collect ALL $TICKER mentions with position
     dollar_tickers = []
     for m in DOLLAR_TICKER_RE.finditer(text):
         sym = normalize_ticker(m.group(1))
         if sym != "NOISE" and sym not in TICKER_BLACKLIST:
             dollar_tickers.append((sym, m.start()))
-
     if dollar_tickers:
         if len(dollar_tickers) == 1:
             return dollar_tickers[0][0]
-
-        # Multiple $TICKERs: score by proximity to action words + frequency
         t_lower = text.lower()
-        best_sym = None
-        best_score = -1
-
         ticker_counts: Dict[str, int] = {}
         for sym, _ in dollar_tickers:
             ticker_counts[sym] = ticker_counts.get(sym, 0) + 1
-
+        best_sym, best_score = None, -1
         for sym, pos in dollar_tickers:
-            score = 0
-            score += ticker_counts[sym] * 2
-
-            context_start = max(0, pos - 40)
-            context_end = min(len(text), pos + 80)
-            context = text[context_start:context_end].lower()
-
-            action_words = [
-                "long","short","buy","sell","entry","target",
-                "tp","sl","stop","loaded","shorted","longed",
-                "bullish","bearish","pump","dump","breakout",
-            ]
-            for w in action_words:
-                if w in context:
+            score = ticker_counts[sym] * 2
+            ctx_start = max(0, pos - 40)
+            ctx_end = min(len(text), pos + 80)
+            ctx = text[ctx_start:ctx_end].lower()
+            for w in ["long","short","buy","sell","entry","target","tp","sl","stop",
+                       "loaded","shorted","longed","bullish","bearish","pump","dump","breakout"]:
+                if w in ctx:
                     score += 3
-
             if pos == dollar_tickers[0][1]:
                 score += 1
-
             if score > best_score:
                 best_score = score
                 best_sym = sym
-
         return best_sym
-
-    # 2) #TICKER — trust if in COMMON_CRYPTO
     for m in HASH_TICKER_RE.finditer(text):
         sym = normalize_ticker(m.group(1))
         if sym in COMMON_CRYPTO:
             return sym
-
-    # 3) Bare uppercase — only match known crypto
     candidates = set()
     for c in PLAIN_TICKER_RE.findall(text.upper()):
         sym = normalize_ticker(c)
@@ -497,81 +451,58 @@ def _cheap_ticker(text: str) -> Optional[str]:
             candidates.add(sym)
     if len(candidates) == 1:
         return next(iter(candidates))
-
     return None
 
 
-def _cheap_sentiment(text: str) -> Optional[str]:
-    """
-    Context-aware sentiment detection using phrase matching.
-    Returns None for ambiguous cases → routed to LLM.
-    """
+def _cheap_sentiment(text):
     if not text:
         return None
     t = text.lower()
-
-    pos_score = 0
-    neg_score = 0
-
+    pos_score = neg_score = 0
     for phrase in POS_PHRASES:
         if phrase in t:
-            is_false = False
-            for fp in FALSE_POS_PATTERNS:
-                if fp in t and phrase in fp:
-                    is_false = True
-                    break
-            if not is_false:
+            if not any(fp in t and phrase in fp for fp in FALSE_POS_PATTERNS):
                 pos_score += len(phrase.split())
-
     for phrase in NEG_PHRASES:
         if phrase in t:
-            is_false = False
-            for fp in FALSE_POS_PATTERNS:
-                if fp in t and phrase in fp:
-                    is_false = True
-                    break
-            if not is_false:
+            if not any(fp in t and phrase in fp for fp in FALSE_POS_PATTERNS):
                 neg_score += len(phrase.split())
-
     if pos_score >= 2 and pos_score > neg_score * 1.5:
         return "bullish"
     if neg_score >= 2 and neg_score > pos_score * 1.5:
         return "bearish"
-
     return None
 
 
-def _sentiment_to_direction(sentiment: str, text: str) -> str:
-    """Determine trade direction from explicit phrases, fallback to sentiment."""
+def _sentiment_to_direction(sentiment, text):
     t = text.lower()
-
     long_score = sum(1 for p in LONG_DIRECTION_PHRASES if p in t)
     short_score = sum(1 for p in SHORT_DIRECTION_PHRASES if p in t)
-
     if long_score > short_score:
         return "long"
     if short_score > long_score:
         return "short"
-
     return "short" if sentiment == "bearish" else "long"
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  OPENAI LABELING (UPGRADED — few-shot examples)
+#  OPENAI LLM — shared request helper
 # ═══════════════════════════════════════════════════════════════════════
 
 def _llm_request(
     messages: List[Dict[str, Any]],
     max_tokens: int,
     temperature: float,
+    model: str | None = None,
     retries: int = 4,
     base_delay: float = 1.0,
 ) -> Tuple[str, int, int]:
     last_err = None
+    use_model = model or LLM_MODEL
     for attempt in range(retries):
         try:
             resp = openai.chat.completions.create(
-                model=LLM_MODEL,
+                model=use_model,
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -590,10 +521,14 @@ def _llm_request(
     raise RuntimeError(f"OpenAI request failed after retries: {last_err}")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  BATCH TEXT LABELING (no images)
+#  ★ FIX: max_tokens increased to prevent JSON truncation
+# ═══════════════════════════════════════════════════════════════════════
+
 def llm_batch_label(
     items: List[Dict[str, Any]],
 ) -> Tuple[Dict[str, Dict[str, str]], int, int]:
-    """Batch label tweets with few-shot examples for accuracy."""
     examples_str = "\n".join([
         f'  Tweet: "{ex["tweet"]}" → {json.dumps(ex["label"])}'
         for ex in LLM_FEW_SHOT_EXAMPLES
@@ -605,16 +540,16 @@ def llm_batch_label(
         "rules": [
             "Return JSON: {\"labels\": [{id, ticker, sentiment, direction}, ...]}",
             "Ticker: the PRIMARY crypto being traded/analyzed. Use symbol (BTC, ETH, SOL, HYPE, etc).",
-            "  - 'NOISE' if tweet is not about a specific crypto trade/analysis (promo, thread, GM, engagement bait, personal life).",
-            "  - 'MARKET' if about general crypto market with no specific coin.",
+            "  - 'NOISE' if tweet is not about a specific crypto trade/analysis (promo, thread, GM, engagement bait, personal life, giveaway).",
+            "  - 'NOISE' if tweet is just sharing news without any directional opinion.",
             "  - If multiple tickers, pick the one the trader is ACTING on or analyzing most.",
             "Sentiment: 'bullish', 'bearish', or 'neutral'.",
-            "  - bullish: buying, longing, expecting up move, positive outlook.",
-            "  - bearish: selling, shorting, expecting down move, negative outlook.",
-            "  - neutral: data/news sharing, no clear directional bias.",
-            "Direction: 'long' or 'short' — the trader's POSITION, not market direction.",
+            "  - bullish: buying, longing, expecting up move, positive outlook on price.",
+            "  - bearish: selling, shorting, expecting down move, negative outlook on price.",
+            "  - neutral: sharing data/news, no clear directional bias, or mixed signals.",
+            "Direction: 'long' or 'short' — the trader's implied POSITION.",
             "  - 'short squeeze' = direction 'long' (expecting price UP).",
-            "  - 'bearish analysis without position' = direction 'short'.",
+            "  - 'bearish analysis without explicit position' = direction 'short'.",
             "  - If unclear, default: bullish→long, bearish→short, neutral→long.",
             "No extra keys. No commentary. Strict JSON only.",
         ],
@@ -628,15 +563,19 @@ def llm_batch_label(
             "content": (
                 "You are an expert crypto trading signal classifier. "
                 "You understand crypto Twitter slang, trading jargon, and can distinguish "
-                "actionable trade signals from noise (promos, threads, engagement bait, news). "
+                "actionable trade signals from noise (promos, threads, engagement bait, news sharing). "
                 "Always return strict JSON. No markdown, no commentary."
             ),
         },
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
     ]
 
+    # ★ FIX: increased max_tokens to prevent JSON truncation on large batches
+    # Each label needs ~40-60 tokens. 20 labels = ~800-1200. Plus JSON overhead.
     raw, tin, tout = _llm_request(
-        messages, max_tokens=min(800, 100 + 30 * len(items)), temperature=0.05
+        messages,
+        max_tokens=min(2500, 300 + 60 * len(items)),
+        temperature=0.05,
     )
 
     try:
@@ -654,11 +593,65 @@ def llm_batch_label(
             out[_id] = {"ticker": ticker, "sentiment": sentiment, "direction": direction}
         return out, tin, tout
     except Exception:
-        print(f"[LLM] Parse error → fallback. Raw: {raw[:200]}")
+        print(f"[LLM] Parse error → fallback. Raw: {raw[:300]}")
         return (
             {it["id"]: {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"} for it in items},
             tin, tout,
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  ★ NEW: VISION LABELING (text + image)
+# ═══════════════════════════════════════════════════════════════════════
+
+VISION_SYSTEM_PROMPT = (
+    "You are an expert crypto trading signal classifier with chart analysis capability. "
+    "Analyze the tweet text AND the attached image (chart, position screenshot, or trading setup). "
+    "From the image, look for: chart patterns (breakout, breakdown, support/resistance), "
+    "trading position P&L screenshots, price annotations/arrows, indicator signals. "
+    "Return strict JSON: {\"ticker\": \"...\", \"sentiment\": \"...\", \"direction\": \"...\"}\n"
+    "- ticker: crypto symbol (BTC, ETH, SOL, etc.) or 'NOISE' if not a trade signal.\n"
+    "- sentiment: 'bullish', 'bearish', or 'neutral'.\n"
+    "- direction: 'long' or 'short'.\n"
+    "No extra keys. No markdown. Strict JSON only."
+)
+
+
+def _llm_label_with_vision(
+    text: str,
+    image_url: str,
+) -> Tuple[Dict[str, str], int, int]:
+    """Label a single tweet using GPT vision (text + image).
+    Uses detail='low' for cost efficiency (85 tokens per image)."""
+    messages = [
+        {"role": "system", "content": VISION_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f'Label this crypto tweet:\n\n"{text[:1000]}"'},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url, "detail": "low"},
+                },
+            ],
+        },
+    ]
+    try:
+        raw, tin, tout = _llm_request(
+            messages, max_tokens=100, temperature=0.05, model=VISION_MODEL,
+        )
+        parsed = json.loads(raw)
+        ticker = normalize_ticker(str(parsed.get("ticker", "")))
+        sentiment = str(parsed.get("sentiment", "")).lower().strip()
+        direction = str(parsed.get("direction", "")).lower().strip()
+        if sentiment not in ("bullish", "bearish", "neutral"):
+            sentiment = "neutral"
+        if direction not in ("long", "short"):
+            direction = "long" if sentiment != "bearish" else "short"
+        return {"ticker": ticker, "sentiment": sentiment, "direction": direction}, tin, tout
+    except Exception as e:
+        print(f"[Vision] Failed for image {image_url[:60]}…: {e}")
+        return {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}, 0, 0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -668,16 +661,11 @@ def llm_batch_label(
 X_API_BASE = "https://api.twitter.com/2"
 
 
-def _x_headers() -> Dict[str, str]:
+def _x_headers():
     return {"Authorization": f"Bearer {X_BEARER_TOKEN}", "User-Agent": "HyperCopy/1.0"}
 
 
-def _x_get(
-    url: str,
-    params: Dict[str, Any] | None = None,
-    retries: int = 5,
-    base_delay: float = 2.0,
-) -> Dict[str, Any]:
+def _x_get(url, params=None, retries=5, base_delay=2.0):
     last_err = None
     for attempt in range(retries):
         try:
@@ -708,21 +696,10 @@ def _x_get(
 #  USER PROFILE RESOLUTION
 # ═══════════════════════════════════════════════════════════════════════
 
-def _resolve_user_profile(
-    username: str,
-    state_con: sqlite3.Connection,
-) -> Optional[Dict[str, Any]]:
-    """
-    Resolve username → full profile dict.
-    Same API call as before, just added user.fields for avatar/bio/etc.
-    """
+def _resolve_user_profile(username, state_con):
     cached_uid = _state_get_user_id(state_con, username)
-
     url = f"{X_API_BASE}/users/by/username/{username}"
-    params = {
-        "user.fields": "profile_image_url,name,description,public_metrics,verified"
-    }
-
+    params = {"user.fields": "profile_image_url,name,description,public_metrics,verified"}
     try:
         data = _x_get(url, params=params)
         user_data = data.get("data", {})
@@ -730,11 +707,9 @@ def _resolve_user_profile(
         if not uid:
             print(f"  ✗ Could not resolve @{username}")
             return None
-
         avatar = user_data.get("profile_image_url", "")
         if avatar:
             avatar = avatar.replace("_normal.", "_400x400.")
-
         metrics = user_data.get("public_metrics", {})
         profile = {
             "user_id": uid,
@@ -745,22 +720,15 @@ def _resolve_user_profile(
             "followers_count": metrics.get("followers_count", 0),
             "following_count": metrics.get("following_count", 0),
         }
-
         if not cached_uid:
             _state_save(state_con, username, uid)
-            print(f"  ✓ Resolved @{username} → {uid} (cached)")
-        else:
-            print(f"  ✓ Profile fetched for @{username} (uid cached)")
-
         return profile
-
     except Exception as e:
         if cached_uid:
-            print(f"  ⚠ Profile fetch failed for @{username}, using cached uid={cached_uid}")
+            print(f"  ⚠ Profile fetch failed for @{username}, using cached uid")
             return {
-                "user_id": cached_uid,
-                "display_name": "", "avatar_url": "", "bio": "",
-                "is_verified": False, "followers_count": 0, "following_count": 0,
+                "user_id": cached_uid, "display_name": "", "avatar_url": "",
+                "bio": "", "is_verified": False, "followers_count": 0, "following_count": 0,
             }
         print(f"  ✗ Could not resolve @{username}: {e}")
         return None
@@ -770,14 +738,8 @@ def _resolve_user_profile(
 #  TWEET FETCHING
 # ═══════════════════════════════════════════════════════════════════════
 
-def _fetch_user_tweets(
-    user_id: str,
-    username: str,
-    since_id: Optional[str] = None,
-    max_days: int = 7,
-    max_results_per_page: int = 100,
-    max_pages: int = 10,
-) -> List[Dict[str, Any]]:
+def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
+                       max_results_per_page=100, max_pages=10):
     params: Dict[str, Any] = {
         "max_results": max_results_per_page,
         "tweet.fields": "created_at,author_id,public_metrics,attachments",
@@ -785,14 +747,11 @@ def _fetch_user_tweets(
         "media.fields": "url,preview_image_url,type",
         "exclude": "retweets,replies",
     }
-
     if since_id:
         params["since_id"] = since_id
-        print(f"  → incremental fetch (since_id={since_id})")
     else:
         start_time = (datetime.now(timezone.utc) - timedelta(days=max_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         params["start_time"] = start_time
-        print(f"  → full fetch (last {max_days} days)")
 
     url = f"{X_API_BASE}/users/{user_id}/tweets"
     all_tweets: List[Dict[str, Any]] = []
@@ -803,14 +762,12 @@ def _fetch_user_tweets(
         meta = data.get("meta", {})
         if meta.get("result_count", 0) == 0:
             break
-
         media_map: Dict[str, str] = {}
         for m in data.get("includes", {}).get("media", []):
             k = m.get("media_key", "")
             img = m.get("url") or m.get("preview_image_url") or ""
             if k and img:
                 media_map[k] = img
-
         for tw in data.get("data", []):
             text = tw.get("text", "").strip()
             if not text:
@@ -820,10 +777,8 @@ def _fetch_user_tweets(
                 dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
             except Exception:
                 dt = datetime.now(timezone.utc)
-
             imgs = [media_map[mk] for mk in tw.get("attachments", {}).get("media_keys", []) if mk in media_map]
             metrics = tw.get("public_metrics", {})
-
             all_tweets.append({
                 "tweet_id": tw.get("id", ""),
                 "text": text,
@@ -833,7 +788,6 @@ def _fetch_user_tweets(
                 "retweets": metrics.get("retweet_count", 0),
                 "replies": metrics.get("reply_count", 0),
             })
-
         next_token = meta.get("next_token")
         if not next_token:
             break
@@ -854,19 +808,12 @@ from backend.models.trader import Trader
 from backend.models.signal import Signal
 
 
-def _get_or_create_trader(
-    session,
-    username: str,
-    profile: Dict[str, Any] | None = None,
-) -> Trader:
-    """Get or create trader. Updates profile fields if fresh data available."""
+def _get_or_create_trader(session, username, profile=None):
     trader = session.query(Trader).filter(Trader.username == username).first()
     if not trader:
         trader = Trader(username=username)
         session.add(trader)
         session.flush()
-        print(f"  + Created Trader: @{username} (id={trader.id})")
-
     if profile:
         changed = False
         for field in ("display_name", "avatar_url", "bio", "is_verified",
@@ -877,12 +824,10 @@ def _get_or_create_trader(
                 changed = True
         if changed:
             trader.updated_at = datetime.now(timezone.utc)
-            print(f"  ↻ Updated profile for @{username}")
-
     return trader
 
 
-def _signal_exists(session, tweet_id: str) -> bool:
+def _signal_exists(session, tweet_id):
     if not tweet_id:
         return False
     return session.query(Signal.id).filter(Signal.tweet_id == tweet_id).first() is not None
@@ -893,13 +838,9 @@ def _signal_exists(session, tweet_id: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_once(max_days: int = 7, batch_size: int = 20, force_all: bool = False):
-    """
-    Full pipeline: fetch tweets → label → write to DB.
-    Includes profile enrichment (avatar, bio) and tweet image capture.
-    """
     users = _resolve_user_list()
     print(f"Users: {len(users)} | force_all={force_all}")
-    print(f"LLM model: {LLM_MODEL}\n")
+    print(f"LLM model: {LLM_MODEL} | Vision: {VISION_ENABLED} ({VISION_MODEL})\n")
 
     state_con = _state_db_connect()
 
@@ -916,7 +857,6 @@ def run_once(max_days: int = 7, batch_size: int = 20, force_all: bool = False):
 
         print(f"\n{'='*50}")
         print(f"[{i+1}/{len(users)}] Fetching @{username}")
-        print(f"{'='*50}")
 
         cached_uid = _state_get_user_id(state_con, username)
         needs_profile = _state_needs_profile_refresh(state_con, username)
@@ -924,24 +864,19 @@ def run_once(max_days: int = 7, batch_size: int = 20, force_all: bool = False):
         if needs_profile or not cached_uid:
             profile = _resolve_user_profile(username, state_con)
             if not profile:
-                print(f"  ✗ Could not resolve @{username}, skipping")
                 continue
             uid = profile["user_id"]
             user_profiles[username] = profile
             _state_update_profile_time(state_con, username)
-            print(f"  ↻ Profile refreshed (weekly)")
         else:
             uid = cached_uid
             api_calls_saved += 1
-            print(f"  ✓ Using cached uid (profile fresh)")
 
         since_id = _state_get_since_id(state_con, username)
         tweets = _fetch_user_tweets(uid, username, since_id=since_id, max_days=max_days)
 
         newest_id = max(tweets, key=lambda t: t["tweet_id"])["tweet_id"] if tweets else None
-        _state_save(state_con, username, uid,
-                    last_tweet_id=newest_id,
-                    tweets_found=len(tweets))
+        _state_save(state_con, username, uid, last_tweet_id=newest_id, tweets_found=len(tweets))
 
         for tw in tweets:
             all_user_tweets.append((username, tw))
@@ -950,26 +885,26 @@ def run_once(max_days: int = 7, batch_size: int = 20, force_all: bool = False):
             time.sleep(1)
 
     print(f"\n{'='*50}")
-    print(f"Total tweets fetched: {len(all_user_tweets)}")
-    print(f"Profiles fetched: {len(user_profiles)}")
-    print(f"Users skipped (not due): {skipped_not_due}/{len(users)}")
-    print(f"API calls saved (cached user_ids): {api_calls_saved}")
-    print(f"{'='*50}")
+    print(f"Total tweets: {len(all_user_tweets)} | Profiles: {len(user_profiles)}")
+    print(f"Skipped (not due): {skipped_not_due}/{len(users)} | API saved: {api_calls_saved}")
 
     if not all_user_tweets:
-        print("No new tweets to process.")
+        print("No new tweets.")
         return
 
     # ── step 2: label ─────────────────────────────────────────────
     cache_con = _label_cache_connect()
     labeled: List[Dict[str, Any]] = []
-    llm_queue: List[Dict[str, Any]] = []
+    llm_text_queue: List[Dict[str, Any]] = []
+    llm_vision_queue: List[Dict[str, Any]] = []
     cache_hits = 0
+    heuristic_hits = 0
 
     for idx, (username, tw) in enumerate(all_user_tweets):
         text = tw["text"]
         thash = _stable_tweet_hash(text)
 
+        # ── cache check ──
         cached = _label_cache_get(cache_con, thash)
         if cached:
             cache_hits += 1
@@ -977,6 +912,7 @@ def run_once(max_days: int = 7, batch_size: int = 20, force_all: bool = False):
                             "sentiment": cached[1], "direction": cached[2]})
             continue
 
+        # ── heuristic ──
         tk = _cheap_ticker(text)
         st = _cheap_sentiment(text)
         if tk and st:
@@ -984,52 +920,85 @@ def run_once(max_days: int = 7, batch_size: int = 20, force_all: bool = False):
             _label_cache_put(cache_con, thash, tk, st, dr)
             labeled.append({**tw, "username": username, "ticker": tk,
                             "sentiment": st, "direction": dr})
+            heuristic_hits += 1
+            continue
+
+        # ── route to LLM: vision if has images, else text batch ──
+        item = {"idx": idx, "id": str(idx), "tweet": text, "username": username, "tw": tw}
+        if VISION_ENABLED and tw.get("images"):
+            llm_vision_queue.append(item)
         else:
-            llm_queue.append({"idx": idx, "id": str(idx), "tweet": text,
-                              "username": username, "tw": tw})
+            llm_text_queue.append(item)
 
-    tokens_in_total = tokens_out_total = batches = 0
-    for start in range(0, len(llm_queue), batch_size):
-        chunk = llm_queue[start : start + batch_size]
+    print(f"\nLabeling pipeline: cache={cache_hits} heuristic={heuristic_hits} "
+          f"llm_text={len(llm_text_queue)} llm_vision={len(llm_vision_queue)}")
+
+    # ── step 2a: batch text labeling ──────────────────────────────
+    tokens_in = tokens_out = batches = 0
+    for start in range(0, len(llm_text_queue), batch_size):
+        chunk = llm_text_queue[start : start + batch_size]
         labels, tin, tout = llm_batch_label(chunk)
-        tokens_in_total += tin
-        tokens_out_total += tout
+        tokens_in += tin
+        tokens_out += tout
         batches += 1
-
         for item in chunk:
             res = labels.get(item["id"], {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"})
-            text = item["tweet"]
-            thash = _stable_tweet_hash(text)
+            thash = _stable_tweet_hash(item["tweet"])
             _label_cache_put(cache_con, thash, res["ticker"], res["sentiment"], res["direction"])
             labeled.append({**item["tw"], "username": item["username"],
                             "ticker": res["ticker"], "sentiment": res["sentiment"],
                             "direction": res["direction"]})
+        if (start + batch_size) % 100 < batch_size:
+            print(f"[Text] {min(start+batch_size, len(llm_text_queue))}/{len(llm_text_queue)}")
 
-        print(f"[Label] {start+len(chunk)}/{len(llm_queue)} done (tokens: {tin}→{tout})")
+    # ── step 2b: vision labeling (individual, with image) ─────────
+    vision_tokens_in = vision_tokens_out = 0
+    for vi, item in enumerate(llm_vision_queue):
+        text = item["tweet"]
+        imgs = item["tw"].get("images", [])
+        img_url = imgs[0] if imgs else None
+
+        if img_url:
+            res, tin, tout = _llm_label_with_vision(text, img_url)
+            vision_tokens_in += tin
+            vision_tokens_out += tout
+        else:
+            # fallback: no image despite being in queue (shouldn't happen)
+            res = {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}
+
+        thash = _stable_tweet_hash(text)
+        _label_cache_put(cache_con, thash, res["ticker"], res["sentiment"], res["direction"])
+        labeled.append({**item["tw"], "username": item["username"],
+                        "ticker": res["ticker"], "sentiment": res["sentiment"],
+                        "direction": res["direction"]})
+
+        if (vi + 1) % 50 == 0:
+            print(f"[Vision] {vi+1}/{len(llm_vision_queue)}")
+        # small delay to avoid rate limiting
+        if vi < len(llm_vision_queue) - 1:
+            time.sleep(0.15)
+
+    tokens_in += vision_tokens_in
+    tokens_out += vision_tokens_out
 
     relevant = [r for r in labeled if r["ticker"] not in ("NOISE",)]
     noise_count = len(labeled) - len(relevant)
 
-    print(f"\nLabeling done: {len(relevant)} relevant, {noise_count} noise")
-    print(f"  cache_hits={cache_hits}, llm_items={len(llm_queue)}, batches={batches}")
-    print(f"  tokens_in={tokens_in_total}, tokens_out={tokens_out_total}")
+    print(f"\n✅ Labeling done: {len(relevant)} relevant, {noise_count} noise")
+    print(f"  text batches={batches}, vision calls={len(llm_vision_queue)}")
+    print(f"  tokens in={tokens_in}, out={tokens_out}")
 
     # ── step 3: write to DB ───────────────────────────────────────
     session = SessionLocal()
     inserted = skipped_dup = 0
-
     try:
         for r in relevant:
             tweet_id = r.get("tweet_id", "")
             if tweet_id and _signal_exists(session, tweet_id):
                 skipped_dup += 1
                 continue
-
-            trader = _get_or_create_trader(
-                session, r["username"],
-                profile=user_profiles.get(r["username"]),
-            )
-
+            trader = _get_or_create_trader(session, r["username"],
+                                           profile=user_profiles.get(r["username"]))
             imgs = r.get("images", [])
             signal = Signal(
                 trader_id=trader.id,
@@ -1047,10 +1016,8 @@ def run_once(max_days: int = 7, batch_size: int = 20, force_all: bool = False):
             )
             session.add(signal)
             inserted += 1
-
         session.commit()
-        print(f"\n✅ DB write complete: {inserted} signals, {skipped_dup} dupes, {len(user_profiles)} profiles updated")
-
+        print(f"\n✅ DB: {inserted} signals, {skipped_dup} dupes, {len(user_profiles)} profiles updated")
     except Exception as e:
         session.rollback()
         print(f"\n❌ DB error: {e}")
@@ -1064,14 +1031,13 @@ def run_once(max_days: int = 7, batch_size: int = 20, force_all: bool = False):
         tickers = Counter(r["ticker"] for r in relevant)
         sents = Counter(r["sentiment"] for r in relevant)
         dirs = Counter(r["direction"] for r in relevant)
-
-        print("\nTicker distribution (top 10):")
-        for t, c in tickers.most_common(10):
+        print("\nTicker distribution (top 15):")
+        for t, c in tickers.most_common(15):
             print(f"  {t}: {c}")
-        print("Sentiment distribution:")
+        print("Sentiment:")
         for s, c in sents.most_common():
             print(f"  {s}: {c} ({100*c/len(relevant):.1f}%)")
-        print("Direction distribution:")
+        print("Direction:")
         for d, c in dirs.most_common():
             print(f"  {d}: {c} ({100*c/len(relevant):.1f}%)")
 
@@ -1301,7 +1267,6 @@ DEFAULT_USERS = [
 ]
 
 
-
 def _resolve_user_list() -> List[str]:
     if SCRAPE_USERS_ENV:
         parts = [p.strip() for p in SCRAPE_USERS_ENV.split(",") if p.strip()]
@@ -1313,9 +1278,7 @@ def _resolve_user_list() -> List[str]:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max-days", type=int, default=7,
-                        help="How far back to look on first run (default 7)")
-    parser.add_argument("--force-all", action="store_true",
-                        help="Ignore adaptive schedule, poll everyone")
+    parser.add_argument("--max-days", type=int, default=7)
+    parser.add_argument("--force-all", action="store_true")
     args = parser.parse_args()
     run_once(max_days=args.max_days, force_all=args.force_all)

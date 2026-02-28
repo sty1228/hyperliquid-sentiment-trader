@@ -1,5 +1,5 @@
 """
-Explore API — Token Sentiment · Rising Traders · Search · Browse by Style
+Explore API — Token Sentiment · Token Detail · Rising Traders · Search · Styles
 """
 from __future__ import annotations
 
@@ -28,6 +28,43 @@ class TokenSentimentItem(BaseModel):
     bull_pct: float
     avg_pnl: float
     latest_price: float | None = None
+
+
+class TokenSignalRow(BaseModel):
+    signal_id: str
+    trader_username: str
+    trader_display_name: str | None = None
+    trader_avatar_url: str | None = None
+    direction: str
+    sentiment: str
+    entry_price: float | None = None
+    current_price: float | None = None
+    pct_change: float | None = None
+    tweet_text: str | None = None
+    created_at: str
+
+
+class TokenTopTrader(BaseModel):
+    username: str
+    display_name: str | None = None
+    avatar_url: str | None = None
+    profit_grade: str | None = None
+    signal_count: int = 0
+    avg_pnl: float = 0.0
+    win_count: int = 0
+    win_rate: float = 0.0
+
+
+class TokenDetailResponse(BaseModel):
+    ticker: str
+    total_signals: int
+    bull_count: int
+    bear_count: int
+    bull_pct: float
+    avg_pnl: float
+    latest_price: float | None = None
+    recent_signals: list[TokenSignalRow] = []
+    top_traders: list[TokenTopTrader] = []
 
 
 class RisingTraderItem(BaseModel):
@@ -113,6 +150,124 @@ def get_token_sentiment(
         return []
 
 
+# ── Token Detail ─────────────────────────────────────────
+
+@router.get("/token/{ticker}", response_model=TokenDetailResponse)
+def get_token_detail(
+    ticker: str = Path(..., min_length=1, max_length=20),
+    days: int = Query(30, ge=1, le=90),
+    signal_limit: int = Query(20, ge=1, le=50),
+    trader_limit: int = Query(10, ge=1, le=20),
+    db: Session = Depends(get_db),
+):
+    """Detailed analysis for a single token: sentiment, recent signals, top traders."""
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        tk = ticker.upper().strip()
+
+        # ── aggregate sentiment ──
+        agg = (
+            db.query(
+                func.count().label("total"),
+                func.sum(case((Signal.sentiment == "bullish", 1), else_=0)).label("bull"),
+                func.sum(case((Signal.sentiment == "bearish", 1), else_=0)).label("bear"),
+                func.coalesce(func.avg(Signal.pct_change), 0).label("avg_pnl"),
+                func.max(Signal.current_price).label("latest_price"),
+            )
+            .filter(Signal.created_at >= cutoff, Signal.ticker == tk)
+            .first()
+        )
+        total = (agg.total or 0) if agg else 0
+        bull = (agg.bull or 0) if agg else 0
+        bear = (agg.bear or 0) if agg else 0
+        denom = bull + bear
+
+        # ── recent signals ──
+        sig_rows = (
+            db.query(Signal, Trader)
+            .join(Trader, Trader.id == Signal.trader_id)
+            .filter(Signal.ticker == tk, Signal.created_at >= cutoff)
+            .order_by(desc(Signal.created_at))
+            .limit(signal_limit)
+            .all()
+        )
+        recent_signals = []
+        for sig, trader in sig_rows:
+            recent_signals.append(TokenSignalRow(
+                signal_id=sig.id,
+                trader_username=trader.username,
+                trader_display_name=trader.display_name,
+                trader_avatar_url=trader.avatar_url,
+                direction=sig.direction,
+                sentiment=sig.sentiment,
+                entry_price=sig.entry_price,
+                current_price=sig.current_price,
+                pct_change=round(float(sig.pct_change), 2) if sig.pct_change is not None else None,
+                tweet_text=sig.tweet_text[:200] if sig.tweet_text else None,
+                created_at=sig.created_at.isoformat() if sig.created_at else "",
+            ))
+
+        # ── top traders for this token ──
+        trader_agg = (
+            db.query(
+                Signal.trader_id,
+                func.count().label("cnt"),
+                func.coalesce(func.avg(Signal.pct_change), 0).label("avg"),
+                func.sum(case((Signal.pct_change > 0, 1), else_=0)).label("wins"),
+            )
+            .filter(Signal.ticker == tk, Signal.created_at >= cutoff)
+            .group_by(Signal.trader_id)
+            .order_by(desc("cnt"))
+            .limit(trader_limit)
+            .all()
+        )
+        top_traders = []
+        if trader_agg:
+            tids = [r.trader_id for r in trader_agg]
+            traders_map = {t.id: t for t in db.query(Trader).filter(Trader.id.in_(tids)).all()}
+            stats_map = {
+                s.trader_id: s
+                for s in db.query(TraderStats)
+                .filter(TraderStats.trader_id.in_(tids), TraderStats.window == "30d")
+                .all()
+            }
+            for r in trader_agg:
+                t = traders_map.get(r.trader_id)
+                if not t:
+                    continue
+                s = stats_map.get(r.trader_id)
+                cnt = r.cnt or 0
+                wins = r.wins or 0
+                top_traders.append(TokenTopTrader(
+                    username=t.username,
+                    display_name=t.display_name,
+                    avatar_url=t.avatar_url,
+                    profit_grade=s.profit_grade if s else None,
+                    signal_count=cnt,
+                    avg_pnl=round(float(r.avg or 0), 2),
+                    win_count=wins,
+                    win_rate=round(wins / max(cnt, 1), 2),
+                ))
+
+        return TokenDetailResponse(
+            ticker=tk,
+            total_signals=total,
+            bull_count=bull,
+            bear_count=bear,
+            bull_pct=round(bull / max(denom, 1) * 100, 1),
+            avg_pnl=round(float(agg.avg_pnl or 0), 2) if agg else 0,
+            latest_price=round(float(agg.latest_price), 6) if agg and agg.latest_price else None,
+            recent_signals=recent_signals,
+            top_traders=top_traders,
+        )
+    except Exception as e:
+        logger.exception("token detail %s failed: %s", ticker, e)
+        return TokenDetailResponse(
+            ticker=ticker.upper(),
+            total_signals=0, bull_count=0, bear_count=0, bull_pct=0, avg_pnl=0,
+        )
+
+
 # ── Rising Traders ───────────────────────────────────────
 
 @router.get("/rising", response_model=list[RisingTraderItem])
@@ -168,25 +323,20 @@ def search_traders(
         pattern = f"%{q.strip()}%"
         traders = (
             db.query(Trader)
-            .filter(or_(
-                Trader.username.ilike(pattern),
-                Trader.display_name.ilike(pattern),
-            ))
+            .filter(or_(Trader.username.ilike(pattern), Trader.display_name.ilike(pattern)))
             .order_by(Trader.followers_count.desc())
             .limit(limit)
             .all()
         )
         if not traders:
             return []
-
         trader_ids = [t.id for t in traders]
-        stats_rows = (
-            db.query(TraderStats)
+        stats_map = {
+            s.trader_id: s
+            for s in db.query(TraderStats)
             .filter(TraderStats.trader_id.in_(trader_ids), TraderStats.window == "30d")
             .all()
-        )
-        stats_map = {s.trader_id: s for s in stats_rows}
-
+        }
         result = []
         for t in traders:
             s = stats_map.get(t.id)
@@ -227,71 +377,34 @@ def get_traders_by_style(
             .join(TraderStats, TraderStats.trader_id == Trader.id)
             .filter(TraderStats.window == window, TraderStats.total_signals >= 1)
         )
-
         if style == "high_wr":
-            # Win rate ≥ 75%, minimum 3 signals for significance
-            base = (
-                base
-                .filter(TraderStats.win_rate >= 0.75, TraderStats.total_signals >= 3)
-                .order_by(desc(TraderStats.win_rate), desc(TraderStats.total_signals))
-            )
-
+            base = base.filter(TraderStats.win_rate >= 0.75, TraderStats.total_signals >= 3).order_by(desc(TraderStats.win_rate), desc(TraderStats.total_signals))
         elif style == "whales":
-            # Highest absolute profit
             base = base.order_by(desc(TraderStats.total_profit_usd))
-
         elif style == "scalpers":
-            # High frequency traders (≥8 signals in window)
-            base = (
-                base
-                .filter(TraderStats.total_signals >= 8)
-                .order_by(desc(TraderStats.total_signals))
-            )
-
+            base = base.filter(TraderStats.total_signals >= 8).order_by(desc(TraderStats.total_signals))
         elif style == "holders":
-            # Low frequency but positive returns (quality over quantity)
-            base = (
-                base
-                .filter(
-                    TraderStats.total_signals.between(1, 5),
-                    TraderStats.avg_return_pct > 0,
-                )
-                .order_by(desc(TraderStats.avg_return_pct))
-            )
-
+            base = base.filter(TraderStats.total_signals.between(1, 5), TraderStats.avg_return_pct > 0).order_by(desc(TraderStats.avg_return_pct))
         elif style == "macro":
-            # Traders who primarily trade BTC/ETH/SOL
-            major = ["BTC", "ETH", "SOL"]
             macro_ids = [
-                r[0]
-                for r in db.query(Signal.trader_id)
-                .filter(Signal.ticker.in_(major))
-                .group_by(Signal.trader_id)
-                .having(func.count() >= 2)
-                .all()
+                r[0] for r in db.query(Signal.trader_id)
+                .filter(Signal.ticker.in_(["BTC", "ETH", "SOL"]))
+                .group_by(Signal.trader_id).having(func.count() >= 2).all()
             ]
             if not macro_ids:
                 return []
             base = base.filter(Trader.id.in_(macro_ids)).order_by(desc(TraderStats.total_profit_usd))
-
         elif style == "new":
-            # Joined within last 30 days
             cutoff = datetime.now(timezone.utc) - timedelta(days=30)
             base = base.filter(Trader.created_at >= cutoff).order_by(desc(Trader.created_at))
 
         rows = base.limit(limit).all()
         return [
             StyleTraderItem(
-                username=t.username,
-                display_name=t.display_name,
-                avatar_url=t.avatar_url,
-                profit_grade=s.profit_grade,
-                win_rate=s.win_rate,
-                avg_return_pct=s.avg_return_pct or 0,
-                total_profit_usd=s.total_profit_usd or 0,
-                total_signals=s.total_signals,
-                copiers_count=s.copiers_count,
-                streak=s.streak,
+                username=t.username, display_name=t.display_name, avatar_url=t.avatar_url,
+                profit_grade=s.profit_grade, win_rate=s.win_rate, avg_return_pct=s.avg_return_pct or 0,
+                total_profit_usd=s.total_profit_usd or 0, total_signals=s.total_signals,
+                copiers_count=s.copiers_count, streak=s.streak,
             )
             for t, s in rows
         ]
