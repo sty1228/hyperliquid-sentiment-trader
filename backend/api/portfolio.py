@@ -47,7 +47,7 @@ class ProfileDataResponse(BaseModel):
 
 
 class BalanceHistoryItem(BaseModel):
-    acconutValue: float   # 注意：前端拼写是 acconutValue
+    accountValue: float   
     timestamp: int
 
 
@@ -268,7 +268,7 @@ def get_balance_history(
                 evt_idx += 1
 
             result.append(BalanceHistoryItem(
-                acconutValue=bal,
+                accountValue=bal,
                 timestamp=hour_ts,
             ))
 
@@ -284,7 +284,7 @@ def get_balance_history(
         )
         final_bal = latest_snap.balance if latest_snap else bal
         if result:
-            result[-1] = BalanceHistoryItem(acconutValue=final_bal, timestamp=result[-1].timestamp)
+            result[-1] = BalanceHistoryItem(accountValue=final_bal, timestamp=result[-1].timestamp)
 
         return result
 
@@ -320,7 +320,7 @@ def get_balance_history(
             pad_date = first_date - timedelta(days=i)
             result.append(
                 BalanceHistoryItem(
-                    acconutValue=0.0,
+                    accountValue=0.0,
                     timestamp=int(
                         datetime.combine(pad_date, datetime.min.time())
                         .replace(tzinfo=timezone.utc)
@@ -331,7 +331,7 @@ def get_balance_history(
 
     result.extend(
         BalanceHistoryItem(
-            acconutValue=s.balance,
+            accountValue=s.balance,
             timestamp=int(
                 datetime.combine(s.snapshot_date, datetime.min.time())
                 .replace(tzinfo=timezone.utc)
