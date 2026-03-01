@@ -1,14 +1,39 @@
+"""
+HyperCopy Ingestor — production-grade continuous service.
+
+Key design principles:
+  • Per-user atomic processing: fetch → label → DB write per user.
+    One user's failure never loses another user's data.
+  • Immediate DB commits: every signal is persisted the moment it's labeled.
+    No "accumulate everything then commit" anti-pattern.
+  • Graceful shutdown: SIGTERM/SIGINT set a flag, current user finishes, then exit.
+  • Exponential backoff on transient errors, circuit-breaker on persistent ones.
+  • Label cache ensures we never pay OpenAI twice for the same tweet text.
+"""
 from __future__ import annotations
-import os, re, time, json, hashlib, random, sqlite3, requests
+import os, re, time, json, hashlib, random, sqlite3, signal, sys
+import logging, requests, threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
+from contextlib import contextmanager
 
 import openai
 from dotenv import load_dotenv
 load_dotenv()
 
-def _env(key: str, default: str = "") -> str:
-    return os.environ.get(key, default)
+# ── logging ────────────────────────────────────────────────────────────
+log = logging.getLogger("ingestor")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter(
+        "%(asctime)s [%(name)s] %(levelname)-5s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    log.addHandler(h)
+
+def _env(k: str, d: str = "") -> str:
+    return os.environ.get(k, d)
 
 # ── paths & secrets ────────────────────────────────────────────────────
 DATA_DIR = _env("DATA_DIR", "data")
@@ -18,20 +43,19 @@ STATE_DB_PATH    = os.path.join(DATA_DIR, "ingestor_state.sqlite")
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 X_BEARER_TOKEN = _env("X_BEARER_TOKEN")
-
 if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY in .env")
+    raise RuntimeError("Missing OPENAI_API_KEY")
 if not X_BEARER_TOKEN:
-    raise RuntimeError("Missing X_BEARER_TOKEN in .env")
-
+    raise RuntimeError("Missing X_BEARER_TOKEN")
 openai.api_key = OPENAI_API_KEY
-SCRAPE_USERS_ENV = _env("SCRAPE_USERS", "")
 
-# ── LLM model config ──────────────────────────────────────────────────
-LLM_MODEL   = _env("LLM_MODEL", "gpt-4o-mini")
-# ★ Vision: gpt-4o-mini supports image inputs natively
+SCRAPE_USERS_ENV = _env("SCRAPE_USERS", "")
+LLM_MODEL      = _env("LLM_MODEL", "gpt-4o-mini")
 VISION_MODEL   = _env("VISION_MODEL", "gpt-4o-mini")
 VISION_ENABLED = _env("VISION_ENABLED", "true").lower() in ("1", "true", "yes")
+
+CYCLE_INTERVAL_S   = int(_env("CYCLE_INTERVAL_S", "300"))
+MAX_CONSECUTIVE_FAILURES = int(_env("MAX_CONSECUTIVE_FAILURES", "10"))
 
 # ── regex / constants ──────────────────────────────────────────────────
 ALNUM_RE         = re.compile(r"[^A-Z0-9]")
@@ -70,7 +94,6 @@ POS_PHRASES = [
     "undervalued","outperform","strong","holding strong",
     "🚀","✅","🔥","📈","🟢","💰","💎","⬆️",
 ]
-
 NEG_PHRASES = [
     "shorted","shorting","going short","opened a short","opening short",
     "entered short","short position","short here","short from",
@@ -87,7 +110,6 @@ NEG_PHRASES = [
     "rug","rugged","rugpull","scam",
     "🟥","🔻","📉","⬇️","💀","🪦",
 ]
-
 FALSE_POS_PATTERNS = [
     "short term","short-term","short squeeze","short covering",
     "in short","short summary","shorts getting","shorts are",
@@ -95,7 +117,6 @@ FALSE_POS_PATTERNS = [
     "as long as","so long","how long","before long","long story",
     "not long","no longer",
 ]
-
 LONG_DIRECTION_PHRASES = [
     "longed","longing","going long","opened a long","opening long",
     "entered long","long position","long here","long from","long entry",
@@ -103,7 +124,6 @@ LONG_DIRECTION_PHRASES = [
     "dip buy","buying the dip","btfd",
     "short squeeze","shorts getting liquidated","shorts getting rekt",
 ]
-
 SHORT_DIRECTION_PHRASES = [
     "shorted","shorting","going short","opened a short","opening short",
     "entered short","short position","short here","short from","short entry",
@@ -140,7 +160,6 @@ ALIAS_TO_CANON: Dict[str, str] = {
     "ARB-PERP":"ARB","SUI-PERP":"SUI","APT-PERP":"APT",
     "AVAX-PERP":"AVAX","LINK-PERP":"LINK","INJ-PERP":"INJ",
 }
-
 STRICT_CANON = False
 SUPPORTED_CANON: set[str] = set(ALIAS_TO_CANON.values()) | COMMON_CRYPTO
 
@@ -188,6 +207,28 @@ LLM_FEW_SHOT_EXAMPLES = [
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  GRACEFUL SHUTDOWN
+# ═══════════════════════════════════════════════════════════════════════
+
+class ShutdownRequested(Exception):
+    pass
+
+_shutdown = threading.Event()
+
+def _handle_signal(signum, frame):
+    sig_name = signal.Signals(signum).name
+    log.info(f"Received {sig_name} — finishing current user then shutting down…")
+    _shutdown.set()
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT,  _handle_signal)
+
+def _check_shutdown():
+    if _shutdown.is_set():
+        raise ShutdownRequested()
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  TICKER NORMALIZATION
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -197,7 +238,6 @@ def _strip_contract_suffix(sym: str) -> str:
             base = sym[: -len(suf)]
             return base if base else "PERP"
     return sym
-
 
 def _strip_stable_quote_pair(sym: str) -> str:
     u = sym.upper()
@@ -223,7 +263,6 @@ def _strip_stable_quote_pair(sym: str) -> str:
             return u[: -len(q)]
     return u
 
-
 def normalize_ticker(raw: str) -> str:
     if not raw:
         return "NOISE"
@@ -248,7 +287,8 @@ def normalize_ticker(raw: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 def _state_db_connect() -> sqlite3.Connection:
-    con = sqlite3.connect(STATE_DB_PATH)
+    con = sqlite3.connect(STATE_DB_PATH, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL")
     con.execute("""
         CREATE TABLE IF NOT EXISTS user_state (
             username         TEXT PRIMARY KEY,
@@ -258,15 +298,19 @@ def _state_db_connect() -> sqlite3.Connection:
             empty_polls      INTEGER NOT NULL DEFAULT 0,
             poll_interval_h  REAL NOT NULL DEFAULT 2.0,
             last_polled_at   TEXT,
+            last_profile_at  TEXT,
+            consecutive_errors INTEGER NOT NULL DEFAULT 0,
             updated_at       TEXT NOT NULL
         )
     """)
+    # migrate older schemas
     for col, defn in [
-        ("avg_tweets_per_day", "REAL NOT NULL DEFAULT 0"),
-        ("empty_polls",        "INTEGER NOT NULL DEFAULT 0"),
-        ("poll_interval_h",    "REAL NOT NULL DEFAULT 2.0"),
-        ("last_polled_at",     "TEXT"),
-        ("last_profile_at",    "TEXT"),
+        ("avg_tweets_per_day",  "REAL NOT NULL DEFAULT 0"),
+        ("empty_polls",         "INTEGER NOT NULL DEFAULT 0"),
+        ("poll_interval_h",     "REAL NOT NULL DEFAULT 2.0"),
+        ("last_polled_at",      "TEXT"),
+        ("last_profile_at",     "TEXT"),
+        ("consecutive_errors",  "INTEGER NOT NULL DEFAULT 0"),
     ]:
         try:
             con.execute(f"ALTER TABLE user_state ADD COLUMN {col} {defn}")
@@ -275,40 +319,44 @@ def _state_db_connect() -> sqlite3.Connection:
     con.commit()
     return con
 
-
 MIN_POLL_INTERVAL_H = 1.0
 MAX_POLL_INTERVAL_H = 24.0
 BACKOFF_FACTOR      = 1.5
 SPEEDUP_FACTOR      = 0.7
-
+PROFILE_REFRESH_DAYS = 7
+ERROR_BACKOFF_H     = 6.0       # back off 6h after repeated errors
+MAX_USER_ERRORS     = 5         # skip user entirely after 5 consecutive errors
 
 def _state_get_user_id(con, username):
-    row = con.execute("SELECT user_id FROM user_state WHERE username = ?", (username,)).fetchone()
+    row = con.execute("SELECT user_id FROM user_state WHERE username=?", (username,)).fetchone()
     return row[0] if row else None
-
 
 def _state_get_since_id(con, username):
-    row = con.execute("SELECT last_tweet_id FROM user_state WHERE username = ?", (username,)).fetchone()
+    row = con.execute("SELECT last_tweet_id FROM user_state WHERE username=?", (username,)).fetchone()
     return row[0] if row else None
 
-
-def _state_should_poll(con, username):
+def _state_should_poll(con, username) -> Tuple[bool, str]:
+    """Returns (should_poll, reason)."""
     row = con.execute(
-        "SELECT last_polled_at, poll_interval_h FROM user_state WHERE username = ?",
+        "SELECT last_polled_at, poll_interval_h, consecutive_errors FROM user_state WHERE username=?",
         (username,),
     ).fetchone()
     if not row or not row[0]:
-        return True
-    last_polled = datetime.fromisoformat(row[0])
-    next_poll = last_polled + timedelta(hours=row[1] or 2.0)
-    return datetime.now(timezone.utc) >= next_poll
+        return True, "never_polled"
+    errs = row[2] or 0
+    if errs >= MAX_USER_ERRORS:
+        return False, f"circuit_open({errs}_errors)"
+    interval = row[1] or 2.0
+    if errs > 0:
+        interval = max(interval, ERROR_BACKOFF_H)
+    last = datetime.fromisoformat(row[0])
+    due = last + timedelta(hours=interval)
+    if datetime.now(timezone.utc) >= due:
+        return True, "due"
+    return False, "not_due"
 
-
-PROFILE_REFRESH_DAYS = 7
-
-
-def _state_needs_profile_refresh(con, username):
-    row = con.execute("SELECT last_profile_at FROM user_state WHERE username = ?", (username,)).fetchone()
+def _state_needs_profile_refresh(con, username) -> bool:
+    row = con.execute("SELECT last_profile_at FROM user_state WHERE username=?", (username,)).fetchone()
     if not row or not row[0]:
         return True
     try:
@@ -316,18 +364,32 @@ def _state_needs_profile_refresh(con, username):
     except Exception:
         return True
 
-
 def _state_update_profile_time(con, username):
-    con.execute("UPDATE user_state SET last_profile_at = ? WHERE username = ?",
+    con.execute("UPDATE user_state SET last_profile_at=? WHERE username=?",
                 (datetime.now(timezone.utc).isoformat(), username))
     con.commit()
 
+def _state_record_error(con, username, user_id):
+    """Increment error counter + still mark as polled so we don't retry instantly."""
+    now = datetime.now(timezone.utc).isoformat()
+    existing = con.execute("SELECT 1 FROM user_state WHERE username=?", (username,)).fetchone()
+    if existing:
+        con.execute(
+            "UPDATE user_state SET consecutive_errors=consecutive_errors+1, last_polled_at=?, updated_at=? WHERE username=?",
+            (now, now, username),
+        )
+    else:
+        con.execute(
+            "INSERT INTO user_state (username, user_id, consecutive_errors, last_polled_at, updated_at) VALUES (?,?,1,?,?)",
+            (username, user_id or "", now, now),
+        )
+    con.commit()
 
 def _state_save(con, username, user_id, last_tweet_id=None, tweets_found=0):
     now = datetime.now(timezone.utc).isoformat()
     existing = con.execute(
         "SELECT last_tweet_id, avg_tweets_per_day, empty_polls, poll_interval_h "
-        "FROM user_state WHERE username = ?", (username,)
+        "FROM user_state WHERE username=?", (username,)
     ).fetchone()
     if existing:
         old_avg = existing[1] or 0.0
@@ -339,19 +401,16 @@ def _state_save(con, username, user_id, last_tweet_id=None, tweets_found=0):
             new_interval = min(old_interval * BACKOFF_FACTOR, MAX_POLL_INTERVAL_H)
         else:
             new_empty = 0
-            if new_avg > 5:
-                target = MIN_POLL_INTERVAL_H
-            elif new_avg > 2:
-                target = 2.0
-            elif new_avg > 0.5:
-                target = 4.0
-            else:
-                target = 8.0
+            if new_avg > 5:    target = MIN_POLL_INTERVAL_H
+            elif new_avg > 2:  target = 2.0
+            elif new_avg > 0.5: target = 4.0
+            else:              target = 8.0
             new_interval = max(old_interval * SPEEDUP_FACTOR, target, MIN_POLL_INTERVAL_H)
         con.execute(
             """UPDATE user_state SET user_id=?, last_tweet_id=COALESCE(?,last_tweet_id),
                avg_tweets_per_day=?, empty_polls=?, poll_interval_h=?,
-               last_polled_at=?, updated_at=? WHERE username=?""",
+               last_polled_at=?, consecutive_errors=0, updated_at=?
+               WHERE username=?""",
             (user_id, last_tweet_id, round(new_avg, 2), new_empty,
              round(new_interval, 1), now, now, username),
         )
@@ -359,8 +418,8 @@ def _state_save(con, username, user_id, last_tweet_id=None, tweets_found=0):
         con.execute(
             """INSERT INTO user_state
                (username, user_id, last_tweet_id, avg_tweets_per_day,
-                empty_polls, poll_interval_h, last_polled_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?)""",
+                empty_polls, poll_interval_h, last_polled_at, consecutive_errors, updated_at)
+               VALUES (?,?,?,?,?,?,?,0,?)""",
             (username, user_id, last_tweet_id, 0.0, 0, 2.0, now, now),
         )
     con.commit()
@@ -371,7 +430,8 @@ def _state_save(con, username, user_id, last_tweet_id=None, tweets_found=0):
 # ═══════════════════════════════════════════════════════════════════════
 
 def _label_cache_connect() -> sqlite3.Connection:
-    con = sqlite3.connect(LABEL_CACHE_PATH)
+    con = sqlite3.connect(LABEL_CACHE_PATH, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL")
     con.execute("""
         CREATE TABLE IF NOT EXISTS label_cache (
             tweet_hash TEXT PRIMARY KEY,
@@ -387,19 +447,16 @@ def _label_cache_connect() -> sqlite3.Connection:
         pass
     return con
 
-
 def _label_cache_get(con, h):
-    row = con.execute("SELECT ticker, sentiment, direction FROM label_cache WHERE tweet_hash = ?", (h,)).fetchone()
+    row = con.execute("SELECT ticker, sentiment, direction FROM label_cache WHERE tweet_hash=?", (h,)).fetchone()
     return (row[0], row[1], row[2]) if row else None
-
 
 def _label_cache_put(con, h, ticker, sentiment, direction):
     con.execute(
-        "INSERT OR REPLACE INTO label_cache (tweet_hash, ticker, sentiment, direction, created_at) VALUES (?,?,?,?,?)",
+        "INSERT OR REPLACE INTO label_cache (tweet_hash,ticker,sentiment,direction,created_at) VALUES (?,?,?,?,?)",
         (h, ticker, sentiment, direction, datetime.now(timezone.utc).isoformat()),
     )
     con.commit()
-
 
 def _stable_tweet_hash(text: str) -> str:
     return hashlib.sha256((text or "").strip().encode("utf-8")).hexdigest()
@@ -453,7 +510,6 @@ def _cheap_ticker(text):
         return next(iter(candidates))
     return None
 
-
 def _cheap_sentiment(text):
     if not text:
         return None
@@ -473,39 +529,28 @@ def _cheap_sentiment(text):
         return "bearish"
     return None
 
-
 def _sentiment_to_direction(sentiment, text):
     t = text.lower()
-    long_score = sum(1 for p in LONG_DIRECTION_PHRASES if p in t)
+    long_score  = sum(1 for p in LONG_DIRECTION_PHRASES if p in t)
     short_score = sum(1 for p in SHORT_DIRECTION_PHRASES if p in t)
-    if long_score > short_score:
-        return "long"
-    if short_score > long_score:
-        return "short"
+    if long_score > short_score:  return "long"
+    if short_score > long_score:  return "short"
     return "short" if sentiment == "bearish" else "long"
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  OPENAI LLM — shared request helper
+#  OPENAI LLM
 # ═══════════════════════════════════════════════════════════════════════
 
-def _llm_request(
-    messages: List[Dict[str, Any]],
-    max_tokens: int,
-    temperature: float,
-    model: str | None = None,
-    retries: int = 4,
-    base_delay: float = 1.0,
-) -> Tuple[str, int, int]:
+def _llm_request(messages, max_tokens, temperature, model=None, retries=4, base_delay=1.0):
     last_err = None
     use_model = model or LLM_MODEL
     for attempt in range(retries):
+        _check_shutdown()
         try:
             resp = openai.chat.completions.create(
-                model=use_model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
+                model=use_model, messages=messages,
+                max_tokens=max_tokens, temperature=temperature,
                 response_format={"type": "json_object"},
             )
             content = (resp.choices[0].message.content or "").strip()
@@ -513,74 +558,52 @@ def _llm_request(
             tin  = getattr(usage, "prompt_tokens", 0) if usage else 0
             tout = getattr(usage, "completion_tokens", 0) if usage else 0
             return content, tin, tout
+        except ShutdownRequested:
+            raise
+        except openai.AuthenticationError:
+            # don't retry auth errors — they'll never succeed
+            raise
         except Exception as e:
             last_err = e
             wait = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
-            print(f"[LLM] Error ({attempt+1}/{retries}): {e} → retry in {wait:.1f}s")
+            log.warning(f"LLM error ({attempt+1}/{retries}): {e} — retry in {wait:.1f}s")
             time.sleep(wait)
-    raise RuntimeError(f"OpenAI request failed after retries: {last_err}")
+    raise RuntimeError(f"OpenAI failed after {retries} retries: {last_err}")
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  BATCH TEXT LABELING (no images)
-#  ★ FIX: max_tokens increased to prevent JSON truncation
-# ═══════════════════════════════════════════════════════════════════════
-
-def llm_batch_label(
-    items: List[Dict[str, Any]],
-) -> Tuple[Dict[str, Dict[str, str]], int, int]:
+def llm_batch_label(items):
     examples_str = "\n".join([
         f'  Tweet: "{ex["tweet"]}" → {json.dumps(ex["label"])}'
         for ex in LLM_FEW_SHOT_EXAMPLES
     ])
-
     user_payload = {
         "task": "label_crypto_tweets",
         "schema": {"id": "str", "ticker": "str", "sentiment": "str", "direction": "str"},
         "rules": [
             "Return JSON: {\"labels\": [{id, ticker, sentiment, direction}, ...]}",
             "Ticker: the PRIMARY crypto being traded/analyzed. Use symbol (BTC, ETH, SOL, HYPE, etc).",
-            "  - 'NOISE' if tweet is not about a specific crypto trade/analysis (promo, thread, GM, engagement bait, personal life, giveaway).",
-            "  - 'NOISE' if tweet is just sharing news without any directional opinion.",
-            "  - If multiple tickers, pick the one the trader is ACTING on or analyzing most.",
+            "  - 'NOISE' if tweet is not about a specific crypto trade/analysis.",
+            "  - If multiple tickers, pick the one the trader is ACTING on most.",
             "Sentiment: 'bullish', 'bearish', or 'neutral'.",
-            "  - bullish: buying, longing, expecting up move, positive outlook on price.",
-            "  - bearish: selling, shorting, expecting down move, negative outlook on price.",
-            "  - neutral: sharing data/news, no clear directional bias, or mixed signals.",
-            "Direction: 'long' or 'short' — the trader's implied POSITION.",
-            "  - 'short squeeze' = direction 'long' (expecting price UP).",
-            "  - 'bearish analysis without explicit position' = direction 'short'.",
-            "  - If unclear, default: bullish→long, bearish→short, neutral→long.",
-            "No extra keys. No commentary. Strict JSON only.",
+            "Direction: 'long' or 'short'.",
+            "  - 'short squeeze' = direction 'long'.",
+            "  - Default: bullish→long, bearish→short, neutral→long.",
+            "Strict JSON only.",
         ],
         "examples": examples_str,
         "items": [{"id": it["id"], "tweet": it["tweet"][:1000]} for it in items],
     }
-
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an expert crypto trading signal classifier. "
-                "You understand crypto Twitter slang, trading jargon, and can distinguish "
-                "actionable trade signals from noise (promos, threads, engagement bait, news sharing). "
-                "Always return strict JSON. No markdown, no commentary."
-            ),
-        },
+        {"role": "system", "content": (
+            "You are an expert crypto trading signal classifier. "
+            "Always return strict JSON. No markdown, no commentary."
+        )},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
     ]
-
-    # ★ FIX: increased max_tokens to prevent JSON truncation on large batches
-    # Each label needs ~40-60 tokens. 20 labels = ~800-1200. Plus JSON overhead.
-    raw, tin, tout = _llm_request(
-        messages,
-        max_tokens=min(2500, 300 + 60 * len(items)),
-        temperature=0.05,
-    )
-
+    raw, tin, tout = _llm_request(messages, max_tokens=min(2500, 300 + 60 * len(items)), temperature=0.05)
     try:
         parsed = json.loads(raw)
-        out: Dict[str, Dict[str, str]] = {}
+        out = {}
         for rec in parsed.get("labels", []):
             _id = str(rec.get("id"))
             ticker = normalize_ticker(str(rec.get("ticker", "")))
@@ -593,64 +616,42 @@ def llm_batch_label(
             out[_id] = {"ticker": ticker, "sentiment": sentiment, "direction": direction}
         return out, tin, tout
     except Exception:
-        print(f"[LLM] Parse error → fallback. Raw: {raw[:300]}")
+        log.warning(f"LLM parse error, fallback. Raw: {raw[:200]}")
         return (
             {it["id"]: {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"} for it in items},
             tin, tout,
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  ★ NEW: VISION LABELING (text + image)
-# ═══════════════════════════════════════════════════════════════════════
-
 VISION_SYSTEM_PROMPT = (
     "You are an expert crypto trading signal classifier with chart analysis capability. "
-    "Analyze the tweet text AND the attached image (chart, position screenshot, or trading setup). "
-    "From the image, look for: chart patterns (breakout, breakdown, support/resistance), "
-    "trading position P&L screenshots, price annotations/arrows, indicator signals. "
+    "Analyze the tweet text AND the attached image. "
     "Return strict JSON: {\"ticker\": \"...\", \"sentiment\": \"...\", \"direction\": \"...\"}\n"
-    "- ticker: crypto symbol (BTC, ETH, SOL, etc.) or 'NOISE' if not a trade signal.\n"
-    "- sentiment: 'bullish', 'bearish', or 'neutral'.\n"
-    "- direction: 'long' or 'short'.\n"
-    "No extra keys. No markdown. Strict JSON only."
+    "- ticker: crypto symbol or 'NOISE'.\n- sentiment: 'bullish','bearish','neutral'.\n"
+    "- direction: 'long' or 'short'.\nStrict JSON only."
 )
 
-
-def _llm_label_with_vision(
-    text: str,
-    image_url: str,
-) -> Tuple[Dict[str, str], int, int]:
-    """Label a single tweet using GPT vision (text + image).
-    Uses detail='low' for cost efficiency (85 tokens per image)."""
+def _llm_label_with_vision(text, image_url):
     messages = [
         {"role": "system", "content": VISION_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": f'Label this crypto tweet:\n\n"{text[:1000]}"'},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": image_url, "detail": "low"},
-                },
-            ],
-        },
+        {"role": "user", "content": [
+            {"type": "text", "text": f'Label this crypto tweet:\n\n"{text[:1000]}"'},
+            {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}},
+        ]},
     ]
     try:
-        raw, tin, tout = _llm_request(
-            messages, max_tokens=100, temperature=0.05, model=VISION_MODEL,
-        )
+        raw, tin, tout = _llm_request(messages, max_tokens=100, temperature=0.05, model=VISION_MODEL)
         parsed = json.loads(raw)
         ticker = normalize_ticker(str(parsed.get("ticker", "")))
         sentiment = str(parsed.get("sentiment", "")).lower().strip()
         direction = str(parsed.get("direction", "")).lower().strip()
-        if sentiment not in ("bullish", "bearish", "neutral"):
-            sentiment = "neutral"
-        if direction not in ("long", "short"):
-            direction = "long" if sentiment != "bearish" else "short"
+        if sentiment not in ("bullish", "bearish", "neutral"): sentiment = "neutral"
+        if direction not in ("long", "short"): direction = "long" if sentiment != "bearish" else "short"
         return {"ticker": ticker, "sentiment": sentiment, "direction": direction}, tin, tout
+    except (ShutdownRequested, openai.AuthenticationError):
+        raise
     except Exception as e:
-        print(f"[Vision] Failed for image {image_url[:60]}…: {e}")
+        log.warning(f"Vision failed for {image_url[:60]}…: {e}")
         return {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}, 0, 0
 
 
@@ -660,14 +661,13 @@ def _llm_label_with_vision(
 
 X_API_BASE = "https://api.twitter.com/2"
 
-
 def _x_headers():
     return {"Authorization": f"Bearer {X_BEARER_TOKEN}", "User-Agent": "HyperCopy/1.0"}
 
-
-def _x_get(url, params=None, retries=5, base_delay=2.0):
+def _x_get(url, params=None, retries=3, base_delay=2.0):
     last_err = None
     for attempt in range(retries):
+        _check_shutdown()
         try:
             r = requests.get(url, headers=_x_headers(), params=params, timeout=30)
             if r.status_code == 200:
@@ -675,25 +675,36 @@ def _x_get(url, params=None, retries=5, base_delay=2.0):
             if r.status_code == 429:
                 reset_ts = r.headers.get("x-rate-limit-reset")
                 wait = max(int(reset_ts) - int(time.time()), 1) + 2 if reset_ts else int(r.headers.get("Retry-After", 60))
-                print(f"[X API] 429 rate-limited → sleeping {wait}s")
-                time.sleep(wait)
+                log.warning(f"X API 429 — sleeping {wait}s")
+                # sleep in small chunks so we can respond to shutdown
+                _interruptible_sleep(wait)
                 continue
             if r.status_code in (500, 502, 503, 504):
                 wait = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                print(f"[X API] {r.status_code} → retry in {wait:.1f}s")
+                log.warning(f"X API {r.status_code} — retry in {wait:.1f}s")
                 time.sleep(wait)
                 continue
             r.raise_for_status()
+        except ShutdownRequested:
+            raise
         except requests.exceptions.RequestException as e:
             last_err = e
             wait = base_delay * (2 ** attempt) + random.uniform(0, 1)
-            print(f"[X API] Request error ({attempt+1}/{retries}): {e} → {wait:.1f}s")
+            log.warning(f"X API error ({attempt+1}/{retries}): {e} — {wait:.1f}s")
             time.sleep(wait)
     raise RuntimeError(f"X API failed after {retries} retries: {last_err}")
 
+def _interruptible_sleep(seconds):
+    """Sleep that can be interrupted by shutdown signal."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if _shutdown.is_set():
+            raise ShutdownRequested()
+        time.sleep(min(1.0, end - time.monotonic()))
+
 
 # ═══════════════════════════════════════════════════════════════════════
-#  USER PROFILE RESOLUTION
+#  USER PROFILE + TWEET FETCHING
 # ═══════════════════════════════════════════════════════════════════════
 
 def _resolve_user_profile(username, state_con):
@@ -705,7 +716,7 @@ def _resolve_user_profile(username, state_con):
         user_data = data.get("data", {})
         uid = user_data.get("id")
         if not uid:
-            print(f"  ✗ Could not resolve @{username}")
+            log.warning(f"  ✗ Could not resolve @{username}")
             return None
         avatar = user_data.get("profile_image_url", "")
         if avatar:
@@ -723,24 +734,22 @@ def _resolve_user_profile(username, state_con):
         if not cached_uid:
             _state_save(state_con, username, uid)
         return profile
+    except ShutdownRequested:
+        raise
     except Exception as e:
         if cached_uid:
-            print(f"  ⚠ Profile fetch failed for @{username}, using cached uid")
+            log.warning(f"  ⚠ Profile fetch failed for @{username}, using cached uid")
             return {
                 "user_id": cached_uid, "display_name": "", "avatar_url": "",
                 "bio": "", "is_verified": False, "followers_count": 0, "following_count": 0,
             }
-        print(f"  ✗ Could not resolve @{username}: {e}")
+        log.warning(f"  ✗ Could not resolve @{username}: {e}")
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  TWEET FETCHING
-# ═══════════════════════════════════════════════════════════════════════
-
 def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
                        max_results_per_page=100, max_pages=10):
-    params: Dict[str, Any] = {
+    params = {
         "max_results": max_results_per_page,
         "tweet.fields": "created_at,author_id,public_metrics,attachments",
         "expansions": "attachments.media_keys",
@@ -754,15 +763,15 @@ def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
         params["start_time"] = start_time
 
     url = f"{X_API_BASE}/users/{user_id}/tweets"
-    all_tweets: List[Dict[str, Any]] = []
+    all_tweets = []
     pages = 0
-
     while pages < max_pages:
+        _check_shutdown()
         data = _x_get(url, params=params)
         meta = data.get("meta", {})
         if meta.get("result_count", 0) == 0:
             break
-        media_map: Dict[str, str] = {}
+        media_map = {}
         for m in data.get("includes", {}).get("media", []):
             k = m.get("media_key", "")
             img = m.get("url") or m.get("preview_image_url") or ""
@@ -794,13 +803,91 @@ def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
         params["pagination_token"] = next_token
         pages += 1
         time.sleep(0.3)
-
-    print(f"  ✓ {len(all_tweets)} tweets fetched for @{username} ({pages+1} pages)")
     return all_tweets
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  DATABASE WRITE
+#  LABEL ONE USER'S TWEETS  (cache → heuristic → LLM batch → vision)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _label_tweets(tweets, cache_con, batch_size=20):
+    """Label a list of tweets. Returns list of labeled dicts.
+    Writes to label cache immediately. Never raises on LLM failure
+    for individual tweets — falls back to NOISE."""
+    results = []
+    llm_text_q  = []   # need LLM text
+    llm_vis_q   = []   # need LLM vision
+    token_stats = {"in": 0, "out": 0}
+
+    for i, tw in enumerate(tweets):
+        text = tw["text"]
+        thash = _stable_tweet_hash(text)
+
+        # 1) cache
+        cached = _label_cache_get(cache_con, thash)
+        if cached:
+            results.append({**tw, "ticker": cached[0], "sentiment": cached[1], "direction": cached[2]})
+            continue
+
+        # 2) heuristic
+        tk = _cheap_ticker(text)
+        st = _cheap_sentiment(text)
+        if tk and st:
+            dr = _sentiment_to_direction(st, text)
+            _label_cache_put(cache_con, thash, tk, st, dr)
+            results.append({**tw, "ticker": tk, "sentiment": st, "direction": dr})
+            continue
+
+        # 3) queue for LLM
+        item = {"idx": i, "id": str(i), "tweet": text, "tw": tw}
+        if VISION_ENABLED and tw.get("images"):
+            llm_vis_q.append(item)
+        else:
+            llm_text_q.append(item)
+
+    # -- batch text labeling --
+    for start in range(0, len(llm_text_q), batch_size):
+        _check_shutdown()
+        chunk = llm_text_q[start:start + batch_size]
+        try:
+            labels, tin, tout = llm_batch_label(chunk)
+            token_stats["in"] += tin
+            token_stats["out"] += tout
+        except (ShutdownRequested, openai.AuthenticationError):
+            raise
+        except Exception as e:
+            log.error(f"LLM batch failed: {e} — marking {len(chunk)} as NOISE")
+            labels = {it["id"]: {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"} for it in chunk}
+
+        for item in chunk:
+            res = labels.get(item["id"], {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"})
+            thash = _stable_tweet_hash(item["tweet"])
+            _label_cache_put(cache_con, thash, res["ticker"], res["sentiment"], res["direction"])
+            results.append({**item["tw"], **res})
+
+    # -- vision labeling --
+    for item in llm_vis_q:
+        _check_shutdown()
+        imgs = item["tw"].get("images", [])
+        try:
+            res, tin, tout = _llm_label_with_vision(item["tweet"], imgs[0])
+            token_stats["in"] += tin
+            token_stats["out"] += tout
+        except (ShutdownRequested, openai.AuthenticationError):
+            raise
+        except Exception as e:
+            log.warning(f"Vision failed: {e}")
+            res = {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}
+        thash = _stable_tweet_hash(item["tweet"])
+        _label_cache_put(cache_con, thash, res["ticker"], res["sentiment"], res["direction"])
+        results.append({**item["tw"], **res})
+        time.sleep(0.15)
+
+    return results, token_stats
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DATABASE WRITE — per-user atomic commit
 # ═══════════════════════════════════════════════════════════════════════
 
 from backend.database import SessionLocal
@@ -833,174 +920,24 @@ def _signal_exists(session, tweet_id):
     return session.query(Signal.id).filter(Signal.tweet_id == tweet_id).first() is not None
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  MAIN PIPELINE
-# ═══════════════════════════════════════════════════════════════════════
+def _write_user_signals(username, labeled_tweets, profile=None):
+    """Write one user's signals to DB in a single transaction.
+    Returns (inserted, skipped_dup, skipped_noise)."""
+    relevant = [r for r in labeled_tweets if r.get("ticker") not in ("NOISE",)]
+    if not relevant:
+        return 0, 0, len(labeled_tweets)
 
-def run_once(max_days: int = 7, batch_size: int = 20, force_all: bool = False):
-    users = _resolve_user_list()
-    print(f"Users: {len(users)} | force_all={force_all}")
-    print(f"LLM model: {LLM_MODEL} | Vision: {VISION_ENABLED} ({VISION_MODEL})\n")
-
-    state_con = _state_db_connect()
-
-    # ── step 1: fetch tweets + profiles ─────────────────────────────
-    all_user_tweets: List[Tuple[str, Dict[str, Any]]] = []
-    user_profiles: Dict[str, Dict[str, Any]] = {}
-    api_calls_saved = 0
-    skipped_not_due = 0
-
-    for i, username in enumerate(users):
-        if not force_all and not _state_should_poll(state_con, username):
-            skipped_not_due += 1
-            continue
-
-        print(f"\n{'='*50}")
-        print(f"[{i+1}/{len(users)}] Fetching @{username}")
-
-        cached_uid = _state_get_user_id(state_con, username)
-        needs_profile = _state_needs_profile_refresh(state_con, username)
-
-        if needs_profile or not cached_uid:
-            profile = _resolve_user_profile(username, state_con)
-            if not profile:
-                continue
-            uid = profile["user_id"]
-            user_profiles[username] = profile
-            _state_update_profile_time(state_con, username)
-        else:
-            uid = cached_uid
-            api_calls_saved += 1
-
-        since_id = _state_get_since_id(state_con, username)
-        tweets = _fetch_user_tweets(uid, username, since_id=since_id, max_days=max_days)
-
-        newest_id = max(tweets, key=lambda t: t["tweet_id"])["tweet_id"] if tweets else None
-        _state_save(state_con, username, uid, last_tweet_id=newest_id, tweets_found=len(tweets))
-
-        for tw in tweets:
-            all_user_tweets.append((username, tw))
-
-        if i < len(users) - 1:
-            time.sleep(1)
-
-    print(f"\n{'='*50}")
-    print(f"Total tweets: {len(all_user_tweets)} | Profiles: {len(user_profiles)}")
-    print(f"Skipped (not due): {skipped_not_due}/{len(users)} | API saved: {api_calls_saved}")
-
-    if not all_user_tweets:
-        print("No new tweets.")
-        return
-
-    # ── step 2: label ─────────────────────────────────────────────
-    cache_con = _label_cache_connect()
-    labeled: List[Dict[str, Any]] = []
-    llm_text_queue: List[Dict[str, Any]] = []
-    llm_vision_queue: List[Dict[str, Any]] = []
-    cache_hits = 0
-    heuristic_hits = 0
-
-    for idx, (username, tw) in enumerate(all_user_tweets):
-        text = tw["text"]
-        thash = _stable_tweet_hash(text)
-
-        # ── cache check ──
-        cached = _label_cache_get(cache_con, thash)
-        if cached:
-            cache_hits += 1
-            labeled.append({**tw, "username": username, "ticker": cached[0],
-                            "sentiment": cached[1], "direction": cached[2]})
-            continue
-
-        # ── heuristic ──
-        tk = _cheap_ticker(text)
-        st = _cheap_sentiment(text)
-        if tk and st:
-            dr = _sentiment_to_direction(st, text)
-            _label_cache_put(cache_con, thash, tk, st, dr)
-            labeled.append({**tw, "username": username, "ticker": tk,
-                            "sentiment": st, "direction": dr})
-            heuristic_hits += 1
-            continue
-
-        # ── route to LLM: vision if has images, else text batch ──
-        item = {"idx": idx, "id": str(idx), "tweet": text, "username": username, "tw": tw}
-        if VISION_ENABLED and tw.get("images"):
-            llm_vision_queue.append(item)
-        else:
-            llm_text_queue.append(item)
-
-    print(f"\nLabeling pipeline: cache={cache_hits} heuristic={heuristic_hits} "
-          f"llm_text={len(llm_text_queue)} llm_vision={len(llm_vision_queue)}")
-
-    # ── step 2a: batch text labeling ──────────────────────────────
-    tokens_in = tokens_out = batches = 0
-    for start in range(0, len(llm_text_queue), batch_size):
-        chunk = llm_text_queue[start : start + batch_size]
-        labels, tin, tout = llm_batch_label(chunk)
-        tokens_in += tin
-        tokens_out += tout
-        batches += 1
-        for item in chunk:
-            res = labels.get(item["id"], {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"})
-            thash = _stable_tweet_hash(item["tweet"])
-            _label_cache_put(cache_con, thash, res["ticker"], res["sentiment"], res["direction"])
-            labeled.append({**item["tw"], "username": item["username"],
-                            "ticker": res["ticker"], "sentiment": res["sentiment"],
-                            "direction": res["direction"]})
-        if (start + batch_size) % 100 < batch_size:
-            print(f"[Text] {min(start+batch_size, len(llm_text_queue))}/{len(llm_text_queue)}")
-
-    # ── step 2b: vision labeling (individual, with image) ─────────
-    vision_tokens_in = vision_tokens_out = 0
-    for vi, item in enumerate(llm_vision_queue):
-        text = item["tweet"]
-        imgs = item["tw"].get("images", [])
-        img_url = imgs[0] if imgs else None
-
-        if img_url:
-            res, tin, tout = _llm_label_with_vision(text, img_url)
-            vision_tokens_in += tin
-            vision_tokens_out += tout
-        else:
-            # fallback: no image despite being in queue (shouldn't happen)
-            res = {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}
-
-        thash = _stable_tweet_hash(text)
-        _label_cache_put(cache_con, thash, res["ticker"], res["sentiment"], res["direction"])
-        labeled.append({**item["tw"], "username": item["username"],
-                        "ticker": res["ticker"], "sentiment": res["sentiment"],
-                        "direction": res["direction"]})
-
-        if (vi + 1) % 50 == 0:
-            print(f"[Vision] {vi+1}/{len(llm_vision_queue)}")
-        # small delay to avoid rate limiting
-        if vi < len(llm_vision_queue) - 1:
-            time.sleep(0.15)
-
-    tokens_in += vision_tokens_in
-    tokens_out += vision_tokens_out
-
-    relevant = [r for r in labeled if r["ticker"] not in ("NOISE",)]
-    noise_count = len(labeled) - len(relevant)
-
-    print(f"\n✅ Labeling done: {len(relevant)} relevant, {noise_count} noise")
-    print(f"  text batches={batches}, vision calls={len(llm_vision_queue)}")
-    print(f"  tokens in={tokens_in}, out={tokens_out}")
-
-    # ── step 3: write to DB ───────────────────────────────────────
     session = SessionLocal()
-    inserted = skipped_dup = 0
+    inserted = skipped = 0
     try:
+        trader = _get_or_create_trader(session, username, profile=profile)
         for r in relevant:
             tweet_id = r.get("tweet_id", "")
             if tweet_id and _signal_exists(session, tweet_id):
-                skipped_dup += 1
+                skipped += 1
                 continue
-            trader = _get_or_create_trader(session, r["username"],
-                                           profile=user_profiles.get(r["username"]))
             imgs = r.get("images", [])
-            signal = Signal(
+            sig = Signal(
                 trader_id=trader.id,
                 tweet_id=tweet_id or None,
                 tweet_text=r["text"],
@@ -1014,33 +951,193 @@ def run_once(max_days: int = 7, batch_size: int = 20, force_all: bool = False):
                 tweet_time=r["created_at"],
                 status="active",
             )
-            session.add(signal)
+            session.add(sig)
             inserted += 1
         session.commit()
-        print(f"\n✅ DB: {inserted} signals, {skipped_dup} dupes, {len(user_profiles)} profiles updated")
     except Exception as e:
         session.rollback()
-        print(f"\n❌ DB error: {e}")
+        log.error(f"DB error for @{username}: {e}")
         raise
     finally:
         session.close()
 
-    # ── telemetry ─────────────────────────────────────────────────
-    if relevant:
-        from collections import Counter
-        tickers = Counter(r["ticker"] for r in relevant)
-        sents = Counter(r["sentiment"] for r in relevant)
-        dirs = Counter(r["direction"] for r in relevant)
-        print("\nTicker distribution (top 15):")
-        for t, c in tickers.most_common(15):
-            print(f"  {t}: {c}")
-        print("Sentiment:")
-        for s, c in sents.most_common():
-            print(f"  {s}: {c} ({100*c/len(relevant):.1f}%)")
-        print("Direction:")
-        for d, c in dirs.most_common():
-            print(f"  {d}: {c} ({100*c/len(relevant):.1f}%)")
+    noise = len(labeled_tweets) - len(relevant)
+    return inserted, skipped, noise
 
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PROCESS ONE USER  (the atomic unit — fetch + label + write)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _process_user(username, state_con, cache_con, max_days=3):
+    """Process a single user end-to-end. Returns stats dict or None."""
+    cached_uid = _state_get_user_id(state_con, username)
+    needs_profile = _state_needs_profile_refresh(state_con, username)
+
+    # -- resolve profile if needed --
+    profile = None
+    if needs_profile or not cached_uid:
+        profile = _resolve_user_profile(username, state_con)
+        if not profile:
+            _state_record_error(state_con, username, "")
+            return None
+        uid = profile["user_id"]
+        _state_update_profile_time(state_con, username)
+    else:
+        uid = cached_uid
+
+    # -- fetch tweets --
+    since_id = _state_get_since_id(state_con, username)
+    tweets = _fetch_user_tweets(uid, username, since_id=since_id, max_days=max_days)
+
+    if not tweets:
+        _state_save(state_con, username, uid, tweets_found=0)
+        return {"username": username, "fetched": 0, "inserted": 0, "skipped": 0, "noise": 0}
+
+    # -- label --
+    labeled, token_stats = _label_tweets(tweets, cache_con)
+
+    # -- write to DB --
+    inserted, skipped, noise = _write_user_signals(username, labeled, profile=profile)
+
+    # -- update state (mark success, advance since_id) --
+    newest_id = max(tweets, key=lambda t: t["tweet_id"])["tweet_id"]
+    _state_save(state_con, username, uid, last_tweet_id=newest_id, tweets_found=len(tweets))
+
+    return {
+        "username": username,
+        "fetched": len(tweets),
+        "inserted": inserted,
+        "skipped": skipped,
+        "noise": noise,
+        "tokens_in": token_stats["in"],
+        "tokens_out": token_stats["out"],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN CYCLE
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_cycle(users, max_days=3, force_all=False):
+    """Run one full cycle over all users. Returns cycle stats."""
+    state_con = _state_db_connect()
+    cache_con = _label_cache_connect()
+
+    stats = {
+        "processed": 0, "skipped_not_due": 0, "skipped_circuit": 0,
+        "failed": 0, "total_inserted": 0, "total_fetched": 0,
+    }
+
+    for i, username in enumerate(users):
+        _check_shutdown()
+
+        if not force_all:
+            should, reason = _state_should_poll(state_con, username)
+            if not should:
+                if "circuit" in reason:
+                    stats["skipped_circuit"] += 1
+                else:
+                    stats["skipped_not_due"] += 1
+                continue
+
+        log.info(f"[{i+1}/{len(users)}] @{username}")
+
+        try:
+            result = _process_user(username, state_con, cache_con, max_days=max_days)
+            if result:
+                stats["processed"] += 1
+                stats["total_inserted"] += result["inserted"]
+                stats["total_fetched"]  += result["fetched"]
+                if result["inserted"] > 0 or result["fetched"] > 0:
+                    log.info(f"  ✓ @{username}: {result['fetched']} fetched, "
+                             f"{result['inserted']} inserted, {result['skipped']} dup, "
+                             f"{result['noise']} noise")
+            else:
+                stats["failed"] += 1
+
+        except ShutdownRequested:
+            log.info(f"  Shutdown during @{username} — state is safe")
+            raise
+        except openai.AuthenticationError as e:
+            log.error(f"🔑 OpenAI auth error — aborting cycle: {e}")
+            raise  # bubble up, don't waste more API calls
+        except Exception as e:
+            stats["failed"] += 1
+            _state_record_error(state_con, username, _state_get_user_id(state_con, username) or "")
+            log.error(f"  ✗ @{username} failed: {e}")
+
+        # polite delay between users
+        if i < len(users) - 1:
+            time.sleep(0.5)
+
+    return stats
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DAEMON LOOP
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_daemon(max_days=3, force_first_cycle=False):
+    """Main entry point — runs forever until SIGTERM/SIGINT."""
+    users = _resolve_user_list()
+    log.info(f"🐦 Ingestor daemon starting — {len(users)} users, "
+             f"cycle interval={CYCLE_INTERVAL_S}s, max_days={max_days}")
+    log.info(f"   LLM={LLM_MODEL}, Vision={VISION_ENABLED} ({VISION_MODEL})")
+
+    cycle_num = 0
+    consecutive_cycle_failures = 0
+
+    while not _shutdown.is_set():
+        cycle_num += 1
+        force = force_first_cycle and cycle_num == 1
+        log.info(f"\n{'='*60}")
+        log.info(f"Cycle #{cycle_num} starting (force_all={force})")
+
+        t0 = time.monotonic()
+        try:
+            stats = run_cycle(users, max_days=max_days, force_all=force)
+            elapsed = time.monotonic() - t0
+            consecutive_cycle_failures = 0
+
+            log.info(
+                f"Cycle #{cycle_num} done in {elapsed:.0f}s — "
+                f"processed={stats['processed']}, inserted={stats['total_inserted']}, "
+                f"fetched={stats['total_fetched']}, failed={stats['failed']}, "
+                f"skipped_not_due={stats['skipped_not_due']}, "
+                f"skipped_circuit={stats['skipped_circuit']}"
+            )
+
+        except ShutdownRequested:
+            log.info("Shutdown requested — exiting daemon loop")
+            break
+        except openai.AuthenticationError:
+            consecutive_cycle_failures += 1
+            log.error(f"🔑 Auth failure — will retry in {CYCLE_INTERVAL_S * 2}s")
+            _interruptible_sleep(CYCLE_INTERVAL_S * 2)
+            continue
+        except Exception as e:
+            consecutive_cycle_failures += 1
+            elapsed = time.monotonic() - t0
+            log.error(f"Cycle #{cycle_num} crashed after {elapsed:.0f}s: {e}")
+            if consecutive_cycle_failures >= MAX_CONSECUTIVE_FAILURES:
+                log.critical(f"💀 {consecutive_cycle_failures} consecutive failures — exiting")
+                sys.exit(1)
+
+        # sleep between cycles (interruptible)
+        log.info(f"💤 Sleeping {CYCLE_INTERVAL_S}s…")
+        try:
+            _interruptible_sleep(CYCLE_INTERVAL_S)
+        except ShutdownRequested:
+            log.info("Shutdown during sleep — exiting")
+            break
+
+    log.info("🛑 Ingestor daemon stopped cleanly")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  USER LIST
+# ═══════════════════════════════════════════════════════════════════════
 
 DEFAULT_USERS = [
     "DonAlt","CryptoCred","HsakaTrades","Tradermayne","RookieXBT",
@@ -1266,7 +1363,6 @@ DEFAULT_USERS = [
     "benarmstrongsx","NeerajKA",
 ]
 
-
 def _resolve_user_list() -> List[str]:
     if SCRAPE_USERS_ENV:
         parts = [p.strip() for p in SCRAPE_USERS_ENV.split(",") if p.strip()]
@@ -1275,10 +1371,29 @@ def _resolve_user_list() -> List[str]:
     return DEFAULT_USERS
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  CLI
+# ═══════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--max-days", type=int, default=7)
-    parser.add_argument("--force-all", action="store_true")
-    args = parser.parse_args()
-    run_once(max_days=args.max_days, force_all=args.force_all)
+    p = argparse.ArgumentParser(description="HyperCopy Ingestor")
+    p.add_argument("--max-days", type=int, default=3)
+    p.add_argument("--force-first", action="store_true",
+                   help="Force poll all users on the first cycle")
+    p.add_argument("--once", action="store_true",
+                   help="Run a single cycle then exit (for testing)")
+    p.add_argument("--force-all", action="store_true",
+                   help="Force poll all users (implies --once)")
+    args = p.parse_args()
+
+    if args.force_all:
+        users = _resolve_user_list()
+        stats = run_cycle(users, max_days=args.max_days, force_all=True)
+        log.info(f"Done: {stats}")
+    elif args.once:
+        users = _resolve_user_list()
+        stats = run_cycle(users, max_days=args.max_days, force_all=False)
+        log.info(f"Done: {stats}")
+    else:
+        run_daemon(max_days=args.max_days, force_first_cycle=args.force_first)
