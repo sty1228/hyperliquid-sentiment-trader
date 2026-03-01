@@ -1,29 +1,32 @@
-# ================================================================
-# FILE: backend/api/rewards.py
-# ================================================================
-# KOL Rewards API — 4 endpoints per handoff doc.
-# All return real data from DB. Zero/empty when user has no activity yet.
-#
-# Endpoints:
-#   GET  /api/kol/rewards           — user's current rewards state
-#   GET  /api/kol/distributions     — weekly distribution history
-#   POST /api/kol/share             — log a share event (PnL card / leaderboard)
-#   POST /api/kol/claim-fee-share   — initiate USDC claim (placeholder until fee engine ready)
-# ================================================================
+"""
+KOL Rewards API — 4 endpoints.
+All return real data from DB. Zero/empty when user has no activity yet.
 
+Endpoints:
+  GET  /api/kol/rewards           — user's current rewards state
+  GET  /api/kol/distributions     — weekly distribution history
+  POST /api/kol/share             — log a share event (PnL card / leaderboard)
+  POST /api/kol/claim-fee-share   — initiate USDC claim to user's Arb wallet
+"""
+
+import logging
+import threading
+from datetime import date, datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional, List, Literal
-from datetime import datetime
 
 from backend.deps import get_db, get_current_user
 from backend.models.rewards import KOLReward, KOLDistribution, ShareEvent, ShareType
+from backend.models.wallet import UserWallet
 
 router = APIRouter(prefix="/api/kol", tags=["kol-rewards"])
+log = logging.getLogger("kol-rewards")
 
+# ── Phase config ──
+BETA_START = date(2026, 2, 28)
 
-# ── Phase config (hardcoded — matches business doc, no reason to store in DB) ──
 PHASE_CONFIG = {
     "beta": {
         "feeShare": "60%",
@@ -120,7 +123,6 @@ class ClaimResponse(BaseModel):
 # ── Helpers ──
 
 def get_or_create_reward(db: Session, user_id: str) -> KOLReward:
-    """Get existing rewards row or create a fresh one for this user."""
     reward = db.query(KOLReward).filter(KOLReward.user_id == user_id).first()
     if not reward:
         reward = KOLReward(user_id=user_id)
@@ -131,17 +133,31 @@ def get_or_create_reward(db: Session, user_id: str) -> KOLReward:
 
 
 def calculate_current_week(phase: str) -> int:
-    """
-    Calculate current week number within the phase.
-    TODO: Replace with actual phase start date from config/DB.
-    For now, returns 1 (phase just started).
-    """
-    # When you have a real start date:
-    # from datetime import date
-    # start = date(2026, 1, 1)  # beta start
-    # delta = (date.today() - start).days
-    # return min(max(delta // 7 + 1, 1), PHASE_CONFIG[phase]["totalWeeks"])
-    return 1
+    """Real week number since beta start (1-indexed), capped at totalWeeks."""
+    delta = (date.today() - BETA_START).days
+    total = PHASE_CONFIG.get(phase, PHASE_CONFIG["beta"])["totalWeeks"]
+    return min(max(delta // 7 + 1, 1), total)
+
+
+def _do_claim_transfer(user_id: str, amount: float, wallet_address: str):
+    """Background thread: transfer USDC from master wallet to user's Arb wallet."""
+    try:
+        from backend.database import SessionLocal
+        from backend.services.wallet_manager import master_transfer_usdc
+        master_transfer_usdc(wallet_address, amount)
+        log.info(f"Claim transfer ${amount:.2f} → {wallet_address[:10]}… OK")
+    except Exception as e:
+        log.error(f"Claim transfer failed for {user_id[:8]}…: {e}")
+        # Refund claimable on failure
+        try:
+            db = SessionLocal()
+            rw = db.query(KOLReward).filter(KOLReward.user_id == user_id).first()
+            if rw:
+                rw.claimable_fee_share += amount
+                db.commit()
+            db.close()
+        except Exception as e2:
+            log.error(f"Refund failed: {e2}")
 
 
 # ── Endpoints ──
@@ -151,11 +167,6 @@ async def get_rewards(
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    GET /api/kol/rewards
-    Returns the user's full rewards state. Creates a fresh record if first visit.
-    Frontend replaces ALL mock data with this response.
-    """
     reward = get_or_create_reward(db, user.id)
     phase = reward.current_phase
     config = PHASE_CONFIG.get(phase, PHASE_CONFIG["beta"])
@@ -183,11 +194,6 @@ async def get_distributions(
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    GET /api/kol/distributions?limit=6
-    Returns weekly distribution history, newest first.
-    Empty list if user has no distributions yet.
-    """
     rows = (
         db.query(KOLDistribution)
         .filter(KOLDistribution.user_id == user.id)
@@ -223,11 +229,6 @@ async def log_share(
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    POST /api/kol/share
-    Logs a share event. Fully functional right now — no dependencies on trading engine.
-    Used for: multiplier calculation, analytics, rewards screen "Share" buttons.
-    """
     event = ShareEvent(
         user_id=user.id,
         share_type=ShareType(body.type),
@@ -235,12 +236,6 @@ async def log_share(
         reference_id=body.referenceId,
     )
     db.add(event)
-
-    # Update share count on rewards row (for multiplier calc)
-    reward = get_or_create_reward(db, user.id)
-    # TODO: Recalculate boost_multiplier based on share frequency + smart followers
-    # For now, just log the event.
-
     db.commit()
     db.refresh(event)
 
@@ -257,16 +252,7 @@ async def claim_fee_share(
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    POST /api/kol/claim-fee-share
-    Initiates USDC claim to user's wallet on Arbitrum.
-
-    Currently: validates amount against claimable balance.
-    TODO: When fee share accumulation is live, add actual USDC transfer
-    via wallet_manager (same pattern as withdraw flow).
-    """
     reward = get_or_create_reward(db, user.id)
-
     amount = body.amount if body.amount else reward.claimable_fee_share
 
     if amount <= 0:
@@ -283,13 +269,29 @@ async def claim_fee_share(
             message=f"Requested ${amount:.2f} but only ${reward.claimable_fee_share:.2f} is claimable.",
         )
 
-    # Deduct from claimable
+    # Find user's external wallet for payout
+    wallet = (
+        db.query(UserWallet)
+        .filter(UserWallet.user_id == user.id, UserWallet.is_active.is_(True))
+        .first()
+    )
+    if not wallet or not wallet.withdraw_address:
+        return ClaimResponse(
+            status="error",
+            amount=0,
+            message="No withdraw address found. Please set up your wallet first.",
+        )
+
+    # Deduct immediately (refunded on failure in background thread)
     reward.claimable_fee_share -= amount
     db.commit()
 
-    # TODO: Trigger actual USDC transfer via background thread
-    # (same pattern as wallet.py withdraw — threading.Thread with HL withdraw + Arb transfer)
-    # For now, just deduct the balance.
+    # Transfer in background (same pattern as withdraw flow)
+    threading.Thread(
+        target=_do_claim_transfer,
+        args=(user.id, amount, wallet.withdraw_address),
+        daemon=True,
+    ).start()
 
     return ClaimResponse(
         status="processing",

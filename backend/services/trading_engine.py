@@ -10,7 +10,7 @@ Background service handling the full trade lifecycle:
 
 Run:  python -m backend.services.trading_engine
 """
-
+from backend.services.rewards_engine import recompute_kol_points, run_weekly_distribution
 import os, sys, time, math, logging, requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -643,6 +643,8 @@ def run():
 
                 if loop_start - last_stats_recompute >= STATS_RECOMPUTE_INTERVAL:
                     recompute_stats(db)
+                    recompute_kol_points(db)
+                    run_weekly_distribution(db)
                     last_stats_recompute = loop_start
             finally:
                 db.close()
