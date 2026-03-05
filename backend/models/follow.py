@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import uuid
 
 from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy.orm import relationship
 
 from backend.database import Base
 
@@ -30,3 +31,7 @@ class Follow(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
     )
+
+    # ── Relationships ────────────────────────────────────
+    user   = relationship("User",   foreign_keys=[user_id])
+    trader = relationship("Trader", foreign_keys=[trader_id])
