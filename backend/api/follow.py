@@ -1,10 +1,11 @@
 """
-Follow API — 关注/取关 Trader，含 stats
+Follow API — follow/unfollow traders + copy/counter trading toggles.
+Copy and Counter are mutually exclusive — enforced at every write path.
 """
 from __future__ import annotations
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sqlalchemy.orm import Session
 
 from backend.deps import get_db, get_current_user
@@ -15,17 +16,25 @@ from backend.models.follow import Follow
 router = APIRouter(prefix="/api", tags=["follow"])
 
 
-# ── Request / Response 模型 ──────────────────────────────
+# ── Request / Response models ────────────────────────────────
 
 class FollowRequest(BaseModel):
     trader_username: str
     is_copy_trading: bool = False
+    is_counter_trading: bool = False  # ★ NEW
+
+    @model_validator(mode="after")
+    def check_mutual_exclusivity(self) -> "FollowRequest":
+        if self.is_copy_trading and self.is_counter_trading:
+            raise ValueError("is_copy_trading and is_counter_trading are mutually exclusive")
+        return self
 
 
 class FollowResponse(BaseModel):
     id: str
     trader_username: str
     is_copy_trading: bool
+    is_counter_trading: bool  # ★ NEW
     created_at: datetime
 
 
@@ -35,8 +44,8 @@ class FollowListItem(BaseModel):
     display_name: str | None = None
     avatar_url: str | None = None
     is_copy_trading: bool
+    is_counter_trading: bool  # ★ NEW
     created_at: datetime
-    # Stats
     win_rate: float = 0.0
     total_profit_usd: float = 0.0
     total_signals: int = 0
@@ -47,9 +56,37 @@ class FollowListItem(BaseModel):
 class FollowStatusResponse(BaseModel):
     is_following: bool
     is_copy_trading: bool
+    is_counter_trading: bool  # ★ NEW
 
 
-# ── API 端点 ─────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────
+
+def _get_trader_or_404(db: Session, username: str) -> Trader:
+    t = db.query(Trader).filter(Trader.username == username).first()
+    if not t:
+        raise HTTPException(404, f"Trader @{username} not found")
+    return t
+
+
+def _get_follow(db: Session, user_id: str, trader_id: str) -> Follow | None:
+    return (
+        db.query(Follow)
+        .filter(Follow.user_id == user_id, Follow.trader_id == trader_id)
+        .first()
+    )
+
+
+def _to_response(follow: Follow, trader: Trader) -> FollowResponse:
+    return FollowResponse(
+        id=follow.id,
+        trader_username=trader.username,
+        is_copy_trading=follow.is_copy_trading,
+        is_counter_trading=follow.is_counter_trading,
+        created_at=follow.created_at,
+    )
+
+
+# ── Endpoints ────────────────────────────────────────────────
 
 @router.post("/follow", response_model=FollowResponse)
 def follow_trader(
@@ -57,44 +94,37 @@ def follow_trader(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """关注一个 Trader（幂等：已关注则返回现有记录，按需更新 copy_trading）"""
-    trader = db.query(Trader).filter(Trader.username == body.trader_username).first()
-    if not trader:
-        raise HTTPException(404, f"Trader @{body.trader_username} not found")
+    """
+    Follow a trader (idempotent).
+    Passing is_copy_trading=True or is_counter_trading=True also activates that mode.
+    Copy and counter are mutually exclusive — setting one clears the other.
+    """
+    trader = _get_trader_or_404(db, body.trader_username)
+    existing = _get_follow(db, current_user.id, trader.id)
 
-    existing = (
-        db.query(Follow)
-        .filter(Follow.user_id == current_user.id, Follow.trader_id == trader.id)
-        .first()
-    )
     if existing:
-        # 幂等：如果请求开启 copy trading 但当前未开启，则更新
-        if body.is_copy_trading and not existing.is_copy_trading:
-            existing.is_copy_trading = True
+        # Update trading mode if anything changed
+        changed = (
+            existing.is_copy_trading != body.is_copy_trading
+            or existing.is_counter_trading != body.is_counter_trading
+        )
+        if changed:
+            existing.is_copy_trading = body.is_copy_trading
+            existing.is_counter_trading = body.is_counter_trading
             db.commit()
             db.refresh(existing)
-        return FollowResponse(
-            id=existing.id,
-            trader_username=trader.username,
-            is_copy_trading=existing.is_copy_trading,
-            created_at=existing.created_at,
-        )
+        return _to_response(existing, trader)
 
     follow = Follow(
         user_id=current_user.id,
         trader_id=trader.id,
         is_copy_trading=body.is_copy_trading,
+        is_counter_trading=body.is_counter_trading,
     )
     db.add(follow)
     db.commit()
     db.refresh(follow)
-
-    return FollowResponse(
-        id=follow.id,
-        trader_username=trader.username,
-        is_copy_trading=follow.is_copy_trading,
-        created_at=follow.created_at,
-    )
+    return _to_response(follow, trader)
 
 
 @router.get("/follow/check/{trader_username}", response_model=FollowStatusResponse)
@@ -103,19 +133,15 @@ def check_follow_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """检查是否已关注某 Trader"""
     trader = db.query(Trader).filter(Trader.username == trader_username).first()
     if not trader:
-        return FollowStatusResponse(is_following=False, is_copy_trading=False)
+        return FollowStatusResponse(is_following=False, is_copy_trading=False, is_counter_trading=False)
 
-    follow = (
-        db.query(Follow)
-        .filter(Follow.user_id == current_user.id, Follow.trader_id == trader.id)
-        .first()
-    )
+    follow = _get_follow(db, current_user.id, trader.id)
     return FollowStatusResponse(
         is_following=follow is not None,
         is_copy_trading=follow.is_copy_trading if follow else False,
+        is_counter_trading=follow.is_counter_trading if follow else False,
     )
 
 
@@ -125,19 +151,10 @@ def unfollow_trader(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """取关一个 Trader"""
-    trader = db.query(Trader).filter(Trader.username == trader_username).first()
-    if not trader:
-        raise HTTPException(404, f"Trader @{trader_username} not found")
-
-    follow = (
-        db.query(Follow)
-        .filter(Follow.user_id == current_user.id, Follow.trader_id == trader.id)
-        .first()
-    )
+    trader = _get_trader_or_404(db, trader_username)
+    follow = _get_follow(db, current_user.id, trader.id)
     if not follow:
         raise HTTPException(404, "Not following this trader")
-
     db.delete(follow)
     db.commit()
     return {"message": f"Unfollowed @{trader_username}"}
@@ -145,36 +162,33 @@ def unfollow_trader(
 
 @router.get("/follows", response_model=list[FollowListItem])
 def get_my_follows(
-    window: str = Query("30d", regex="^(24h|7d|30d)$"),
+    window: str = Query("30d", pattern="^(24h|7d|30d)$"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取我关注的所有 Trader（含 stats）"""
     follows = (
         db.query(Follow)
         .filter(Follow.user_id == current_user.id)
         .order_by(Follow.created_at.desc())
         .all()
     )
-
     result = []
     for f in follows:
         trader = db.query(Trader).filter(Trader.id == f.trader_id).first()
         if not trader:
             continue
-
         stats = (
             db.query(TraderStats)
             .filter(TraderStats.trader_id == trader.id, TraderStats.window == window)
             .first()
         )
-
         result.append(FollowListItem(
             id=f.id,
             trader_username=trader.username,
             display_name=trader.display_name,
             avatar_url=trader.avatar_url,
             is_copy_trading=f.is_copy_trading,
+            is_counter_trading=f.is_counter_trading,
             created_at=f.created_at,
             win_rate=stats.win_rate if stats else 0.0,
             total_profit_usd=stats.total_profit_usd if stats else 0.0,
@@ -191,20 +205,35 @@ def toggle_copy_trading(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """开启/关闭跟单"""
-    trader = db.query(Trader).filter(Trader.username == trader_username).first()
-    if not trader:
-        raise HTTPException(404, f"Trader @{trader_username} not found")
-
-    follow = (
-        db.query(Follow)
-        .filter(Follow.user_id == current_user.id, Follow.trader_id == trader.id)
-        .first()
-    )
+    """Toggle copy trading on/off. Turning ON clears counter trading."""
+    trader = _get_trader_or_404(db, trader_username)
+    follow = _get_follow(db, current_user.id, trader.id)
     if not follow:
         raise HTTPException(404, "Not following this trader")
 
     follow.is_copy_trading = not follow.is_copy_trading
+    if follow.is_copy_trading:
+        follow.is_counter_trading = False  # mutual exclusivity
     db.commit()
     db.refresh(follow)
-    return {"is_copy_trading": follow.is_copy_trading}
+    return {"is_copy_trading": follow.is_copy_trading, "is_counter_trading": follow.is_counter_trading}
+
+
+@router.patch("/follow/{trader_username}/counter-trading")
+def toggle_counter_trading(
+    trader_username: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """★ NEW — Toggle counter trading on/off. Turning ON clears copy trading."""
+    trader = _get_trader_or_404(db, trader_username)
+    follow = _get_follow(db, current_user.id, trader.id)
+    if not follow:
+        raise HTTPException(404, "Not following this trader")
+
+    follow.is_counter_trading = not follow.is_counter_trading
+    if follow.is_counter_trading:
+        follow.is_copy_trading = False  # mutual exclusivity
+    db.commit()
+    db.refresh(follow)
+    return {"is_counter_trading": follow.is_counter_trading, "is_copy_trading": follow.is_copy_trading}

@@ -1,27 +1,32 @@
+"""
+Follow model — user ↔ trader relationship
+Supports: follow-only, copy trading (same direction), counter trading (opposite direction).
+Copy and counter are mutually exclusive.
+"""
 from __future__ import annotations
-import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, Boolean, DateTime, ForeignKey, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+import uuid
+
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, UniqueConstraint
 
 from backend.database import Base
 
-def _utcnow():
-    return datetime.now(timezone.utc)
 
 class Follow(Base):
-    """User follows/copy-trades a trader."""
     __tablename__ = "follows"
     __table_args__ = (
-        UniqueConstraint("user_id", "trader_id", name="uq_user_trader"),
+        UniqueConstraint("user_id", "trader_id", name="uq_follow_user_trader"),
     )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
-    trader_id: Mapped[str] = mapped_column(ForeignKey("traders.id"), nullable=False, index=True)
-    is_copy_trading: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    trader_id = Column(String(36), ForeignKey("traders.id"), nullable=False, index=True)
 
-    # Relationships
-    user = relationship("User", back_populates="follows")
-    trader = relationship("Trader", back_populates="follows")
+    is_copy_trading = Column(Boolean, default=False, nullable=False)
+    # ★ NEW — reverse-direction copy trading (mutually exclusive with is_copy_trading)
+    is_counter_trading = Column(Boolean, default=False, nullable=False, server_default="false")
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )

@@ -144,6 +144,7 @@ def process_new_signals(db: Session, coins: dict[str, int], mids: dict[str, floa
     db.commit()
 
 
+
 def _dispatch_signal(db: Session, sig: Signal, coins: dict, mids: dict):
     coin = sig.ticker
     if coin not in coins:
@@ -155,22 +156,42 @@ def _dispatch_signal(db: Session, sig: Signal, coins: dict, mids: dict):
         return
     if not sig.entry_price:
         sig.entry_price = mid
+
+    # ★ Include both copy AND counter traders in one query
     followers = (
         db.query(Follow)
-        .filter(Follow.trader_id == sig.trader_id, Follow.is_copy_trading.is_(True))
+        .filter(
+            Follow.trader_id == sig.trader_id,
+            (Follow.is_copy_trading.is_(True)) | (Follow.is_counter_trading.is_(True)),
+        )
         .all()
     )
     if not followers:
         return
-    log.info(f"  → {coin} {sig.direction} (trader {sig.trader_id[:8]}…) → {len(followers)} copiers")
+
+    copy_count = sum(1 for f in followers if f.is_copy_trading)
+    counter_count = sum(1 for f in followers if f.is_counter_trading)
+    log.info(
+        f"  → {coin} {sig.direction} (trader {sig.trader_id[:8]}…) "
+        f"→ {copy_count} copiers, {counter_count} counters"
+    )
+
     for fol in followers:
         try:
-            _execute_for_user(db, fol.user_id, sig, coin, mid, coins[coin])
+            _execute_for_user(
+                db, fol.user_id, sig, coin, mid, coins[coin],
+                is_counter=fol.is_counter_trading,  # ★ NEW
+            )
         except Exception as e:
             log.error(f"  ✗ user {fol.user_id[:8]}… : {e}")
 
 
-def _execute_for_user(db, user_id, sig, coin, mid, sz_decimals):
+
+def _execute_for_user(db, user_id, sig, coin, mid, sz_decimals, is_counter: bool = False):
+    """
+    Execute a copy trade for one user.
+    ★ is_counter=True → flips the trade direction (long→short, short→long).
+    """
     wallet = (
         db.query(UserWallet)
         .filter(UserWallet.user_id == user_id, UserWallet.is_active.is_(True))
@@ -178,10 +199,12 @@ def _execute_for_user(db, user_id, sig, coin, mid, sz_decimals):
     )
     if not wallet:
         return
+
     bal = get_hl_balance(wallet.address)
     equity = bal.get("equity", 0.0)
     if equity < 5:
         return
+
     settings = (
         db.query(CopySetting)
         .filter(CopySetting.user_id == user_id, CopySetting.trader_id.is_(None))
@@ -189,52 +212,78 @@ def _execute_for_user(db, user_id, sig, coin, mid, sz_decimals):
     )
     leverage = settings.leverage if settings else 8.0
     max_pos = settings.max_positions if settings else 10
+
     open_count = db.query(Trade).filter(Trade.user_id == user_id, Trade.status == "open").count()
     if open_count >= max_pos:
         return
+
     dup = db.query(Trade).filter(Trade.user_id == user_id, Trade.signal_id == sig.id).first()
     if dup:
         return
+
+    trader_username = (
+        db.query(Trader.username).filter(Trader.id == sig.trader_id).scalar()
+    )
     existing_pos = db.query(Trade).filter(
-        Trade.user_id == user_id, Trade.ticker == coin,
-        Trade.trader_username == (db.query(Trader.username).filter(Trader.id == sig.trader_id).scalar()),
+        Trade.user_id == user_id,
+        Trade.ticker == coin,
+        Trade.trader_username == trader_username,
         Trade.status == "open",
     ).first()
     if existing_pos:
         return
+
     if settings and settings.size_type == "fixed_usd":
         usd_alloc = min(settings.size_value, equity * 0.9)
     else:
         pct = (settings.size_value if settings else 10.0) / 100.0
         usd_alloc = equity * pct
     usd_alloc = max(usd_alloc, MIN_TRADE_USD)
+
     notional = usd_alloc * leverage
     qty = round(notional / mid, sz_decimals)
     if qty <= 0:
         return
-    is_buy = sig.direction == "long"
+
+    # ★ Determine direction — flip if counter trading
+    original_is_buy = sig.direction == "long"
+    is_buy = (not original_is_buy) if is_counter else original_is_buy
+    effective_direction = ("short" if is_buy is False else "long")
+
     slip = SLIPPAGE_BPS / 10_000
     price = round(mid * (1 + slip) if is_buy else mid * (1 - slip), 6)
+
     pk = decrypt_key(wallet.encrypted_private_key)
     is_cross = (settings.margin_mode == "cross") if settings else True
     _hl_set_leverage(pk, coin, int(leverage), cross=is_cross)
+
     result = execute_copy_trade(private_key=pk, coin=coin, is_buy=is_buy, size=qty, price=price)
     filled, avg_px = _parse_order_result(result)
     if not filled:
         log.warning(f"  ✗ order not filled user {user_id[:8]}… {coin}")
         return
+
     fill_price = avg_px if avg_px > 0 else mid
     trader = db.query(Trader).filter(Trader.id == sig.trader_id).first()
+
     trade = Trade(
-        user_id=user_id, signal_id=sig.id,
+        user_id=user_id,
+        signal_id=sig.id,
         trader_username=trader.username if trader else None,
-        ticker=coin, direction=sig.direction,
-        entry_price=fill_price, size_usd=usd_alloc, size_qty=qty,
-        leverage=leverage, status="open", source="copy",
+        ticker=coin,
+        direction=effective_direction,          # ★ actual executed direction
+        entry_price=fill_price,
+        size_usd=usd_alloc,
+        size_qty=qty,
+        leverage=leverage,
+        status="open",
+        source="counter" if is_counter else "copy",  # ★ distinguishable in trade history
     )
     db.add(trade)
-    log.info(f"  ✅ OPEN {sig.direction} {coin} user {user_id[:8]}… qty={qty} @ {fill_price:.2f}")
-
+    log.info(
+        f"  ✅ {'COUNTER' if is_counter else 'COPY'} {effective_direction.upper()} {coin} "
+        f"user {user_id[:8]}… qty={qty} @ {fill_price:.2f}"
+    )
 
 # ═══════════════════════════════════════════════════════════════
 #  2. POSITION MANAGEMENT  (PnL + TP/SL)

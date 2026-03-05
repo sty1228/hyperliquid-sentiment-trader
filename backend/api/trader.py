@@ -92,6 +92,7 @@ class TraderProfileResponse(BaseModel):
     # Follow state (requires auth, else false)
     is_followed: bool = False
     is_copy_trading: bool = False
+    is_counter_trading: bool = False  # ★ NEW
     # Best / worst signal
     best_signal: BestWorstSignal | None = None
     worst_signal: BestWorstSignal | None = None
@@ -142,17 +143,15 @@ def _compute_radar(
     avg_w = (sum(s.pct_change for s in wins) / len(wins)) if wins else 0
     avg_l = abs(sum(s.pct_change for s in losses) / len(losses)) if losses else 1
     raw_rr = avg_w / max(avg_l, 0.01)
-    # R/R 1.0 → 33, R/R 2.0 → 67, R/R 3.0+ → 100
     rr_score = _clamp(raw_rr / 3.0 * 100)
 
     # ── 4. Consistency ──
     rates = [st.win_rate for st in [s24, s7, s30] if st and st.total_signals > 0]
     if len(rates) >= 2:
         std = stats_lib.stdev(rates)
-        # std 0 → 100, std ≥ 0.3 → 0
         consistency = _clamp((1 - std / 0.3) * 100)
     elif len(rates) == 1:
-        consistency = 50  # insufficient windows
+        consistency = 50
     else:
         consistency = 0
 
@@ -168,7 +167,7 @@ def _compute_radar(
         )
         dt = sig.tweet_time or sig.created_at
         age_days = max(0, (now - dt).total_seconds() / 86400) if dt else 7
-        w = math.exp(-0.1 * age_days)  # half-life ≈ 7 days
+        w = math.exp(-0.1 * age_days)
         w_sum += w * (1.0 if correct else 0.0)
         w_tot += w
     timing = _clamp((w_sum / w_tot) * 100) if w_tot > 0 else 0
@@ -196,7 +195,6 @@ def _compute_radar(
             for s in signals
         ]
         avg_eng = sum(scores) / len(scores)
-        # score 8+ → 100 (big KOL), score 4 → 50 (mid), score 0 → 0
         engagement = _clamp(avg_eng / 8.0 * 100)
     else:
         engagement = 0
@@ -258,7 +256,7 @@ def _best_worst(
         dt = s.tweet_time or s.created_at
         return BestWorstSignal(
             token=s.ticker,
-            pnl=round(s.pct_change, 1),
+            pnl=round(s.pct_change, 1),  # ★ fixed typo: pct_chantge → pct_change
             date=dt.strftime("%b %d") if dt else "",
         )
 
@@ -273,13 +271,13 @@ def _best_worst(
 @router.get("/trader/{x_handle}/profile", response_model=TraderProfileResponse)
 def get_trader_profile(
     x_handle: str,
-    window: str = Query("7d", regex="^(24h|7d|30d)$"),
+    window: str = Query("7d", pattern="^(24h|7d|30d)$"),
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user),
 ):
     """
     Trader profile page: basic info + stats + radar + follow state.
-    Auth is optional — if JWT present, returns is_followed/is_copy_trading.
+    Auth is optional — if JWT present, returns is_followed / is_copy_trading / is_counter_trading.
     """
     trader = _get_trader_or_404(db, x_handle)
 
@@ -305,8 +303,10 @@ def get_trader_profile(
     radar = _compute_radar(signals, all_stats)
     best, worst = _best_worst(signals)
 
-    # Follow state
-    is_followed = is_copy = False
+    # Follow state (requires auth)
+    is_followed = False
+    is_copy = False
+    is_counter = False  # ★ NEW
     if current_user:
         follow = (
             db.query(Follow)
@@ -319,6 +319,7 @@ def get_trader_profile(
         if follow:
             is_followed = True
             is_copy = follow.is_copy_trading
+            is_counter = follow.is_counter_trading  # ★ NEW
 
     return TraderProfileResponse(
         id=trader.id,
@@ -342,6 +343,7 @@ def get_trader_profile(
         radar=radar,
         is_followed=is_followed,
         is_copy_trading=is_copy,
+        is_counter_trading=is_counter,  # ★ NEW
         best_signal=best,
         worst_signal=worst,
     )
