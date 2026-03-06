@@ -219,7 +219,7 @@ def _get_trader_or_404(db: Session, x_handle: str) -> Trader:
     return t
 
 
-def _sanitize_pct(v: float | None, cap: float = 500.0) -> float:
+def _sanitize_pct(v: float | None, cap: float = 200.0) -> float:
     """
     Spot prices cannot realistically move ±500% in any reasonable window.
     Values outside this range indicate a bad entry_price in the DB.
