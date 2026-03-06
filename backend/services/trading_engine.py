@@ -253,12 +253,14 @@ def _execute_for_user(db, user_id, sig, coin, mid, sz_decimals, is_counter: bool
     slip = SLIPPAGE_BPS / 10_000
     
     raw_price = mid * (1 + slip) if is_buy else mid * (1 - slip)
-    if raw_price >= 1000:
-        price = round(raw_price, 1)
-    elif raw_price >= 10:
+    if raw_price >= 10000:
+        price = round(raw_price)        # BTC 等高价币，整数
+    elif raw_price >= 100:
+        price = round(raw_price, 1)     # SOL/ETH 等
+    elif raw_price >= 1:
         price = round(raw_price, 2)
     else:
-        price = round(raw_price, 4)
+        price = round(raw_price, 4)     # 低价 meme 币
 
     pk = decrypt_key(wallet.encrypted_private_key)
     is_cross = (settings.margin_mode == "cross") if settings else True
@@ -361,12 +363,14 @@ def _close_trade(db, trade, wallet, mid, reason):
         is_buy = trade.direction == "short"
         slip = SLIPPAGE_BPS / 10_000
         raw_price = mid * (1 + slip) if is_buy else mid * (1 - slip)
-        if raw_price >= 1000:
-            price = round(raw_price, 1)
-        elif raw_price >= 10:
+        if raw_price >= 10000:
+            price = round(raw_price)        # BTC 等高价币，整数
+        elif raw_price >= 100:
+            price = round(raw_price, 1)     # SOL/ETH 等
+        elif raw_price >= 1:
             price = round(raw_price, 2)
         else:
-            price = round(raw_price, 4)
+            price = round(raw_price, 4)     # 低价 meme 币
         result = execute_copy_trade(
             private_key=pk, coin=trade.ticker, is_buy=is_buy,
             size=trade.size_qty, price=price, reduce_only=True,
