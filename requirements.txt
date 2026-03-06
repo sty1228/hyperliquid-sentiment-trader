@@ -26,4 +26,5 @@ cryptography>=41.0.0
 openai>=1.0
 pandas>=2.0
 selenium>=4.0
-webdriver-manager>=4.0
+webdriver-manager>=4.0sentry-sdk
+slowapi
