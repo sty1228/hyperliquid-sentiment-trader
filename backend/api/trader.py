@@ -223,8 +223,10 @@ def _get_trader_or_404(db: Session, x_handle: str) -> Trader:
     return t
 
 
-# ★ Cap must match PCT_SANITY_CAP=500 in bybit_price_tracker.py
-PCT_SANITY_CAP = 500.0
+# ★ Cap must match PCT_SANITY_CAP=200 in bybit_price_tracker.py
+# 200% is the practical ceiling — values beyond this indicate a bad entry_price
+# (e.g. historical price fetch failed and fell back to current price on a stale tweet)
+PCT_SANITY_CAP = 200.0
 
 def _sanitize_pct(v: float | None, cap: float = PCT_SANITY_CAP) -> float:
     """
