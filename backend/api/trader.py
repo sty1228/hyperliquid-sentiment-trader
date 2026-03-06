@@ -18,7 +18,14 @@ from backend.models.follow import Follow
 from backend.models.signal import Signal
 from backend.models.trader import Trader, TraderStats
 from backend.models.user import User
+import logging
+import requests as _req
+from backend.api.auth import get_current_user as get_current_user_dep
+from backend.models.wallet import UserWallet
+from backend.models.trade import Trade as TradeModel
+from backend.models.setting import CopySetting
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["trader"])
 
 
@@ -408,4 +415,162 @@ def get_user_signals(
         name=trader.display_name or trader.username,
         tweetsCount=total,
         signals=items,
+    )
+
+
+# ── Manual Signal Trade ──────────────────────────────────
+
+class SignalTradeRequest(BaseModel):
+    side: str  # "copy" | "counter"
+
+class SignalTradeResponse(BaseModel):
+    status: str
+    direction: str
+    ticker: str
+    entry_price: float
+    size_usd: float
+    size_qty: float
+
+@router.post("/signal/{signal_id}/trade", response_model=SignalTradeResponse)
+def place_signal_trade(
+    signal_id: str,
+    body: SignalTradeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_dep),
+):
+    """Execute a single signal trade via dedicated wallet. Uses per-trader settings → default fallback."""
+    from backend.services.wallet_manager import get_hl_balance, decrypt_key, execute_copy_trade
+
+    if body.side not in ("copy", "counter"):
+        raise HTTPException(400, "side must be 'copy' or 'counter'")
+
+    signal = db.query(Signal).filter(Signal.id == signal_id).first()
+    if not signal:
+        raise HTTPException(404, "Signal not found")
+
+    wallet = (
+        db.query(UserWallet)
+        .filter(UserWallet.user_id == current_user.id, UserWallet.is_active.is_(True))
+        .first()
+    )
+    if not wallet:
+        raise HTTPException(400, "no_wallet")
+
+    bal = get_hl_balance(wallet.address)
+    equity = bal.get("equity", 0.0)
+    if equity < 5.0:
+        raise HTTPException(400, "insufficient_balance")
+
+    # Per-trader settings → fallback to default
+    trader = db.query(Trader).filter(Trader.id == signal.trader_id).first()
+    settings = None
+    if trader:
+        settings = (
+            db.query(CopySetting)
+            .filter(CopySetting.user_id == current_user.id, CopySetting.trader_id == trader.id)
+            .first()
+        )
+    if not settings:
+        settings = (
+            db.query(CopySetting)
+            .filter(CopySetting.user_id == current_user.id, CopySetting.trader_id.is_(None))
+            .first()
+        )
+
+    leverage = float(settings.leverage) if settings else 8.0
+    if settings and settings.size_type == "fixed_usd":
+        usd_alloc = min(settings.size_value, equity * 0.9)
+    else:
+        pct = (settings.size_value if settings else 10.0) / 100.0
+        usd_alloc = equity * pct
+    usd_alloc = max(usd_alloc, 10.0)
+
+    if equity < usd_alloc:
+        raise HTTPException(400, "insufficient_balance")
+
+    # Fetch current price
+    coin = signal.ticker
+    try:
+        mid = float(
+            _req.post("https://api.hyperliquid.xyz/info", json={"type": "allMids"}, timeout=5)
+            .json().get(coin, 0)
+        )
+    except Exception:
+        mid = 0.0
+    if not mid:
+        raise HTTPException(503, "Price unavailable for this asset")
+
+    # sz_decimals
+    try:
+        sz_decimals = {
+            a["name"]: a.get("szDecimals", 2)
+            for a in _req.post(
+                "https://api.hyperliquid.xyz/info", json={"type": "meta"}, timeout=5
+            ).json().get("universe", [])
+        }.get(coin, 2)
+    except Exception:
+        sz_decimals = 2
+
+    is_counter = body.side == "counter"
+    is_buy = (signal.direction != "long") if is_counter else (signal.direction == "long")
+    effective_direction = "long" if is_buy else "short"
+
+    qty = round((usd_alloc * leverage) / mid, sz_decimals)
+    if qty <= 0:
+        raise HTTPException(400, "Trade size too small")
+
+    slip = 50 / 10_000
+    price = round(mid * (1 + slip) if is_buy else mid * (1 - slip), 6)
+
+    pk = decrypt_key(wallet.encrypted_private_key)
+    try:
+        from hyperliquid.exchange import Exchange
+        import eth_account
+        ex = Exchange(wallet=eth_account.Account.from_key(pk), base_url="https://api.hyperliquid.xyz")
+        is_cross = (settings.margin_mode == "cross") if settings else True
+        ex.update_leverage(int(leverage), coin, is_cross=is_cross)
+    except Exception as e:
+        log.warning(f"Set leverage failed: {e}")
+
+    result = execute_copy_trade(private_key=pk, coin=coin, is_buy=is_buy, size=qty, price=price)
+
+    filled, avg_px = False, 0.0
+    try:
+        for st in result.get("response", {}).get("data", {}).get("statuses", []):
+            if "filled" in st:
+                filled, avg_px = True, float(st["filled"].get("avgPx", 0))
+                break
+            if "resting" in st:
+                filled = True; break
+            if "error" in st:
+                raise HTTPException(400, f"Order failed: {st['error']}")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    if not filled:
+        raise HTTPException(500, "Order was not filled")
+
+    fill_price = avg_px if avg_px > 0 else mid
+
+    trade = TradeModel(
+        user_id=current_user.id,
+        signal_id=signal.id,
+        trader_username=trader.username if trader else None,
+        ticker=coin,
+        direction=effective_direction,
+        entry_price=fill_price,
+        size_usd=usd_alloc,
+        size_qty=qty,
+        leverage=leverage,
+        status="open",
+        source="counter" if is_counter else "copy",
+    )
+    db.add(trade)
+    db.commit()
+
+    return SignalTradeResponse(
+        status="filled", direction=effective_direction, ticker=coin,
+        entry_price=fill_price, size_usd=usd_alloc, size_qty=qty,
     )
