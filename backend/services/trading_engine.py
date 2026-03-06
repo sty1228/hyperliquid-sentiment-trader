@@ -251,7 +251,14 @@ def _execute_for_user(db, user_id, sig, coin, mid, sz_decimals, is_counter: bool
     effective_direction = ("short" if is_buy is False else "long")
 
     slip = SLIPPAGE_BPS / 10_000
-    price = round(mid * (1 + slip) if is_buy else mid * (1 - slip), 6)
+    
+    raw_price = mid * (1 + slip) if is_buy else mid * (1 - slip)
+    if raw_price >= 1000:
+        price = round(raw_price, 1)
+    elif raw_price >= 10:
+        price = round(raw_price, 2)
+    else:
+        price = round(raw_price, 4)
 
     pk = decrypt_key(wallet.encrypted_private_key)
     is_cross = (settings.margin_mode == "cross") if settings else True
@@ -353,7 +360,13 @@ def _close_trade(db, trade, wallet, mid, reason):
         pk = decrypt_key(wallet.encrypted_private_key)
         is_buy = trade.direction == "short"
         slip = SLIPPAGE_BPS / 10_000
-        price = round(mid * (1 + slip) if is_buy else mid * (1 - slip), 6)
+        raw_price = mid * (1 + slip) if is_buy else mid * (1 - slip)
+        if raw_price >= 1000:
+            price = round(raw_price, 1)
+        elif raw_price >= 10:
+            price = round(raw_price, 2)
+        else:
+            price = round(raw_price, 4)
         result = execute_copy_trade(
             private_key=pk, coin=trade.ticker, is_buy=is_buy,
             size=trade.size_qty, price=price, reduce_only=True,
