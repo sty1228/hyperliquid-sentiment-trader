@@ -212,6 +212,10 @@ def _compute_radar(
 
 # ── Helpers ──────────────────────────────────────────────
 
+def _clamp(v: float, lo: float = 0, hi: float = 100) -> int:
+    return int(max(lo, min(hi, v)))
+
+
 def _get_trader_or_404(db: Session, x_handle: str) -> Trader:
     t = db.query(Trader).filter(Trader.username == x_handle).first()
     if not t:
@@ -219,11 +223,14 @@ def _get_trader_or_404(db: Session, x_handle: str) -> Trader:
     return t
 
 
-def _sanitize_pct(v: float | None, cap: float = 200.0) -> float:
+# ★ Cap must match PCT_SANITY_CAP=500 in bybit_price_tracker.py
+PCT_SANITY_CAP = 500.0
+
+def _sanitize_pct(v: float | None, cap: float = PCT_SANITY_CAP) -> float:
     """
     Spot prices cannot realistically move ±500% in any reasonable window.
     Values outside this range indicate a bad entry_price in the DB.
-    Return 0.0 so the UI shows '-' instead of a nonsense number.
+    Return 0.0 so the UI shows a neutral value instead of a nonsense number.
     """
     if v is None:
         return 0.0
