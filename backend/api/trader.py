@@ -58,6 +58,7 @@ class SignalItemResponse(BaseModel):
     retweetsCount: int = 0
     likesCount: int = 0
     change_since_tweet: float = 0.0
+    tweet_image_url: str | None = None  # ★ NEW
 
 
 class UserSignalResponse(BaseModel):
@@ -92,7 +93,7 @@ class TraderProfileResponse(BaseModel):
     # Follow state (requires auth, else false)
     is_followed: bool = False
     is_copy_trading: bool = False
-    is_counter_trading: bool = False  # ★ NEW
+    is_counter_trading: bool = False
     # Best / worst signal
     best_signal: BestWorstSignal | None = None
     worst_signal: BestWorstSignal | None = None
@@ -101,7 +102,6 @@ class TraderProfileResponse(BaseModel):
 # ── Radar Computation ────────────────────────────────────
 
 def _clamp(v: float, lo: float = 0, hi: float = 100) -> int:
-    """Clamp value to [lo, hi] and return int."""
     return int(max(lo, min(hi, v)))
 
 
@@ -109,19 +109,6 @@ def _compute_radar(
     signals: list[Signal],
     all_stats: dict[str, TraderStats | None],
 ) -> RadarData:
-    """
-    Compute 8-dimension radar scores (0-100 each).
-
-    Dimensions:
-    1. Accuracy   — 30d win_rate (long-term)
-    2. Win Rate   — 7d win_rate (current form)
-    3. R/R Ratio  — avg win% / avg loss%, capped at 3x = 100
-    4. Consistency — std dev of win_rate across 24h/7d/30d windows
-    5. Timing     — direction-match ratio, exponential time-decay weighting
-    6. Transparency— entry(25) + TP(25) + SL(25) + meaningful tweet text(25)
-    7. Engagement  — log-scale (likes + retweets×2 + replies×1.5), normalized
-    8. Track Record— min(signals/100,1)×50 + min(active_days/90,1)×50
-    """
     s24 = all_stats.get("24h")
     s7 = all_stats.get("7d")
     s30 = all_stats.get("30d")
@@ -247,7 +234,6 @@ def _time_ago(dt: datetime | None) -> str:
 def _best_worst(
     signals: list[Signal],
 ) -> tuple[BestWorstSignal | None, BestWorstSignal | None]:
-    """Find best and worst signals by pct_change."""
     valid = [s for s in signals if s.pct_change is not None]
     if not valid:
         return None, None
@@ -256,7 +242,7 @@ def _best_worst(
         dt = s.tweet_time or s.created_at
         return BestWorstSignal(
             token=s.ticker,
-            pnl=round(s.pct_change, 1),  # ★ fixed typo: pct_chantge → pct_change
+            pnl=round(s.pct_change, 1),
             date=dt.strftime("%b %d") if dt else "",
         )
 
@@ -275,13 +261,8 @@ def get_trader_profile(
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user),
 ):
-    """
-    Trader profile page: basic info + stats + radar + follow state.
-    Auth is optional — if JWT present, returns is_followed / is_copy_trading / is_counter_trading.
-    """
     trader = _get_trader_or_404(db, x_handle)
 
-    # All 3 windows for radar consistency calculation
     all_stats: dict[str, TraderStats | None] = {}
     for w in ["24h", "7d", "30d"]:
         all_stats[w] = (
@@ -291,7 +272,6 @@ def get_trader_profile(
         )
     stats = all_stats.get(window)
 
-    # Signals for radar + best/worst (cap at 500 for perf)
     signals = (
         db.query(Signal)
         .filter(Signal.trader_id == trader.id)
@@ -303,10 +283,9 @@ def get_trader_profile(
     radar = _compute_radar(signals, all_stats)
     best, worst = _best_worst(signals)
 
-    # Follow state (requires auth)
     is_followed = False
     is_copy = False
-    is_counter = False  # ★ NEW
+    is_counter = False
     if current_user:
         follow = (
             db.query(Follow)
@@ -319,7 +298,7 @@ def get_trader_profile(
         if follow:
             is_followed = True
             is_copy = follow.is_copy_trading
-            is_counter = follow.is_counter_trading  # ★ NEW
+            is_counter = follow.is_counter_trading
 
     return TraderProfileResponse(
         id=trader.id,
@@ -343,7 +322,7 @@ def get_trader_profile(
         radar=radar,
         is_followed=is_followed,
         is_copy_trading=is_copy,
-        is_counter_trading=is_counter,  # ★ NEW
+        is_counter_trading=is_counter,
         best_signal=best,
         worst_signal=worst,
     )
@@ -401,6 +380,7 @@ def get_user_signals(
             retweetsCount=s.retweets,
             likesCount=s.likes,
             change_since_tweet=s.pct_change or 0.0,
+            tweet_image_url=s.tweet_image_url,  # ★ NEW
         ))
 
     return UserSignalResponse(
