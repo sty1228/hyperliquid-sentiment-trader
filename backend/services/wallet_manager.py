@@ -501,7 +501,7 @@ def execute_copy_trade(
     exchange = Exchange(wallet=acct, base_url="https://api.hyperliquid.xyz")
 
     result = exchange.order(
-        coin=coin,
+        name=coin,
         is_buy=is_buy,
         sz=size,
         limit_px=price,
