@@ -219,6 +219,17 @@ def _get_trader_or_404(db: Session, x_handle: str) -> Trader:
     return t
 
 
+def _sanitize_pct(v: float | None, cap: float = 500.0) -> float:
+    """
+    Spot prices cannot realistically move ±500% in any reasonable window.
+    Values outside this range indicate a bad entry_price in the DB.
+    Return 0.0 so the UI shows '-' instead of a nonsense number.
+    """
+    if v is None:
+        return 0.0
+    return v if abs(v) <= cap else 0.0
+
+
 def _time_ago(dt: datetime | None) -> str:
     if not dt:
         return ""
@@ -379,7 +390,7 @@ def get_user_signals(
             commentsCount=s.replies,
             retweetsCount=s.retweets,
             likesCount=s.likes,
-            change_since_tweet=s.pct_change or 0.0,
+            change_since_tweet=_sanitize_pct(s.pct_change),
             tweet_image_url=s.tweet_image_url,  # ★ NEW
         ))
 

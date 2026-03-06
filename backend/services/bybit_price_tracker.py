@@ -1,4 +1,3 @@
-
 import os
 import re
 import time
@@ -30,8 +29,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 DB_PATH = get_db_path(env("DB_PATH", os.path.join(DATA_DIR, "crypto_tracker.db")))
 
-
-MAX_BACKFILL_DAYS = int(env("MAX_BACKFILL_DAYS", "14")) 
+MAX_BACKFILL_DAYS = int(env("MAX_BACKFILL_DAYS", "14"))
 ENTRY_FALLBACK_CURRENT = env("ENTRY_FALLBACK_CURRENT", "true").lower() in ("1", "true", "yes", "y")
 SLEEP_S = float(env("API_SLEEP_SECONDS", "0.02"))
 
@@ -39,22 +37,24 @@ BYBIT_API_KEY = env("BYBIT_API_KEY", "")
 BYBIT_SECRET = env("BYBIT_SECRET", "")
 BYBIT_TESTNET = env("BYBIT_TESTNET", "false").lower() in ("1", "true", "yes", "y")
 
+# ★ Sanity cap: spot price cannot realistically move more than ±500%
+# Values outside this range mean entry_price is bad data (wrong timestamp,
+# fallback-to-current on a stale entry, etc.)
+PCT_SANITY_CAP = 500.0
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def _map_price_source(name_raw: str) -> str:
-
     n = (name_raw or "").strip().lower()
     if n in ("bybit",):
         return "bybit"
     if n in ("hyperliquid", "hl", "hyperliquid_sdk"):
         return "hyperliquid"
-    # default
     return "bybit"
 
 
 def _utc_from_any(value) -> datetime:
-
     try:
         dt = pd.to_datetime(value, utc=True)
         return dt.to_pydatetime()
@@ -63,7 +63,6 @@ def _utc_from_any(value) -> datetime:
 
 
 def _get_price_number(payload: Any) -> Optional[float]:
-
     if payload is None:
         return None
     if isinstance(payload, (int, float)):
@@ -79,20 +78,9 @@ def _get_price_number(payload: Any) -> Optional[float]:
 
 
 class PriceTracker:
-    """
-
-      1) read data/tweets_processed_complete.csv
-      2) keep supported symbols only
-      3) entry_price from 1m open near tweet_time (fallback current if enabled)
-      4) refresh current_price and percent change to now
-      5) compute fixed-horizon metrics (e.g., 24h)
-      6) print leaderboard
-    """
-
     SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}(USDT|USDC|USD)?$")
 
     def __init__(self, database: Optional[EnhancedPriceDatabase] = None, *, auto_schedule: bool = False):
-
         src_env = env("PRICE_SOURCE", "bybit")
         src_name = _map_price_source(src_env)
         if src_name == "bybit":
@@ -123,7 +111,6 @@ class PriceTracker:
         if auto_schedule:
             self.setup_scheduler()
 
-
     def setup_scheduler(self) -> None:
         schedule.every(5).minutes.do(self.update_all_prices)
         schedule.every(1).hours.do(self.cleanup_and_analyze)
@@ -139,7 +126,6 @@ class PriceTracker:
         threading.Thread(target=run_scheduler, daemon=True).start()
         logging.info("Background scheduler started")
 
- 
     def _csv_path(self) -> str:
         return os.path.join(DATA_DIR, "tweets_processed_complete.csv")
 
@@ -173,7 +159,6 @@ class PriceTracker:
 
         logging.info(f"Processing {len(df)} tweets from CSV")
         processed, skipped = 0, 0
-
         now_utc = datetime.now(timezone.utc)
 
         for _, row in df.iterrows():
@@ -246,7 +231,6 @@ class PriceTracker:
 
         logging.info(f"Processing complete: {processed} added, {skipped} skipped")
 
-    # Price updates
     def update_all_prices(self) -> None:
         tweets_df = self.database.get_tweets_for_price_update()
         if tweets_df.empty:
@@ -285,30 +269,35 @@ class PriceTracker:
             entry = tweet["entry_price"]
             if entry is None:
                 continue
+
+            # ★ Compute pct_change with sanity cap
             try:
                 pct = ((float(cur_price) - float(entry)) / float(entry)) * 100.0
+
+                # Spot price cannot realistically move ±500% in any window.
+                # Values outside this range mean entry_price is bad data
+                # (wrong timestamp, fallback-to-current on stale entry, etc.)
+                if abs(pct) > PCT_SANITY_CAP:
+                    logging.warning(
+                        f"Extreme pct_change={pct:.1f}% for {tk} "
+                        f"(entry={entry}, current={cur_price}) — discarding"
+                    )
+                    pct = None
             except Exception:
                 pct = None
+
             if self.database.update_tweet_price(int(tweet["id"]), cur_price, pct):
                 updated += 1
 
         logging.info(f"Updated prices for {updated} tweets")
 
-
-    # metrics
-
     def _choose_interval_fallback(self, horizon_h: int) -> str:
-
         H = int(horizon_h)
-        if H <= 6:
-            return "1"    # 1m
-        if H <= 24:
-            return "3"    # 3m
-        if H <= 72:
-            return "5"    # 5m
-        if H <= 168:
-            return "15"   # 15m
-        return "60"       # 1h
+        if H <= 6:   return "1"
+        if H <= 24:  return "3"
+        if H <= 72:  return "5"
+        if H <= 168: return "15"
+        return "60"
 
     def _compute_horizon_metrics_for_tweet(self, tweet_row, horizons=(24,), benchmark="BTCUSDT"):
         import math
@@ -349,18 +338,25 @@ class PriceTracker:
                 continue
 
             try:
-                highs = [float(r[2]) for r in rows]
-                lows  = [float(r[3]) for r in rows]
-                closes= [float(r[4]) for r in rows]
+                highs  = [float(r[2]) for r in rows]
+                lows   = [float(r[3]) for r in rows]
+                closes = [float(r[4]) for r in rows]
             except Exception:
                 continue
             if not closes:
                 continue
 
-            close_H = closes[-1]
+            close_H   = closes[-1]
             ret_close = (close_H - entry) / entry
             ret_high  = ((max(highs) - entry) / entry) if highs else None
             ret_low   = ((min(lows)  - entry) / entry) if lows  else None
+
+            # ★ sanity check on horizon returns too (stored as ratio, so cap at 5.0 = 500%)
+            if abs(ret_close) > PCT_SANITY_CAP / 100.0:
+                logging.warning(
+                    f"Extreme horizon ret_close={ret_close*100:.1f}% for {symbol} — discarding"
+                )
+                continue
 
             ret_close_alpha = None
             try:
@@ -371,8 +367,10 @@ class PriceTracker:
             except Exception:
                 pass
 
-            self.database.upsert_horizon_perf(int(tweet_row["id"]), int(H),
-                                              ret_close, ret_high, ret_low, ret_close_alpha)
+            self.database.upsert_horizon_perf(
+                int(tweet_row["id"]), int(H),
+                ret_close, ret_high, ret_low, ret_close_alpha
+            )
             time.sleep(SLEEP_S)
 
     def update_horizon_metrics(self, horizons=(24,)):
@@ -409,9 +407,9 @@ class PriceTracker:
 
         rc_pct = rc * 100.0
         median = rc_pct.median()
-        p25 = rc_pct.quantile(0.25)
-        p75 = rc_pct.quantile(0.75)
-        mean = rc_pct.mean()
+        p25    = rc_pct.quantile(0.25)
+        p75    = rc_pct.quantile(0.75)
+        mean   = rc_pct.mean()
 
         print(f"\n{'='*80}")
         print(f"FIXED-HORIZON REPORT  (H = {horizon_h}h)")
@@ -419,15 +417,15 @@ class PriceTracker:
         print(f"Samples: {n}  |  Hit: {pos}  Miss: {neg}  Zero(|Δ|≤{eps*100:.2f}%): {zer}")
         print(f"Median: {median:+.3f}%  Mean: {mean:+.3f}%  P25: {p25:+.3f}%  P75: {p75:+.3f}%")
 
-        top_win = df.sort_values("ret_close", ascending=False).head(topn)
-        top_lose= df.sort_values("ret_close", ascending=True).head(topn)
+        top_win  = df.sort_values("ret_close", ascending=False).head(topn)
+        top_lose = df.sort_values("ret_close", ascending=True).head(topn)
 
         def _print_rows(name, rows):
             print(f"\n{name}")
             for _, r in rows.iterrows():
-                rc_ = float(r["ret_close"]) * 100.0
-                mfe = float(r["ret_high"])  * 100.0 if pd.notna(r["ret_high"]) else float('nan')
-                mae = float(r["ret_low"])   * 100.0 if pd.notna(r["ret_low"])  else float('nan')
+                rc_  = float(r["ret_close"]) * 100.0
+                mfe  = float(r["ret_high"])  * 100.0 if pd.notna(r["ret_high"])  else float("nan")
+                mae  = float(r["ret_low"])   * 100.0 if pd.notna(r["ret_low"])   else float("nan")
                 alpha = r["ret_close_alpha"]
                 alpha_s = "" if pd.isna(alpha) else f" | alpha={alpha*100:+.3f}%"
                 print(f"@{r['username']} {r['ticker']} {r['sentiment']} | "
@@ -437,13 +435,11 @@ class PriceTracker:
         _print_rows(f"TOP {topn} LOSERS",  top_lose)
         print(f"{'='*80}")
 
-    # leaderboard
-
     def get_user_leaderboard_df(self, hours: int = 168, eps: float = 0.02, min_calls: int = 3):
         import sqlite3
 
-        hours = int(hours)
-        eps = float(eps)
+        hours     = int(hours)
+        eps       = float(eps)
         min_calls = int(min_calls)
 
         with sqlite3.connect(self.database.db_path) as conn:
@@ -456,6 +452,7 @@ class PriceTracker:
                    SUM(CASE WHEN ABS(price_change_percent) <= {eps} THEN 1 ELSE 0 END) AS zero
             FROM tweets
             WHERE price_change_percent IS NOT NULL
+              AND ABS(price_change_percent) <= {PCT_SANITY_CAP}
               AND username IS NOT NULL AND username != ''
               AND datetime(tweet_time) > datetime('now', '-{hours} hours')
             GROUP BY username
@@ -474,7 +471,7 @@ class PriceTracker:
     def print_user_leaderboard(self, hours: int = 168, eps: float = 0.02,
                                topn: int = 20, min_calls: int = 3,
                                save_csv: str | None = None) -> None:
-        df = self.bbget_user_leaderboard_df(hours=hours, eps=eps, min_calls=min_calls)
+        df = self.get_user_leaderboard_df(hours=hours, eps=eps, min_calls=min_calls)
         if df.empty:
             print("No user data available for leaderboard")
             return
@@ -493,16 +490,16 @@ class PriceTracker:
         print(f"USER LEADERBOARD (last {int(hours)}h, eps={float(eps):.2f}%, min_calls={int(min_calls)})")
         print(f"{'='*80}")
         for i, row in df.head(int(topn)).iterrows():
-            uname = row["username"]
-            avg   = float(row["avg_perf"])
-            n     = int(row["tweet_count"])
-            pos   = int(row["positive"])
-            neg   = int(row["negative"])
-            zer   = int(row["zero"])
+            uname    = row["username"]
+            avg      = float(row["avg_perf"])
+            n        = int(row["tweet_count"])
+            pos      = int(row["positive"])
+            neg      = int(row["negative"])
+            zer      = int(row["zero"])
             hit_rate = float(row["hit_rate_%"])
-            print(f"{i:2d}. @{uname:20s} | avg={avg:+.3f}% | N={n:3d} | hit={pos:3d} miss={neg:3d} zero={zer:3d} | hit_rate={hit_rate:5.1f}%")
+            print(f"{i:2d}. @{uname:20s} | avg={avg:+.3f}% | N={n:3d} | "
+                  f"hit={pos:3d} miss={neg:3d} zero={zer:3d} | hit_rate={hit_rate:5.1f}%")
         print(f"{'='*80}")
-
 
     def print_performance_summary(self, hours: int = 24, eps: float = 0.02) -> None:
         print(f"\n{'='*80}")
@@ -562,7 +559,8 @@ class PriceTracker:
                     hours_ago = (now_utc - dt.to_pydatetime()).total_seconds() / 3600.0
                 except Exception:
                     hours_ago = float("nan")
-                print(f"   @{call['username']} - {call['ticker']} {emoji}: {call['price_change_percent']:+.4f}% ({hours_ago:.1f}h ago)")
+                print(f"   @{call['username']} - {call['ticker']} {emoji}: "
+                      f"{call['price_change_percent']:+.4f}% ({hours_ago:.1f}h ago)")
                 try:
                     print(f"     ${float(call['entry_price']):.6f} → ${float(call['current_price']):.6f}")
                 except Exception:
@@ -573,9 +571,6 @@ class PriceTracker:
 
         print(f"{'='*80}")
 
-    # -----------------------
-    # Maintenance
-    # -----------------------
     def cleanup_and_analyze(self) -> None:
         logging.info("Running cleanup and analysis...")
         cleaned = self.database.cleanup_old_data(days_old=7)
@@ -591,11 +586,10 @@ class PriceTracker:
             else:
                 avg_performance = float("nan")
             total_tweets = int(summary_df["tweet_count"].sum())
-            logging.info(f"24h Performance: {avg_performance:+.4f}% across {total_tweets} tracked tweets")
+            logging.info(
+                f"24h Performance: {avg_performance:+.4f}% across {total_tweets} tracked tweets"
+            )
 
-    # -----------------------
-    # Entrypoints
-    # -----------------------
     def run_once(self) -> None:
         self.process_new_tweets()
         self.update_all_prices()
