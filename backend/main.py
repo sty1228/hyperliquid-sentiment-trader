@@ -24,6 +24,7 @@ from backend.api.deposit import router as deposit_router
 from backend.api.wallet import router as wallet_router
 from backend.api.explore import router as explore_router
 from backend.api.rewards import router as rewards_router
+from backend.api.referral_api import router as referral_router
 
 settings = get_settings()
 
@@ -56,7 +57,7 @@ app.include_router(deposit_router)
 app.include_router(wallet_router)
 app.include_router(explore_router)
 app.include_router(rewards_router)
-
+app.include_router(referral_router)
 
 @app.get("/")
 def root():
