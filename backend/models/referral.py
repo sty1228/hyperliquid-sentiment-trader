@@ -1,7 +1,8 @@
 import uuid
-from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey
+from sqlalchemy import Column, String, Boolean, DateTime, Text, ForeignKey
 from sqlalchemy.sql import func
 from backend.database import Base
+
 
 class Referral(Base):
     __tablename__ = "referrals"
@@ -9,6 +10,7 @@ class Referral(Base):
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False, unique=True)
     code = Column(String(20), nullable=False, unique=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
 
 class ReferralUse(Base):
     __tablename__ = "referral_uses"
@@ -19,9 +21,11 @@ class ReferralUse(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     is_active = Column(Boolean, default=False)
 
+
 class AffiliateApplication(Base):
     __tablename__ = "affiliate_applications"
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False, unique=True)
-    status = Column(String(20), default="pending")
+    status = Column(String(20), default="pending")  # pending | approved | rejected
+    notes = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -39,13 +39,18 @@ log = logging.getLogger("trading_engine")
 # ═══════════════════════════════════════════════════════════════
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 
-SIGNAL_MAX_AGE_SEC = 300        # ignore signals older than 5 min
-SLIPPAGE_BPS = 50               # 0.5 % slippage for IOC limit
-MIN_TRADE_USD = 10.0            # minimum position notional
-LOOP_SLEEP_SEC = 15             # main loop cadence
-BALANCE_SYNC_INTERVAL = 300     # 5 min
-STATS_RECOMPUTE_INTERVAL = 600  # 10 min
-META_REFRESH_INTERVAL = 3600    # 1 hour
+SIGNAL_MAX_AGE_SEC     = 300        # ignore signals older than 5 min
+SLIPPAGE_BPS           = 50         # 0.5 % slippage for IOC limit
+MIN_TRADE_USD          = 10.0       # minimum position notional
+LOOP_SLEEP_SEC         = 15         # main loop cadence
+BALANCE_SYNC_INTERVAL  = 300        # 5 min
+STATS_RECOMPUTE_INTERVAL = 600      # 10 min
+META_REFRESH_INTERVAL  = 3600       # 1 hour
+
+# ★ Referral / free-trade config (must match referral_api.py)
+FREE_COPY_TRADES_LIMIT  = 10
+BUILDER_BPS_DEFAULT     = int(os.environ.get("HL_DEFAULT_BUILDER_BPS", "10"))
+BUILDER_ADDRESS         = os.environ.get("HL_BUILDER_ADDRESS", "")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -79,9 +84,9 @@ def hl_parse_positions(state: dict) -> dict[str, dict]:
         coin = p.get("coin")
         if coin:
             out[coin] = {
-                "szi": float(p.get("szi", "0")),
+                "szi":     float(p.get("szi", "0")),
                 "entryPx": float(p.get("entryPx", "0")),
-                "upnl": float(p.get("unrealizedPnl", "0")),
+                "upnl":    float(p.get("unrealizedPnl", "0")),
             }
     return out
 
@@ -117,6 +122,44 @@ def _parse_order_result(result: dict) -> tuple[bool, float]:
     return False, 0.0
 
 
+def _round_price(raw: float) -> float:
+    """Tiered price rounding to satisfy HL tick size requirements."""
+    if raw >= 10000:
+        return round(raw)
+    elif raw >= 100:
+        return round(raw, 1)
+    elif raw >= 1:
+        return round(raw, 2)
+    else:
+        return round(raw, 4)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ★ REFERRAL HELPERS (inline — avoids circular import)
+# ═══════════════════════════════════════════════════════════════
+
+def _get_free_trades_remaining(db: Session, user_id: str) -> int:
+    """How many fee-free copy trades this user still has."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not getattr(user, "referral_code_used", None):
+        return 0
+    used = getattr(user, "free_copy_trades_used", 0) or 0
+    return max(0, FREE_COPY_TRADES_LIMIT - used)
+
+
+def _consume_free_trade(db: Session, user_id: str) -> bool:
+    """Consume one free trade slot. Returns True if a slot was consumed."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not getattr(user, "referral_code_used", None):
+        return False
+    used = getattr(user, "free_copy_trades_used", 0) or 0
+    if used >= FREE_COPY_TRADES_LIMIT:
+        return False
+    user.free_copy_trades_used = used + 1
+    # Note: caller is responsible for db.commit() or it will be batched
+    return True
+
+
 # ═══════════════════════════════════════════════════════════════
 #  1. SIGNAL PROCESSING → COPY TRADE EXECUTION
 # ═══════════════════════════════════════════════════════════════
@@ -144,7 +187,6 @@ def process_new_signals(db: Session, coins: dict[str, int], mids: dict[str, floa
     db.commit()
 
 
-
 def _dispatch_signal(db: Session, sig: Signal, coins: dict, mids: dict):
     coin = sig.ticker
     if coin not in coins:
@@ -169,7 +211,7 @@ def _dispatch_signal(db: Session, sig: Signal, coins: dict, mids: dict):
     if not followers:
         return
 
-    copy_count = sum(1 for f in followers if f.is_copy_trading)
+    copy_count    = sum(1 for f in followers if f.is_copy_trading)
     counter_count = sum(1 for f in followers if f.is_counter_trading)
     log.info(
         f"  → {coin} {sig.direction} (trader {sig.trader_id[:8]}…) "
@@ -180,17 +222,25 @@ def _dispatch_signal(db: Session, sig: Signal, coins: dict, mids: dict):
         try:
             _execute_for_user(
                 db, fol.user_id, sig, coin, mid, coins[coin],
-                is_counter=fol.is_counter_trading,  # ★ NEW
+                is_counter=fol.is_counter_trading,
             )
         except Exception as e:
             log.error(f"  ✗ user {fol.user_id[:8]}… : {e}")
 
 
-
-def _execute_for_user(db, user_id, sig, coin, mid, sz_decimals, is_counter: bool = False):
+def _execute_for_user(
+    db: Session,
+    user_id: str,
+    sig: Signal,
+    coin: str,
+    mid: float,
+    sz_decimals: int,
+    is_counter: bool = False,
+):
     """
-    Execute a copy trade for one user.
-    ★ is_counter=True → flips the trade direction (long→short, short→long).
+    Execute a copy (or counter) trade for one user.
+    ★ is_counter=True  → flips direction (long→short, short→long).
+    ★ Referral boost   → first FREE_COPY_TRADES_LIMIT trades are fee-free.
     """
     wallet = (
         db.query(UserWallet)
@@ -200,7 +250,7 @@ def _execute_for_user(db, user_id, sig, coin, mid, sz_decimals, is_counter: bool
     if not wallet:
         return
 
-    bal = get_hl_balance(wallet.address)
+    bal    = get_hl_balance(wallet.address)
     equity = bal.get("equity", 0.0)
     if equity < 5:
         return
@@ -210,10 +260,14 @@ def _execute_for_user(db, user_id, sig, coin, mid, sz_decimals, is_counter: bool
         .filter(CopySetting.user_id == user_id, CopySetting.trader_id.is_(None))
         .first()
     )
-    leverage = settings.leverage if settings else 8.0
-    max_pos = settings.max_positions if settings else 10
+    leverage  = settings.leverage if settings else 8.0
+    max_pos   = settings.max_positions if settings else 10
 
-    open_count = db.query(Trade).filter(Trade.user_id == user_id, Trade.status == "open").count()
+    open_count = (
+        db.query(Trade)
+        .filter(Trade.user_id == user_id, Trade.status == "open")
+        .count()
+    )
     if open_count >= max_pos:
         return
 
@@ -233,66 +287,100 @@ def _execute_for_user(db, user_id, sig, coin, mid, sz_decimals, is_counter: bool
     if existing_pos:
         return
 
+    # ── Size calculation ──
     if settings and settings.size_type == "fixed_usd":
         usd_alloc = min(settings.size_value, equity * 0.9)
     else:
-        pct = (settings.size_value if settings else 10.0) / 100.0
+        pct       = (settings.size_value if settings else 10.0) / 100.0
         usd_alloc = equity * pct
     usd_alloc = max(usd_alloc, MIN_TRADE_USD)
 
     notional = usd_alloc * leverage
-    qty = round(notional / mid, sz_decimals)
+    qty      = round(notional / mid, sz_decimals)
     if qty <= 0:
         return
 
-    # ★ Determine direction — flip if counter trading
-    original_is_buy = sig.direction == "long"
-    is_buy = (not original_is_buy) if is_counter else original_is_buy
-    effective_direction = ("short" if is_buy is False else "long")
+    # ── Direction (flip if counter) ──
+    original_is_buy    = sig.direction == "long"
+    is_buy             = (not original_is_buy) if is_counter else original_is_buy
+    effective_direction = "long" if is_buy else "short"
 
-    slip = SLIPPAGE_BPS / 10_000
-    
+    # ── Price with slippage ──
+    slip      = SLIPPAGE_BPS / 10_000
     raw_price = mid * (1 + slip) if is_buy else mid * (1 - slip)
-    if raw_price >= 10000:
-        price = round(raw_price)        # BTC 等高价币，整数
-    elif raw_price >= 100:
-        price = round(raw_price, 1)     # SOL/ETH 等
-    elif raw_price >= 1:
-        price = round(raw_price, 2)
-    else:
-        price = round(raw_price, 4)     # 低价 meme 币
+    price     = _round_price(raw_price)
 
-    pk = decrypt_key(wallet.encrypted_private_key)
+    # ── ★ Referral: check free-trade eligibility ──
+    free_trades_left = _get_free_trades_remaining(db, user_id)
+    is_fee_free      = free_trades_left > 0
+
+    # builder_bps = 0 means no fee charged to the user
+    builder_bps = 0 if is_fee_free else BUILDER_BPS_DEFAULT
+
+    # ── Execute on HL ──
+    pk       = decrypt_key(wallet.encrypted_private_key)
     is_cross = (settings.margin_mode == "cross") if settings else True
     _hl_set_leverage(pk, coin, int(leverage), cross=is_cross)
 
-    result = execute_copy_trade(private_key=pk, coin=coin, is_buy=is_buy, size=qty, price=price)
+    result         = execute_copy_trade(
+        private_key=pk,
+        coin=coin,
+        is_buy=is_buy,
+        size=qty,
+        price=price,
+        builder_bps=builder_bps,          # ★ 0 for free trades
+    )
     filled, avg_px = _parse_order_result(result)
     if not filled:
         log.warning(f"  ✗ order not filled user {user_id[:8]}… {coin}")
         return
 
     fill_price = avg_px if avg_px > 0 else mid
-    trader = db.query(Trader).filter(Trader.id == sig.trader_id).first()
 
-    trade = Trade(
-        user_id=user_id,
-        signal_id=sig.id,
-        trader_username=trader.username if trader else None,
-        ticker=coin,
-        direction=effective_direction,          # ★ actual executed direction
-        entry_price=fill_price,
-        size_usd=usd_alloc,
-        size_qty=qty,
-        leverage=leverage,
-        status="open",
-        source="counter" if is_counter else "copy",  # ★ distinguishable in trade history
+    # ── ★ Calculate fee (for affiliate revenue share tracking) ──
+    size_usd = qty * fill_price
+    fee_usd  = 0.0 if is_fee_free else round(size_usd * builder_bps / 10_000, 6)
+
+    # ── Persist trade ──
+    trader = db.query(Trader).filter(Trader.id == sig.trader_id).first()
+    trade  = Trade(
+        user_id        = user_id,
+        signal_id      = sig.id,
+        trader_username= trader.username if trader else None,
+        ticker         = coin,
+        direction      = effective_direction,
+        entry_price    = fill_price,
+        size_usd       = usd_alloc,
+        size_qty       = qty,
+        leverage       = leverage,
+        status         = "open",
+        source         = "counter" if is_counter else "copy",
+        fee_usd        = fee_usd,        # ★ stored for affiliate revenue share
+        is_fee_free    = is_fee_free,    # ★ flag for UI / audit
     )
     db.add(trade)
+
+    # ── ★ Consume free trade slot after successful fill ──
+    if is_fee_free:
+        _consume_free_trade(db, user_id)
+        log.info(
+            f"  🎁 FREE trade used — user {user_id[:8]}… "
+            f"({FREE_COPY_TRADES_LIMIT - free_trades_left + 1}/{FREE_COPY_TRADES_LIMIT})"
+        )
+
     log.info(
         f"  ✅ {'COUNTER' if is_counter else 'COPY'} {effective_direction.upper()} {coin} "
-        f"user {user_id[:8]}… qty={qty} @ {fill_price:.2f}"
+        f"user {user_id[:8]}… qty={qty} @ {fill_price:.2f} "
+        f"fee={'FREE' if is_fee_free else f'${fee_usd:.4f}'}"
     )
+
+    # ★ Accrue affiliate revenue share + update weekly points
+    try:
+        from backend.api.rewards import on_trade_placed
+        on_trade_placed(db, user_id, fee_usd)
+    except Exception as e:
+        log.warning(f"  on_trade_placed hook failed: {e}")
+
 
 # ═══════════════════════════════════════════════════════════════
 #  2. POSITION MANAGEMENT  (PnL + TP/SL)
@@ -313,7 +401,7 @@ def update_positions(db: Session, mids: dict[str, float]):
     db.commit()
 
 
-def _manage_user_positions(db, user_id, trades, mids):
+def _manage_user_positions(db: Session, user_id: str, trades: list, mids: dict):
     wallet = (
         db.query(UserWallet)
         .filter(UserWallet.user_id == user_id, UserWallet.is_active.is_(True))
@@ -321,8 +409,8 @@ def _manage_user_positions(db, user_id, trades, mids):
     )
     if not wallet:
         return
-    state = hl_clearinghouse(wallet.address)
-    hl_pos = hl_parse_positions(state)
+    state    = hl_clearinghouse(wallet.address)
+    hl_pos   = hl_parse_positions(state)
     settings = (
         db.query(CopySetting)
         .filter(CopySetting.user_id == user_id, CopySetting.trader_id.is_(None))
@@ -330,6 +418,7 @@ def _manage_user_positions(db, user_id, trades, mids):
     )
     tp_pct = settings.tp_value if settings else 15.0
     sl_pct = settings.sl_value if settings else 50.0
+
     for trade in trades:
         mid = mids.get(trade.ticker)
         if not mid:
@@ -338,16 +427,21 @@ def _manage_user_positions(db, user_id, trades, mids):
             pnl_pct = (mid - trade.entry_price) / trade.entry_price * 100
         else:
             pnl_pct = (trade.entry_price - mid) / trade.entry_price * 100
-        pnl_usd = pnl_pct / 100 * trade.size_usd * trade.leverage
-        trade.pnl_pct = round(pnl_pct, 2)
-        trade.pnl_usd = round(pnl_usd, 2)
+        pnl_usd        = pnl_pct / 100 * trade.size_usd * trade.leverage
+        trade.pnl_pct  = round(pnl_pct, 2)
+        trade.pnl_usd  = round(pnl_usd, 2)
+
         hp = hl_pos.get(trade.ticker)
         if not hp or abs(hp["szi"]) < 1e-10:
-            trade.status = "closed"
-            trade.exit_price = mid
+            trade.status    = "closed"
+            trade.exit_price= mid
             trade.closed_at = datetime.now(timezone.utc)
-            log.info(f"  ↩ {trade.ticker} closed externally, user {user_id[:8]}… PnL ${trade.pnl_usd:.2f}")
+            log.info(
+                f"  ↩ {trade.ticker} closed externally, "
+                f"user {user_id[:8]}… PnL ${trade.pnl_usd:.2f}"
+            )
             continue
+
         reason = ""
         if pnl_pct >= tp_pct:
             reason = "TP"
@@ -357,51 +451,48 @@ def _manage_user_positions(db, user_id, trades, mids):
             _close_trade(db, trade, wallet, mid, reason)
 
 
-def _close_trade(db, trade, wallet, mid, reason):
+def _close_trade(db: Session, trade: Trade, wallet: UserWallet, mid: float, reason: str):
     try:
-        pk = decrypt_key(wallet.encrypted_private_key)
-        is_buy = trade.direction == "short"
-        slip = SLIPPAGE_BPS / 10_000
-        raw_price = mid * (1 + slip) if is_buy else mid * (1 - slip)
-        if raw_price >= 10000:
-            price = round(raw_price)        # BTC 等高价币，整数
-        elif raw_price >= 100:
-            price = round(raw_price, 1)     # SOL/ETH 等
-        elif raw_price >= 1:
-            price = round(raw_price, 2)
-        else:
-            price = round(raw_price, 4)     # 低价 meme 币
-        result = execute_copy_trade(
+        pk       = decrypt_key(wallet.encrypted_private_key)
+        is_buy   = trade.direction == "short"
+        slip     = SLIPPAGE_BPS / 10_000
+        raw_price= mid * (1 + slip) if is_buy else mid * (1 - slip)
+        price    = _round_price(raw_price)
+
+        result         = execute_copy_trade(
             private_key=pk, coin=trade.ticker, is_buy=is_buy,
             size=trade.size_qty, price=price, reduce_only=True,
         )
         filled, avg_px = _parse_order_result(result)
-        exit_px = avg_px if (filled and avg_px > 0) else mid
-        trade.status = "closed"
-        trade.exit_price = exit_px
+        exit_px        = avg_px if (filled and avg_px > 0) else mid
+
+        trade.status    = "closed"
+        trade.exit_price= exit_px
         trade.closed_at = datetime.now(timezone.utc)
+
         if trade.direction == "long":
             trade.pnl_pct = round((exit_px - trade.entry_price) / trade.entry_price * 100, 2)
         else:
             trade.pnl_pct = round((trade.entry_price - exit_px) / trade.entry_price * 100, 2)
         trade.pnl_usd = round(trade.pnl_pct / 100 * trade.size_usd * trade.leverage, 2)
-        log.info(f"  ✅ CLOSE {trade.ticker} ({reason}) user {trade.user_id[:8]}… PnL {trade.pnl_pct:+.1f}%")
+
+        log.info(
+            f"  ✅ CLOSE {trade.ticker} ({reason}) "
+            f"user {trade.user_id[:8]}… PnL {trade.pnl_pct:+.1f}%"
+        )
     except Exception as e:
         log.error(f"  ✗ close {trade.ticker} failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
 #  3. SIGNAL PRICE UPDATE  (for leaderboard pct_change)
-#  ★ FIX: backfill missing entry_price + use tweet_time
 # ═══════════════════════════════════════════════════════════════
 
 def update_signal_prices(db: Session, mids: dict[str, float]):
-    """Keep current_price / pct_change fresh for recent signals.
-    ★ Also backfills entry_price for signals that missed processing."""
     sig_time = func.coalesce(Signal.tweet_time, Signal.created_at)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    cutoff   = datetime.now(timezone.utc) - timedelta(days=30)
 
-    signals = (
+    signals  = (
         db.query(Signal)
         .filter(
             sig_time >= cutoff,
@@ -409,21 +500,17 @@ def update_signal_prices(db: Session, mids: dict[str, float]):
         )
         .all()
     )
-    changed = 0
+    changed    = 0
     backfilled = 0
 
     for sig in signals:
         mid = mids.get(sig.ticker)
         if not mid:
             continue
-
-        # ★ Backfill entry_price for signals that missed process_new_signals
         if not sig.entry_price:
             sig.entry_price = mid
-            backfilled += 1
-
+            backfilled     += 1
         sig.current_price = mid
-
         if sig.entry_price:
             if sig.direction == "long":
                 sig.pct_change = round((mid - sig.entry_price) / sig.entry_price * 100, 2)
@@ -438,30 +525,34 @@ def update_signal_prices(db: Session, mids: dict[str, float]):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  4. BALANCE SYNC  (HL equity → BalanceSnapshot)
+#  4. BALANCE SYNC
 # ═══════════════════════════════════════════════════════════════
 
 def sync_balances(db: Session):
     wallets = db.query(UserWallet).filter(UserWallet.is_active.is_(True)).all()
     if not wallets:
         return
-    today = datetime.now(timezone.utc).date()
+    today  = datetime.now(timezone.utc).date()
     synced = 0
     for w in wallets:
         try:
-            bal = get_hl_balance(w.address)
-            equity = bal.get("equity", 0.0)
-            withdrawable = bal.get("withdrawable", 0.0)
+            bal         = get_hl_balance(w.address)
+            equity      = bal.get("equity", 0.0)
+            withdrawable= bal.get("withdrawable", 0.0)
             positions_val = abs(bal.get("positions", 0.0))
+
             snap = (
                 db.query(BalanceSnapshot)
-                .filter(BalanceSnapshot.user_id == w.user_id, BalanceSnapshot.snapshot_date == today)
+                .filter(
+                    BalanceSnapshot.user_id == w.user_id,
+                    BalanceSnapshot.snapshot_date == today,
+                )
                 .first()
             )
             if snap:
-                snap.balance = equity
+                snap.balance   = equity
                 snap.available = withdrawable
-                snap.used = positions_val
+                snap.used      = positions_val
             else:
                 prev = (
                     db.query(BalanceSnapshot)
@@ -471,9 +562,12 @@ def sync_balances(db: Session):
                 )
                 prev_bal = prev.balance if prev else equity
                 snap = BalanceSnapshot(
-                    user_id=w.user_id, balance=equity, available=withdrawable,
-                    used=positions_val, pnl_daily=round(equity - prev_bal, 2),
-                    snapshot_date=today,
+                    user_id      = w.user_id,
+                    balance      = equity,
+                    available    = withdrawable,
+                    used         = positions_val,
+                    pnl_daily    = round(equity - prev_bal, 2),
+                    snapshot_date= today,
                 )
                 db.add(snap)
             synced += 1
@@ -485,8 +579,7 @@ def sync_balances(db: Session):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  5. STATS RECOMPUTE  (TraderStats for leaderboard)
-#  ★ FIX: use tweet_time (not created_at) for window filtering
+#  5. STATS RECOMPUTE
 # ═══════════════════════════════════════════════════════════════
 
 WINDOWS = {
@@ -511,26 +604,17 @@ def _profit_grade(wr: float, avg_ret: float) -> str:
 
 
 def recompute_stats(db: Session):
-    """Rebuild TraderStats for every trader × window.
-    ★ Uses COALESCE(tweet_time, created_at) so historical tweets
-      imported in bulk are bucketed by their actual tweet time,
-      not when the ingestor inserted them."""
-    now = datetime.now(timezone.utc)
+    now     = datetime.now(timezone.utc)
     traders = db.query(Trader).all()
     if not traders:
         return
 
-    # ★ Use tweet_time (actual publish time) for time-window bucketing
-    sig_time = func.coalesce(Signal.tweet_time, Signal.created_at)
-
-    # ★ Trending: last 48h based on tweet_time
-    recent_cutoff = now - timedelta(hours=48)
+    sig_time       = func.coalesce(Signal.tweet_time, Signal.created_at)
+    recent_cutoff  = now - timedelta(hours=48)
 
     for wname, delta in WINDOWS.items():
         cutoff = now - delta
-
-        # ★ Filter by actual tweet time, not DB insertion time
-        sigs = (
+        sigs   = (
             db.query(Signal)
             .filter(sig_time >= cutoff, Signal.pct_change.isnot(None))
             .all()
@@ -549,15 +633,18 @@ def recompute_stats(db: Session):
                 scored.append((trader.id, 0.0, _empty_stats()))
                 continue
 
-            returns = [s.pct_change for s in tsigs]
-            win_n  = sum(1 for r in returns if r > 0)
-            loss_n = sum(1 for r in returns if r <= 0)
-            wr = win_n / total
-            avg_ret = sum(returns) / total
+            returns  = [s.pct_change for s in tsigs]
+            win_n    = sum(1 for r in returns if r > 0)
+            loss_n   = sum(1 for r in returns if r <= 0)
+            wr       = win_n / total
+            avg_ret  = sum(returns) / total
             total_profit = sum(returns)
 
-            # streak: consecutive recent wins (by tweet_time)
-            ordered = sorted(tsigs, key=lambda s: s.tweet_time or s.created_at or now, reverse=True)
+            ordered = sorted(
+                tsigs,
+                key=lambda s: s.tweet_time or s.created_at or now,
+                reverse=True,
+            )
             streak = 0
             for s in ordered:
                 if s.pct_change and s.pct_change > 0:
@@ -566,7 +653,7 @@ def recompute_stats(db: Session):
                     break
 
             grade = _profit_grade(wr, avg_ret)
-            pts = wr * 40 + min(avg_ret, 50) * 0.6 + min(total, 100) * 0.2
+            pts   = wr * 40 + min(avg_ret, 50) * 0.6 + min(total, 100) * 0.2
 
             copiers = (
                 db.query(func.count(Follow.id))
@@ -574,35 +661,34 @@ def recompute_stats(db: Session):
                 .scalar()
             )
 
-            # ★ Trending score — use tweet_time for recency
-            recent_sigs = [
+            recent_sigs    = [
                 s for s in tsigs
                 if (s.tweet_time or s.created_at or now) >= recent_cutoff
             ]
-            recent_count = len(recent_sigs)
+            recent_count   = len(recent_sigs)
             recent_returns = [s.pct_change for s in recent_sigs if s.pct_change is not None]
-            recent_avg = sum(recent_returns) / len(recent_returns) if recent_returns else 0.0
+            recent_avg     = sum(recent_returns) / len(recent_returns) if recent_returns else 0.0
 
             trending = (
                 recent_count * 3.0
-                + streak * 5.0
+                + streak      * 5.0
                 + max(recent_avg, 0) * 2.0
-                + wr * 10.0
+                + wr          * 10.0
             )
 
             data = {
-                "total_signals": total,
-                "win_count": win_n,
-                "loss_count": loss_n,
-                "win_rate": round(wr, 3),
-                "avg_return_pct": round(avg_ret, 2),
-                "total_profit_usd": round(total_profit, 2),
-                "streak": streak,
-                "points": round(pts, 1),
-                "profit_grade": grade,
-                "copiers_count": copiers or 0,
+                "total_signals":   total,
+                "win_count":       win_n,
+                "loss_count":      loss_n,
+                "win_rate":        round(wr, 3),
+                "avg_return_pct":  round(avg_ret, 2),
+                "total_profit_usd":round(total_profit, 2),
+                "streak":          streak,
+                "points":          round(pts, 1),
+                "profit_grade":    grade,
+                "copiers_count":   copiers or 0,
                 "signal_to_noise": 0.0,
-                "trending_score": round(trending, 1),
+                "trending_score":  round(trending, 1),
             }
             scored.append((trader.id, pts, data))
 
@@ -612,18 +698,22 @@ def recompute_stats(db: Session):
         for trader_id, _, data in scored:
             existing = (
                 db.query(TraderStats)
-                .filter(TraderStats.trader_id == trader_id, TraderStats.window == wname)
+                .filter(
+                    TraderStats.trader_id == trader_id,
+                    TraderStats.window == wname,
+                )
                 .first()
             )
             if existing:
                 for k, v in data.items():
                     setattr(existing, k, v)
-                existing.rank = rank_map.get(trader_id)
+                existing.rank        = rank_map.get(trader_id)
                 existing.computed_at = now
             else:
                 db.add(TraderStats(
                     trader_id=trader_id, window=wname,
-                    rank=rank_map.get(trader_id), computed_at=now, **data,
+                    rank=rank_map.get(trader_id), computed_at=now,
+                    **data,
                 ))
 
     db.commit()
@@ -645,7 +735,7 @@ def _empty_stats() -> dict:
 
 def expire_old_signals(db: Session):
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=SIGNAL_MAX_AGE_SEC)
-    count = (
+    count  = (
         db.query(Signal)
         .filter(Signal.status == "active", Signal.created_at < cutoff)
         .update({"status": "expired"})
@@ -674,16 +764,16 @@ def run():
     except Exception as e:
         log.error(f"Failed to load HL meta (will retry): {e}")
 
-    last_balance_sync = 0.0
+    last_balance_sync    = 0.0
     last_stats_recompute = 0.0
-    last_meta_refresh = time.time()
+    last_meta_refresh    = time.time()
 
     while True:
         loop_start = time.time()
         try:
             if not coins or (loop_start - last_meta_refresh >= META_REFRESH_INTERVAL):
                 try:
-                    coins = hl_load_meta()
+                    coins             = hl_load_meta()
                     last_meta_refresh = loop_start
                 except Exception:
                     pass
