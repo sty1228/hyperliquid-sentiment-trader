@@ -46,6 +46,11 @@ class BestWorstSignal(BaseModel):
     token: str
     pnl: float
     date: str
+    # ★ NEW — needed by frontend SignalDetailSheet
+    signal_id: str | None = None
+    direction: str | None = None
+    tweet_text: str | None = None
+    tweet_image_url: str | None = None
 
 
 class SignalItemResponse(BaseModel):
@@ -271,6 +276,11 @@ def _best_worst(
             token=s.ticker,
             pnl=round(s.pct_change, 1),
             date=dt.strftime("%b %d") if dt else "",
+            # ★ NEW fields for frontend click-to-detail
+            signal_id=s.id,
+            direction=s.direction or s.sentiment,
+            tweet_text=s.tweet_text,
+            tweet_image_url=s.tweet_image_url,
         )
 
     return (

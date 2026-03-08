@@ -137,3 +137,13 @@ def save_sub_account(
 @router.post("/logout")
 def logout():
     return {"message": "Logged out successfully"}
+
+@router.get("/me")
+async def get_me(
+    current_user: User = Depends(get_current_user),
+):
+    return {
+        "id": current_user.id,
+        "wallet_address": current_user.wallet_address,
+        "twitter_username": current_user.twitter_username,
+    }

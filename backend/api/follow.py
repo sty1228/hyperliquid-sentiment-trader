@@ -115,6 +115,7 @@ def follow_trader(
             db.refresh(existing)
         return _to_response(existing, trader)
 
+    # ★ New follow — increment followers_count
     follow = Follow(
         user_id=current_user.id,
         trader_id=trader.id,
@@ -122,6 +123,7 @@ def follow_trader(
         is_counter_trading=body.is_counter_trading,
     )
     db.add(follow)
+    trader.followers_count = (trader.followers_count or 0) + 1
     db.commit()
     db.refresh(follow)
     return _to_response(follow, trader)
@@ -156,6 +158,8 @@ def unfollow_trader(
     if not follow:
         raise HTTPException(404, "Not following this trader")
     db.delete(follow)
+    # ★ Decrement followers_count (floor at 0)
+    trader.followers_count = max((trader.followers_count or 0) - 1, 0)
     db.commit()
     return {"message": f"Unfollowed @{trader_username}"}
 
