@@ -3,6 +3,7 @@ Portfolio API — Dashboard 数据（余额、持仓、盈亏曲线）
 
 ★ Fix 1: positions current_price 从 pnl_pct 反推，不再用 exit_price
 ★ Fix 2: 新增 GET /api/portfolio/trader-pnl — 用户实际跟单盈亏 per KOL
+★ Fix 3: trader-pnl 新增 pnl_pct 字段（基于 size_usd 计算）
 """
 from __future__ import annotations
 from datetime import datetime, timedelta, timezone, date
@@ -85,13 +86,14 @@ class PnlHistoryResponse(BaseModel):
     total_pnl: float = 0.0
 
 
-# ★ NEW: per-trader PnL response
+# ★ per-trader PnL response — 新增 pnl_pct
 class TraderPnlItem(BaseModel):
     trader_username: str
     pnl_usd: float
+    pnl_pct: float = 0.0          # ★ 新增：用户在该KOL名下的实际回报%
     trade_count: int
     open_count: int
-    source: str | None = None  # "copy" | "counter" | "mixed"
+    source: str | None = None     # "copy" | "counter" | "mixed"
 
 
 # ── helpers ──────────────────────────────────────────────
@@ -292,7 +294,6 @@ def get_open_positions(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """当前持仓 — ★ current_price 从 pnl_pct 反推（engine 每 15s 更新）"""
     positions = (
         db.query(Trade)
         .filter(Trade.user_id == current_user.id, Trade.status == "open")
@@ -304,7 +305,7 @@ def get_open_positions(
             ticker=t.ticker,
             direction=t.direction,
             entry_price=t.entry_price,
-            current_price=_compute_current_price(t),  # ★ FIX
+            current_price=_compute_current_price(t),
             size_usd=t.size_usd,
             size_qty=t.size_qty,
             leverage=t.leverage,
@@ -341,7 +342,7 @@ def get_dashboard_summary(
     )
 
 
-# ★ NEW: 用户实际跟单盈亏 per KOL
+# ★ 用户实际跟单盈亏 per KOL（含 pnl_pct）
 @router.get("/portfolio/trader-pnl", response_model=list[TraderPnlItem])
 def get_trader_pnl(
     db: Session = Depends(get_db),
@@ -349,13 +350,14 @@ def get_trader_pnl(
 ):
     """
     Returns the user's actual trade PnL grouped by KOL.
-    This is the real profit/loss from copy/counter trades, NOT the KOL's own stats.
+    pnl_pct = pnl_usd / total_size_usd * 100 (user's real return %, not KOL's stats)
     """
     rows = (
         db.query(
             Trade.trader_username,
             Trade.source,
             func.coalesce(func.sum(Trade.pnl_usd), 0.0).label("pnl_usd"),
+            func.coalesce(func.sum(Trade.size_usd), 0.0).label("total_size_usd"),  # ★ 新增
             func.count(Trade.id).label("trade_count"),
             func.sum(func.case((Trade.status == "open", 1), else_=0)).label("open_count"),
         )
@@ -364,34 +366,45 @@ def get_trader_pnl(
         .all()
     )
 
-    # Merge rows with same trader_username but different source
-    merged: dict[str, TraderPnlItem] = {}
+    # 按 trader_username 合并（可能有 copy + counter 两条）
+    # 用 total_size_usd 累加来正确计算合并后的 pnl_pct
+    merged: dict[str, dict] = {}
     for r in rows:
         uname = r.trader_username
         pnl = round(float(r.pnl_usd), 2)
+        size = float(r.total_size_usd or 0)
         cnt = int(r.trade_count)
         open_cnt = int(r.open_count or 0)
         src = r.source or "copy"
 
         if uname in merged:
-            existing = merged[uname]
-            merged[uname] = TraderPnlItem(
-                trader_username=uname,
-                pnl_usd=round(existing.pnl_usd + pnl, 2),
-                trade_count=existing.trade_count + cnt,
-                open_count=existing.open_count + open_cnt,
-                source="mixed" if existing.source != src else src,
-            )
+            m = merged[uname]
+            m["pnl_usd"] = round(m["pnl_usd"] + pnl, 2)
+            m["total_size_usd"] += size
+            m["trade_count"] += cnt
+            m["open_count"] += open_cnt
+            m["source"] = "mixed" if m["source"] != src else src
         else:
-            merged[uname] = TraderPnlItem(
-                trader_username=uname,
-                pnl_usd=pnl,
-                trade_count=cnt,
-                open_count=open_cnt,
-                source=src,
-            )
+            merged[uname] = {
+                "pnl_usd": pnl,
+                "total_size_usd": size,
+                "trade_count": cnt,
+                "open_count": open_cnt,
+                "source": src,
+            }
 
-    return list(merged.values())
+    result = []
+    for uname, m in merged.items():
+        pnl_pct = round(m["pnl_usd"] / m["total_size_usd"] * 100, 2) if m["total_size_usd"] > 0 else 0.0
+        result.append(TraderPnlItem(
+            trader_username=uname,
+            pnl_usd=m["pnl_usd"],
+            pnl_pct=pnl_pct,          # ★ 真实用户回报%
+            trade_count=m["trade_count"],
+            open_count=m["open_count"],
+            source=m["source"],
+        ))
+    return result
 
 
 @router.get("/portfolio/pnl-history", response_model=PnlHistoryResponse)
