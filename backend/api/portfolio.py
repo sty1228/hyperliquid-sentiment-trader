@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
-
+from sqlalchemy import case
 from backend.deps import get_db, get_current_user
 from backend.models.user import User
 from backend.models.trade import Trade
@@ -359,7 +359,7 @@ def get_trader_pnl(
             func.coalesce(func.sum(Trade.pnl_usd), 0.0).label("pnl_usd"),
             func.coalesce(func.sum(Trade.size_usd), 0.0).label("total_size_usd"),  # ★ 新增
             func.count(Trade.id).label("trade_count"),
-            func.sum(func.case((Trade.status == "open", 1), else_=0)).label("open_count"),
+            func.sum(case((condition, value), else_=0)).label("open_count"),
         )
         .filter(Trade.user_id == current_user.id, Trade.trader_username.isnot(None))
         .group_by(Trade.trader_username, Trade.source)
