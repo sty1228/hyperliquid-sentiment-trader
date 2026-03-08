@@ -359,7 +359,7 @@ def get_trader_pnl(
             func.coalesce(func.sum(Trade.pnl_usd), 0.0).label("pnl_usd"),
             func.coalesce(func.sum(Trade.size_usd), 0.0).label("total_size_usd"),  # ★ 新增
             func.count(Trade.id).label("trade_count"),
-            func.sum(case((condition, value), else_=0)).label("open_count"),
+            func.sum(case((Trade.status == "open", 1), else_=0)).label("open_count"),
         )
         .filter(Trade.user_id == current_user.id, Trade.trader_username.isnot(None))
         .group_by(Trade.trader_username, Trade.source)
