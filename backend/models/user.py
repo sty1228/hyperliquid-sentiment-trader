@@ -1,13 +1,13 @@
-from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, Boolean, DateTime
+from sqlalchemy import String, Boolean, DateTime, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
 from backend.database import Base
+
 
 def _utcnow():
     return datetime.now(timezone.utc)
+
 
 class User(Base):
     __tablename__ = "users"
@@ -20,6 +20,10 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+    # ★ Referral
+    referral_code_used: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    free_copy_trades_used: Mapped[int] = mapped_column(Integer, default=0)
 
     # Relationships
     follows = relationship("Follow", back_populates="user", cascade="all, delete-orphan")
