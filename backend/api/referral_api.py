@@ -5,7 +5,7 @@ from sqlalchemy import func
 from pydantic import BaseModel
 from typing import Optional
 
-from backend.database import get_db
+from backend.deps import get_db
 from backend.deps import get_current_user
 from backend.models.referral import Referral, ReferralUse, AffiliateApplication
 from backend.models.user import User
