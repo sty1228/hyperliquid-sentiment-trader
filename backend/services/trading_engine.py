@@ -4,9 +4,11 @@ HyperCopy Trading Engine
 Background service handling the full trade lifecycle:
   1. Signal Processing   — new KOL signals → copy trades for followers
   2. Position Management — live PnL, TP/SL enforcement, auto-close
-  3. Signal Price Update  — keep pct_change fresh for leaderboard
-  4. Balance Sync         — HL equity → BalanceSnapshot
-  5. Stats Recompute      — refresh TraderStats for leaderboard
+  3. ★ Equity Protection — force-close all positions if equity < threshold
+  4. Signal Price Update  — keep pct_change fresh for leaderboard
+  5. Balance Sync         — HL equity → BalanceSnapshot
+  6. Stats Recompute      — refresh TraderStats for leaderboard
+  7. Mark Stale Signals
 
 Run:  python -m backend.services.trading_engine
 """
@@ -46,6 +48,9 @@ LOOP_SLEEP_SEC         = 15         # main loop cadence
 BALANCE_SYNC_INTERVAL  = 300        # 5 min
 STATS_RECOMPUTE_INTERVAL = 600      # 10 min
 META_REFRESH_INTERVAL  = 3600       # 1 hour
+
+EQUITY_SKIP_THRESHOLD  = 5.0        # ★ Skip new trades below this equity
+MIN_EQUITY_CLOSE_ALL   = 2.0        # ★ Force-close ALL positions below this equity
 
 # ★ Referral / free-trade config (must match referral_api.py)
 FREE_COPY_TRADES_LIMIT  = 10
@@ -252,7 +257,11 @@ def _execute_for_user(
 
     bal    = get_hl_balance(wallet.address)
     equity = bal.get("equity", 0.0)
-    if equity < 5:
+    if equity < EQUITY_SKIP_THRESHOLD:
+        log.info(
+            f"  ⏭️ SKIP user {user_id[:8]}… equity=${equity:.2f} "
+            f"< ${EQUITY_SKIP_THRESHOLD} — insufficient balance"
+        )
         return
 
     settings = (
@@ -260,7 +269,7 @@ def _execute_for_user(
         .filter(CopySetting.user_id == user_id, CopySetting.trader_id.is_(None))
         .first()
     )
-    leverage  = settings.leverage if settings else 8.0
+    leverage  = settings.leverage if settings else 5.0
     max_pos   = settings.max_positions if settings else 10
 
     open_count = (
@@ -269,6 +278,10 @@ def _execute_for_user(
         .count()
     )
     if open_count >= max_pos:
+        log.info(
+            f"  ⏭️ SKIP user {user_id[:8]}… max positions reached "
+            f"({open_count}/{max_pos})"
+        )
         return
 
     dup = db.query(Trade).filter(Trade.user_id == user_id, Trade.signal_id == sig.id).first()
@@ -294,6 +307,14 @@ def _execute_for_user(
         pct       = (settings.size_value if settings else 10.0) / 100.0
         usd_alloc = equity * pct
     usd_alloc = max(usd_alloc, MIN_TRADE_USD)
+
+    # ★ Extra guard: don't allocate more than 90% of equity
+    if usd_alloc > equity * 0.9:
+        usd_alloc = equity * 0.9
+        log.info(
+            f"  ⚠️ Capped allocation to 90% of equity for user {user_id[:8]}… "
+            f"→ ${usd_alloc:.2f}"
+        )
 
     notional = usd_alloc * leverage
     qty      = round(notional / mid, sz_decimals)
@@ -485,7 +506,60 @@ def _close_trade(db: Session, trade: Trade, wallet: UserWallet, mid: float, reas
 
 
 # ═══════════════════════════════════════════════════════════════
-#  3. SIGNAL PRICE UPDATE  (for leaderboard pct_change)
+#  3. ★ EQUITY PROTECTION — force-close all if equity too low
+# ═══════════════════════════════════════════════════════════════
+
+def check_equity_protection(db: Session, mids: dict[str, float]):
+    """
+    ★ EQUITY PROTECTION (simple mode):
+    If a user's HL equity drops below MIN_EQUITY_CLOSE_ALL,
+    force-close ALL their open positions to prevent total wipeout.
+    """
+    open_trades = db.query(Trade).filter(Trade.status == "open").all()
+    if not open_trades:
+        return
+
+    by_user: dict[str, list[Trade]] = defaultdict(list)
+    for t in open_trades:
+        by_user[t.user_id].append(t)
+
+    for uid, user_trades in by_user.items():
+        wallet = (
+            db.query(UserWallet)
+            .filter(UserWallet.user_id == uid, UserWallet.is_active.is_(True))
+            .first()
+        )
+        if not wallet:
+            continue
+        try:
+            bal = get_hl_balance(wallet.address)
+            equity = bal.get("equity", 0.0)
+
+            if equity < MIN_EQUITY_CLOSE_ALL:
+                log.warning(
+                    f"🛑 EQUITY PROTECTION: user {uid[:8]}… equity=${equity:.2f} "
+                    f"< ${MIN_EQUITY_CLOSE_ALL} → force-closing {len(user_trades)} positions"
+                )
+                for trade in user_trades:
+                    mid = mids.get(trade.ticker)
+                    if mid:
+                        _close_trade(db, trade, wallet, mid, "EQUITY_PROTECT")
+                    else:
+                        # Can't get price — mark closed at entry (better than leaving open)
+                        trade.status = "closed"
+                        trade.exit_price = trade.entry_price
+                        trade.closed_at = datetime.now(timezone.utc)
+                        log.warning(
+                            f"  ⚠️ {trade.ticker} no mid price available — "
+                            f"closed at entry price ${trade.entry_price}"
+                        )
+                db.commit()
+        except Exception as e:
+            log.error(f"Equity protection check failed for {uid[:8]}…: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  4. SIGNAL PRICE UPDATE  (for leaderboard pct_change)
 # ═══════════════════════════════════════════════════════════════
 
 def update_signal_prices(db: Session, mids: dict[str, float]):
@@ -525,7 +599,7 @@ def update_signal_prices(db: Session, mids: dict[str, float]):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  4. BALANCE SYNC
+#  5. BALANCE SYNC
 # ═══════════════════════════════════════════════════════════════
 
 def sync_balances(db: Session):
@@ -579,7 +653,7 @@ def sync_balances(db: Session):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  5. STATS RECOMPUTE
+#  6. STATS RECOMPUTE
 # ═══════════════════════════════════════════════════════════════
 
 WINDOWS = {
@@ -730,7 +804,7 @@ def _empty_stats() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  6. MARK STALE SIGNALS
+#  7. MARK STALE SIGNALS
 # ═══════════════════════════════════════════════════════════════
 
 def expire_old_signals(db: Session):
@@ -791,6 +865,7 @@ def run():
                 process_new_signals(db, coins, mids)
                 expire_old_signals(db)
                 update_positions(db, mids)
+                check_equity_protection(db, mids)      # ★ NEW
                 update_signal_prices(db, mids)
 
                 if loop_start - last_balance_sync >= BALANCE_SYNC_INTERVAL:

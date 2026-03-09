@@ -18,18 +18,18 @@ router = APIRouter(prefix="/api", tags=["settings"])
 # ── Request / Response 模型（匹配前端 DefaultFollowSettings）────
 
 class TPOrSL(BaseModel):
-    type: str = "USD"   # "USD" | "PCT"
+    type: str = "PCT"   # "USD" | "PCT"
     value: float = 0.0
 
 
 class CopySettingsRequest(BaseModel):
-    tradeSizeType: str = "USD"     # "USD" | "PCT"
-    tradeSize: float = 64.0
-    leverage: float = 8.0
-    leverageType: str = "cross"    # "isolated" | "cross"
+    tradeSizeType: str = "PCT"      # ★ was "USD" → default to percentage
+    tradeSize: float = 10.0         # ★ was 64.0 → 10% of balance is reasonable
+    leverage: float = 5.0           # ★ was 8.0 → safer default
+    leverageType: str = "cross"     # "isolated" | "cross"
     tp: TPOrSL = TPOrSL(type="PCT", value=15.0)
-    sl: TPOrSL = TPOrSL(type="USD", value=169.0)
-    orderType: str = "market"      # "market" | "limit"
+    sl: TPOrSL = TPOrSL(type="PCT", value=10.0)  # ★ was type="USD", value=169.0
+    orderType: str = "market"       # "market" | "limit"
 
 
 class CopySettingsResponse(BaseModel):
@@ -74,6 +74,19 @@ def _apply_request_to_setting(s: CopySetting, body: CopySettingsRequest):
     s.order_type = body.orderType
 
 
+# ── 默认值常量（新用户 / fallback 用）─────────────────────
+
+_DEFAULT_RESPONSE = CopySettingsResponse(
+    tradeSizeType="PCT",
+    tradeSize=10.0,
+    leverage=5.0,
+    leverageType="cross",
+    tp=TPOrSL(type="PCT", value=15.0),
+    sl=TPOrSL(type="PCT", value=10.0),
+    orderType="market",
+)
+
+
 # ── API 端点 ─────────────────────────────────────────────
 
 @router.get("/settings/default", response_model=CopySettingsResponse)
@@ -88,8 +101,18 @@ def get_default_settings(
         .first()
     )
     if not setting:
-        # 没有设置过，返回默认值
+        # 没有设置过，创建合理的默认值
         setting = CopySetting(user_id=current_user.id, trader_id=None)
+        # ★ Apply sane defaults instead of CopySetting model defaults
+        setting.size_type = "percent"
+        setting.size_value = 10.0
+        setting.leverage = 5.0
+        setting.margin_mode = "cross"
+        setting.tp_type = "percent"
+        setting.tp_value = 15.0
+        setting.sl_type = "percent"
+        setting.sl_value = 10.0
+        setting.order_type = "market"
         db.add(setting)
         db.commit()
         db.refresh(setting)
@@ -144,11 +167,8 @@ def get_trader_settings(
         )
         if default:
             return _setting_to_response(default)
-        return CopySettingsResponse(
-            tradeSizeType="PCT", tradeSize=64.0, leverage=8.0,
-            leverageType="cross", tp=TPOrSL(type="PCT", value=15.0),
-            sl=TPOrSL(type="USD", value=169.0), orderType="market",
-        )
+        # ★ 用合理的默认值（不再是 64 / 169）
+        return _DEFAULT_RESPONSE
 
     return _setting_to_response(setting)
 
