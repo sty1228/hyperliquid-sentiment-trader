@@ -221,6 +221,19 @@ ALIAS_TO_CANON: Dict[str, str] = {
     "ONDO-PERP":"ONDO","PEPE-PERP":"PEPE","DOGE-PERP":"DOGE",
     "ARB-PERP":"ARB","SUI-PERP":"SUI","APT-PERP":"APT",
     "AVAX-PERP":"AVAX","LINK-PERP":"LINK","INJ-PERP":"INJ",
+    # Stock / commodity / forex aliases → HL spot names
+    "GOLD":"GLD","XAUUSD":"GLD","XAU":"GLD",
+    "SILVER":"SLV","XAGUSD":"SLV","XAG":"SLV",
+    "GOOG":"GOOGL","GOOGLE":"GOOGL",
+    "APPLE":"AAPL",
+    "AMAZON":"AMZN",
+    "TESLA":"TSLA",
+    "MICROSOFT":"MSFT",
+    "NVIDIA":"NVDA",
+    "ORACLE":"ORCL",
+    "SP500":"SPY","SNP500":"SPY",
+    "NASDAQ100":"QQQ","NDX":"QQQ",
+    "EURUSD":"EUR",
 }
 
 # ★ NOW STRICT — only HL-listed tokens pass through normalize_ticker
@@ -232,7 +245,7 @@ TICKER_BLACKLIST = {
     "OUR","OUT","HAS","HIS","HOW","ITS","MAY","NEW","NOW","OLD","SEE","WAY",
     "WHO","DID","GET","HIM","LET","SAY","SHE","TOO","USE","DAD","MOM","USA",
     "CEO","CTO","COO","CFO","IMO","TBH","LMAO","HODL","NGMI","WAGMI","DYOR",
-    "NFA","PSA","FYI","ATH","ATL","API","ETF","SEC","USD","EUR","JPY","GBP",
+    "NFA","PSA","FYI","ATH","ATL","API","ETF","SEC","USD","JPY","GBP",
     "IPO","ICO","IDO","DEX","CEX","TVL","APR","APY","ROI","PNL","OTC",
     "NFT","DAO","DCA","KOL","RWA","GM","GN","CT","RT","DM","PM","AM",
     "JUST","THIS","THAT","WITH","FROM","THEY","BEEN","HAVE","WILL","YOUR",
