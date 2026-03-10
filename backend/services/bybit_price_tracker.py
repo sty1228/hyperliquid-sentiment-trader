@@ -1,11 +1,22 @@
+"""
+HyperCopy Price Tracker — HyperLiquid-first with Bybit fallback.
+
+Key changes from Bybit-only version:
+  • Default price source is now HyperLiquid (allMids endpoint).
+  • Bulk price fetch: one POST to /info gets ALL mid prices at once.
+  • Supports HIP-3 tokens (TSLA, CIRCLE, etc.) automatically.
+  • Falls back to Bybit source for historical klines if HL doesn't have them.
+  • PCT_SANITY_CAP=500 still enforced on all pct_change values.
+"""
 import os
 import re
 import time
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
+import requests as http_requests
 import pandas as pd
 import schedule
 
@@ -14,7 +25,6 @@ _THIS_DIR = os.path.dirname(__file__)
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
-
 
 from backend.services.sources import create_price_source
 from backend.services.enhanced_price_database import EnhancedPriceDatabase
@@ -37,13 +47,165 @@ BYBIT_API_KEY = env("BYBIT_API_KEY", "")
 BYBIT_SECRET = env("BYBIT_SECRET", "")
 BYBIT_TESTNET = env("BYBIT_TESTNET", "false").lower() in ("1", "true", "yes", "y")
 
-# ★ Sanity cap: spot price cannot realistically move more than ±500%
-# Values outside this range mean entry_price is bad data (wrong timestamp,
-# fallback-to-current on a stale entry, etc.)
+HL_BASE_URL = env("HL_BASE_URL", "https://api.hyperliquid.xyz")
+
+# ★ Default to HyperLiquid now (was "bybit")
+PRICE_SOURCE_ENV = env("PRICE_SOURCE", "hyperliquid")
+
 PCT_SANITY_CAP = 500.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+
+# ═══════════════════════════════════════════════════════════════════════
+#  HYPERLIQUID NATIVE PRICE CLIENT
+# ═══════════════════════════════════════════════════════════════════════
+
+class HLPriceClient:
+    """Thin client for HyperLiquid price data.
+    
+    Uses:
+      - POST /info {"type":"allMids"} for bulk current prices (one request!)
+      - POST /info {"type":"meta"} + {"type":"spotMeta"} for token lists
+      - POST /info {"type":"candleSnapshot"} for historical klines
+    """
+
+    def __init__(self, base_url: str = "https://api.hyperliquid.xyz"):
+        self.base_url = base_url
+        self._token_cache: Dict[str, Any] = {"perp": set(), "spot": set(), "fetched_at": 0.0}
+        self._TOKEN_TTL = 3600
+
+    def _post(self, payload: dict, timeout: int = 15) -> Any:
+        r = http_requests.post(f"{self.base_url}/info", json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+
+    # ── Token lists ──────────────────────────────────────────────────
+
+    def get_all_tokens(self) -> Dict[str, set]:
+        """Returns {"perp": set(...), "spot": set(...), "all": set(...)}"""
+        now = time.monotonic()
+        if now - self._token_cache["fetched_at"] < self._TOKEN_TTL and self._token_cache["perp"]:
+            return {
+                "perp": self._token_cache["perp"],
+                "spot": self._token_cache["spot"],
+                "all": self._token_cache["perp"] | self._token_cache["spot"],
+            }
+
+        perp_tokens = set()
+        spot_tokens = set()
+
+        try:
+            meta = self._post({"type": "meta"})
+            for asset in meta.get("universe", []):
+                name = asset.get("name", "").upper().strip()
+                if name:
+                    perp_tokens.add(name)
+        except Exception as e:
+            logging.warning(f"HL meta fetch failed: {e}")
+
+        try:
+            spot = self._post({"type": "spotMeta"})
+            for tok in spot.get("tokens", []):
+                name = tok.get("name", "").upper().strip()
+                if name:
+                    spot_tokens.add(name)
+        except Exception as e:
+            logging.warning(f"HL spotMeta fetch failed: {e}")
+
+        if perp_tokens or spot_tokens:
+            self._token_cache["perp"] = perp_tokens
+            self._token_cache["spot"] = spot_tokens
+            self._token_cache["fetched_at"] = now
+
+        return {
+            "perp": perp_tokens,
+            "spot": spot_tokens,
+            "all": perp_tokens | spot_tokens,
+        }
+
+    # ── Bulk current prices (the big win) ────────────────────────────
+
+    def get_all_mids(self) -> Dict[str, float]:
+        """Fetch ALL mid prices in one request. Returns {symbol: price}.
+        This is the key efficiency gain — replaces hundreds of individual calls."""
+        try:
+            data = self._post({"type": "allMids"})
+            result = {}
+            for symbol, price_str in data.items():
+                try:
+                    price = float(price_str)
+                    if price > 0:
+                        result[symbol.upper()] = price
+                except (ValueError, TypeError):
+                    pass
+            return result
+        except Exception as e:
+            logging.error(f"HL allMids failed: {e}")
+            return {}
+
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        """Get current mid price for a single symbol."""
+        mids = self.get_all_mids()
+        return mids.get(symbol.upper())
+
+    # ── Historical klines ────────────────────────────────────────────
+
+    def get_candle_at(self, symbol: str, timestamp: datetime,
+                      interval: str = "1h") -> Optional[float]:
+        """Get the open price of the candle containing `timestamp`."""
+        ts_ms = int(timestamp.timestamp() * 1000)
+        # Request a small window around the timestamp
+        try:
+            data = self._post({
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": symbol.upper(),
+                    "interval": interval,
+                    "startTime": ts_ms - 3600_000,  # 1h before
+                    "endTime": ts_ms + 3600_000,     # 1h after
+                }
+            })
+            if not data:
+                return None
+            # Find the candle closest to our timestamp
+            best = None
+            best_dist = float("inf")
+            for candle in data:
+                t = candle.get("t", 0)
+                dist = abs(t - ts_ms)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = candle
+            if best:
+                return float(best.get("o", 0))  # open price
+            return None
+        except Exception as e:
+            logging.debug(f"HL candle fetch failed for {symbol}: {e}")
+            return None
+
+    def get_klines_range(self, symbol: str, start_ms: int, end_ms: int,
+                         interval: str = "1h") -> List[dict]:
+        """Get candles in a time range."""
+        try:
+            data = self._post({
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": symbol.upper(),
+                    "interval": interval,
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                }
+            })
+            return data if data else []
+        except Exception as e:
+            logging.debug(f"HL klines range failed for {symbol}: {e}")
+            return []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════════
 
 def _map_price_source(name_raw: str) -> str:
     n = (name_raw or "").strip().lower()
@@ -51,7 +213,7 @@ def _map_price_source(name_raw: str) -> str:
         return "bybit"
     if n in ("hyperliquid", "hl", "hyperliquid_sdk"):
         return "hyperliquid"
-    return "bybit"
+    return "hyperliquid"  # ★ default changed from bybit
 
 
 def _utc_from_any(value) -> datetime:
@@ -77,12 +239,20 @@ def _get_price_number(payload: Any) -> Optional[float]:
     return None
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN TRACKER CLASS
+# ═══════════════════════════════════════════════════════════════════════
+
 class PriceTracker:
     SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}(USDT|USDC|USD)?$")
 
-    def __init__(self, database: Optional[EnhancedPriceDatabase] = None, *, auto_schedule: bool = False):
-        src_env = env("PRICE_SOURCE", "bybit")
-        src_name = _map_price_source(src_env)
+    def __init__(self, database: Optional[EnhancedPriceDatabase] = None,
+                 *, auto_schedule: bool = False):
+        # ★ Always create HL client for bulk prices
+        self.hl_client = HLPriceClient(base_url=HL_BASE_URL)
+
+        # Legacy source for historical klines (fallback)
+        src_name = _map_price_source(PRICE_SOURCE_ENV)
         if src_name == "bybit":
             self.price_source = create_price_source(
                 name="bybit",
@@ -90,11 +260,25 @@ class PriceTracker:
                 secret_key=BYBIT_SECRET,
                 testnet=BYBIT_TESTNET,
             )
-            used_name = "BybitPriceSource"
+            self._legacy_source_name = "Bybit"
         else:
-            self.price_source = create_price_source(name="hyperliquid")
-            used_name = "HyperliquidPriceSource"
-        logging.info(f"Using price source: {used_name} (env={src_env})")
+            try:
+                self.price_source = create_price_source(name="hyperliquid")
+                self._legacy_source_name = "HyperliquidSDK"
+            except Exception:
+                self.price_source = create_price_source(
+                    name="bybit",
+                    api_key=BYBIT_API_KEY,
+                    secret_key=BYBIT_SECRET,
+                    testnet=BYBIT_TESTNET,
+                )
+                self._legacy_source_name = "Bybit(fallback)"
+
+        logging.info(f"Price sources: HL allMids (primary) + {self._legacy_source_name} (klines)")
+
+        # Pre-fetch token list
+        tokens = self.hl_client.get_all_tokens()
+        logging.info(f"📋 HL tokens: {len(tokens['perp'])} perp, {len(tokens['spot'])} spot")
 
         db_dir = os.path.dirname(DB_PATH) or "."
         os.makedirs(db_dir, exist_ok=True)
@@ -137,12 +321,59 @@ class PriceTracker:
             return False
         return bool(self.SYMBOL_RE.match(s))
 
-    def _supported_and_normalized(self, raw_symbol: str) -> Optional[str]:
+    def _get_entry_price_hl(self, symbol: str, tweet_time: datetime) -> Optional[float]:
+        """Try to get entry price from HL candles first, then allMids as fallback."""
+        # Try historical candle
+        price = self.hl_client.get_candle_at(symbol, tweet_time, interval="1h")
+        if price and price > 0:
+            return price
+
+        # Try 15m candle for more precision
+        price = self.hl_client.get_candle_at(symbol, tweet_time, interval="15m")
+        if price and price > 0:
+            return price
+
+        return None
+
+    def _get_entry_price_legacy(self, symbol: str, tweet_time: datetime) -> Optional[float]:
+        """Legacy source fallback for entry price."""
         try:
-            norm = self.price_source.normalize_symbol(raw_symbol)
-            return norm if self.price_source.is_supported_symbol(norm) else None
+            norm = self.price_source.normalize_symbol(symbol)
+            if not self.price_source.is_supported_symbol(norm):
+                return None
         except Exception:
             return None
+
+        for cat in ("perp", "linear", "spot"):
+            try:
+                entry = self.price_source.get_price_at(norm, tweet_time, category=cat, use_open=True)
+                if entry is not None:
+                    return float(entry) if not isinstance(entry, float) else entry
+            except Exception:
+                pass
+        return None
+
+    def _get_entry_price(self, symbol: str, tweet_time: datetime) -> Optional[float]:
+        """Get entry price: HL first, legacy fallback, current price last resort."""
+        # 1) HL historical
+        price = self._get_entry_price_hl(symbol, tweet_time)
+        if price:
+            return price
+
+        # 2) Legacy source (Bybit klines)
+        price = self._get_entry_price_legacy(symbol, tweet_time)
+        if price:
+            return price
+
+        # 3) Current price fallback (only if tweet is recent)
+        if ENTRY_FALLBACK_CURRENT:
+            age = datetime.now(timezone.utc) - tweet_time
+            if age < timedelta(hours=1):
+                cur = self.hl_client.get_current_price(symbol)
+                if cur:
+                    return cur
+
+        return None
 
     def process_new_tweets(self) -> None:
         path = self._csv_path()
@@ -179,35 +410,16 @@ class PriceTracker:
                 skipped += 1
                 continue
 
-            norm = self._supported_and_normalized(raw)
-            if not norm:
-                skipped += 1
-                continue
-
             t0 = _utc_from_any(row["tweet_time"])
 
             if (now_utc - t0) > timedelta(days=MAX_BACKFILL_DAYS):
                 skipped += 1
                 continue
 
-            entry = None
-            for cat in ("perp", "linear", "spot"):
-                try:
-                    entry = self.price_source.get_price_at(norm, t0, category=cat, use_open=True)
-                    if entry is not None:
-                        break
-                except Exception:
-                    pass
-
-            if entry is None and ENTRY_FALLBACK_CURRENT:
-                try:
-                    cur = self.price_source.get_current_price(norm)
-                    entry = _get_price_number(cur)
-                except Exception:
-                    entry = None
+            entry = self._get_entry_price(raw, t0)
 
             if entry is None:
-                logging.warning(f"Could not get entry price at tweet_time for {norm}")
+                logging.warning(f"Could not get entry price for {raw} at {t0}")
                 skipped += 1
                 continue
 
@@ -215,7 +427,7 @@ class PriceTracker:
                 username=username,
                 tweet_text=tweet_text,
                 tweet_time=t0,
-                ticker=norm,
+                ticker=raw,
                 sentiment=sentiment,
                 entry_price=float(entry),
             )
@@ -223,7 +435,7 @@ class PriceTracker:
                 processed += 1
                 self.processed_tweets.add(key)
                 emoji = "🟢" if sentiment == "bullish" else "🔴" if sentiment == "bearish" else "⚪"
-                logging.info(f"✓ Added {norm} {emoji} @{username} entry=${float(entry):.6f}")
+                logging.info(f"✓ Added {raw} {emoji} @{username} entry=${float(entry):.6f}")
             else:
                 skipped += 1
 
@@ -232,6 +444,7 @@ class PriceTracker:
         logging.info(f"Processing complete: {processed} added, {skipped} skipped")
 
     def update_all_prices(self) -> None:
+        """★ Core improvement: one HL allMids call replaces hundreds of individual requests."""
         tweets_df = self.database.get_tweets_for_price_update()
         if tweets_df.empty:
             logging.info("No tweets to update")
@@ -239,6 +452,78 @@ class PriceTracker:
 
         logging.info(f"Updating prices for {len(tweets_df)} tweets")
 
+        # ★ ONE request for ALL prices
+        all_mids = self.hl_client.get_all_mids()
+        if not all_mids:
+            logging.warning("HL allMids returned empty — falling back to legacy source")
+            self._update_all_prices_legacy(tweets_df)
+            return
+
+        logging.info(f"📊 Got {len(all_mids)} prices from HL allMids")
+
+        unique_tickers = sorted(tweets_df["ticker"].dropna().unique())
+        price_cache: Dict[str, float] = {}
+
+        for tk in unique_tickers:
+            tk_upper = str(tk).upper()
+            price = all_mids.get(tk_upper)
+            if price is not None:
+                price_cache[tk] = price
+                self.database.insert_price_data(
+                    symbol=tk, price=price, market_type="perp",
+                )
+
+        # Tokens not on HL — try legacy source
+        missing = [tk for tk in unique_tickers if tk not in price_cache]
+        if missing:
+            logging.info(f"  {len(missing)} tickers not on HL, trying legacy source: {missing[:10]}")
+            for tk in missing:
+                try:
+                    norm = self.price_source.normalize_symbol(str(tk))
+                    if not self.price_source.is_supported_symbol(norm):
+                        continue
+                    cur = self.price_source.get_current_price(norm)
+                    price_val = _get_price_number(cur)
+                    if price_val is not None:
+                        price_cache[tk] = price_val
+                        self.database.insert_price_data(
+                            symbol=tk, price=price_val,
+                            market_type=(cur.get("market", "spot") if isinstance(cur, dict) else "spot"),
+                        )
+                except Exception:
+                    pass
+                time.sleep(SLEEP_S)
+
+        # Update tweet prices
+        updated = 0
+        for _, tweet in tweets_df.iterrows():
+            tk = tweet["ticker"]
+            if tk not in price_cache:
+                continue
+            cur_price = price_cache[tk]
+            entry = tweet["entry_price"]
+            if entry is None:
+                continue
+
+            try:
+                pct = ((float(cur_price) - float(entry)) / float(entry)) * 100.0
+                if abs(pct) > PCT_SANITY_CAP:
+                    logging.warning(
+                        f"Extreme pct_change={pct:.1f}% for {tk} "
+                        f"(entry={entry}, current={cur_price}) — discarding"
+                    )
+                    pct = None
+            except Exception:
+                pct = None
+
+            if self.database.update_tweet_price(int(tweet["id"]), cur_price, pct):
+                updated += 1
+
+        logging.info(f"Updated prices for {updated}/{len(tweets_df)} tweets "
+                     f"({len(price_cache)} tickers had prices)")
+
+    def _update_all_prices_legacy(self, tweets_df) -> None:
+        """Fallback: update prices one-by-one via legacy source."""
         unique_tickers = sorted(tweets_df["ticker"].dropna().unique())
         price_cache: Dict[str, float] = {}
 
@@ -252,8 +537,7 @@ class PriceTracker:
                 if price_val is not None:
                     price_cache[tk] = float(price_val)
                     self.database.insert_price_data(
-                        symbol=tk,
-                        price=float(price_val),
+                        symbol=tk, price=float(price_val),
                         market_type=(cur.get("market", "spot") if isinstance(cur, dict) else "spot"),
                     )
             except Exception:
@@ -269,27 +553,16 @@ class PriceTracker:
             entry = tweet["entry_price"]
             if entry is None:
                 continue
-
-            # ★ Compute pct_change with sanity cap
             try:
                 pct = ((float(cur_price) - float(entry)) / float(entry)) * 100.0
-
-                # Spot price cannot realistically move ±500% in any window.
-                # Values outside this range mean entry_price is bad data
-                # (wrong timestamp, fallback-to-current on stale entry, etc.)
                 if abs(pct) > PCT_SANITY_CAP:
-                    logging.warning(
-                        f"Extreme pct_change={pct:.1f}% for {tk} "
-                        f"(entry={entry}, current={cur_price}) — discarding"
-                    )
                     pct = None
             except Exception:
                 pct = None
-
             if self.database.update_tweet_price(int(tweet["id"]), cur_price, pct):
                 updated += 1
 
-        logging.info(f"Updated prices for {updated} tweets")
+        logging.info(f"(Legacy) Updated prices for {updated} tweets")
 
     def _choose_interval_fallback(self, horizon_h: int) -> str:
         H = int(horizon_h)
@@ -299,7 +572,7 @@ class PriceTracker:
         if H <= 168: return "15"
         return "60"
 
-    def _compute_horizon_metrics_for_tweet(self, tweet_row, horizons=(24,), benchmark="BTCUSDT"):
+    def _compute_horizon_metrics_for_tweet(self, tweet_row, horizons=(24,), benchmark="BTC"):
         import math
 
         symbol = tweet_row["ticker"]
@@ -309,38 +582,49 @@ class PriceTracker:
         entry = float(entry)
 
         t0 = _utc_from_any(tweet_row["tweet_time"])
-        t0_ms = int(t0.timestamp() * 1000)
 
         for H in horizons:
             t1 = t0 + timedelta(hours=int(H))
-            t1_ms = int(t1.timestamp() * 1000)
 
-            try:
-                if hasattr(self.price_source, "choose_interval_for_horizon"):
-                    interval = self.price_source.choose_interval_for_horizon(int(H))
-                else:
-                    interval = self._choose_interval_fallback(int(H))
-            except Exception:
-                interval = self._choose_interval_fallback(int(H))
+            # ★ Try HL candles first
+            interval = "1h" if H <= 48 else "4h"
+            start_ms = int(t0.timestamp() * 1000)
+            end_ms = int(t1.timestamp() * 1000)
 
-            def pull_range_chunked(sym, cat):
-                return self.price_source.get_klines_range_chunked(
-                    sym, category=cat, interval=interval,
-                    start_ms=t0_ms, end_ms=t1_ms, limit_per_call=2000
-                )
+            candles = self.hl_client.get_klines_range(symbol, start_ms, end_ms, interval=interval)
 
-            rows = pull_range_chunked(symbol, "perp")
-            if not rows:
-                rows = pull_range_chunked(symbol, "linear")
-            if not rows:
-                rows = pull_range_chunked(symbol, "spot")
-            if not rows:
+            if not candles:
+                # Fallback to legacy source
+                try:
+                    if hasattr(self.price_source, "choose_interval_for_horizon"):
+                        legacy_interval = self.price_source.choose_interval_for_horizon(int(H))
+                    else:
+                        legacy_interval = self._choose_interval_fallback(int(H))
+
+                    def pull_range_chunked(sym, cat):
+                        return self.price_source.get_klines_range_chunked(
+                            sym, category=cat, interval=legacy_interval,
+                            start_ms=start_ms, end_ms=end_ms, limit_per_call=2000
+                        )
+
+                    rows = pull_range_chunked(symbol, "perp")
+                    if not rows:
+                        rows = pull_range_chunked(symbol, "linear")
+                    if not rows:
+                        rows = pull_range_chunked(symbol, "spot")
+                    if rows:
+                        # Convert legacy format to HL candle format
+                        candles = [{"h": r[2], "l": r[3], "c": r[4]} for r in rows]
+                except Exception:
+                    pass
+
+            if not candles:
                 continue
 
             try:
-                highs  = [float(r[2]) for r in rows]
-                lows   = [float(r[3]) for r in rows]
-                closes = [float(r[4]) for r in rows]
+                highs  = [float(c.get("h", 0)) for c in candles if c.get("h")]
+                lows   = [float(c.get("l", 0)) for c in candles if c.get("l")]
+                closes = [float(c.get("c", 0)) for c in candles if c.get("c")]
             except Exception:
                 continue
             if not closes:
@@ -351,7 +635,6 @@ class PriceTracker:
             ret_high  = ((max(highs) - entry) / entry) if highs else None
             ret_low   = ((min(lows)  - entry) / entry) if lows  else None
 
-            # ★ sanity check on horizon returns too (stored as ratio, so cap at 5.0 = 500%)
             if abs(ret_close) > PCT_SANITY_CAP / 100.0:
                 logging.warning(
                     f"Extreme horizon ret_close={ret_close*100:.1f}% for {symbol} — discarding"
@@ -360,10 +643,12 @@ class PriceTracker:
 
             ret_close_alpha = None
             try:
-                b_entry = self.price_source.get_price_at(benchmark, t0, category="spot", use_open=True)
-                b_end   = self.price_source.get_price_at(benchmark, t1, category="spot", use_open=False)
-                if b_entry and b_end:
-                    ret_close_alpha = ret_close - ((float(b_end) - float(b_entry)) / float(b_entry))
+                b_candles = self.hl_client.get_klines_range(benchmark, start_ms, end_ms, interval=interval)
+                if b_candles and len(b_candles) >= 2:
+                    b_entry = float(b_candles[0].get("o", 0))
+                    b_close = float(b_candles[-1].get("c", 0))
+                    if b_entry > 0:
+                        ret_close_alpha = ret_close - ((b_close - b_entry) / b_entry)
             except Exception:
                 pass
 

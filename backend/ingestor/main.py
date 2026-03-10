@@ -9,6 +9,7 @@ Key design principles:
   • Graceful shutdown: SIGTERM/SIGINT set a flag, current user finishes, then exit.
   • Exponential backoff on transient errors, circuit-breaker on persistent ones.
   • Label cache ensures we never pay OpenAI twice for the same tweet text.
+  • Token whitelist fetched from HyperLiquid meta — only tradeable tokens pass.
 """
 from __future__ import annotations
 import os, re, time, json, hashlib, random, sqlite3, signal, sys
@@ -57,13 +58,73 @@ VISION_ENABLED = _env("VISION_ENABLED", "true").lower() in ("1", "true", "yes")
 CYCLE_INTERVAL_S   = int(_env("CYCLE_INTERVAL_S", "300"))
 MAX_CONSECUTIVE_FAILURES = int(_env("MAX_CONSECUTIVE_FAILURES", "10"))
 
+HL_BASE_URL = _env("HL_BASE_URL", "https://api.hyperliquid.xyz")
+
 # ── regex / constants ──────────────────────────────────────────────────
 ALNUM_RE         = re.compile(r"[^A-Z0-9]")
 DOLLAR_TICKER_RE = re.compile(r"\$([A-Za-z0-9]{2,15})\b")
 HASH_TICKER_RE   = re.compile(r"#([A-Za-z0-9]{2,15})\b")
 PLAIN_TICKER_RE  = re.compile(r"\b([A-Z]{2,10})\b")
 
-COMMON_CRYPTO = {
+
+# ═══════════════════════════════════════════════════════════════════════
+#  HYPERLIQUID TOKEN WHITELIST (the source of truth)
+# ═══════════════════════════════════════════════════════════════════════
+
+_hl_token_cache: Dict[str, Any] = {"tokens": set(), "fetched_at": 0.0}
+HL_TOKEN_CACHE_TTL = 3600  # refresh every hour
+
+def _fetch_hl_tokens() -> set[str]:
+    """Fetch all tradeable token symbols from HyperLiquid meta endpoint.
+    Includes both perps (meta) and spot (spotMeta) tokens."""
+    tokens: set[str] = set()
+    try:
+        # Perps
+        r = requests.post(f"{HL_BASE_URL}/info", json={"type": "meta"}, timeout=15)
+        r.raise_for_status()
+        meta = r.json()
+        for asset in meta.get("universe", []):
+            name = asset.get("name", "").upper().strip()
+            if name:
+                tokens.add(name)
+
+        # Spot
+        try:
+            r2 = requests.post(f"{HL_BASE_URL}/info", json={"type": "spotMeta"}, timeout=15)
+            r2.raise_for_status()
+            spot = r2.json()
+            for tok in spot.get("tokens", []):
+                name = tok.get("name", "").upper().strip()
+                if name:
+                    tokens.add(name)
+        except Exception as e:
+            log.warning(f"spotMeta fetch failed (non-fatal): {e}")
+
+        log.info(f"📋 Fetched {len(tokens)} tradeable tokens from HL: {sorted(list(tokens))[:20]}…")
+    except Exception as e:
+        log.error(f"Failed to fetch HL tokens: {e}")
+
+    return tokens
+
+
+def get_hl_tokens() -> set[str]:
+    """Get cached HL token set, refreshing if stale."""
+    now = time.monotonic()
+    if now - _hl_token_cache["fetched_at"] > HL_TOKEN_CACHE_TTL or not _hl_token_cache["tokens"]:
+        fetched = _fetch_hl_tokens()
+        if fetched:
+            _hl_token_cache["tokens"] = fetched
+            _hl_token_cache["fetched_at"] = now
+        elif not _hl_token_cache["tokens"]:
+            # Fallback: use COMMON_CRYPTO if HL is unreachable on first boot
+            log.warning("Using COMMON_CRYPTO fallback — HL unreachable")
+            _hl_token_cache["tokens"] = COMMON_CRYPTO_FALLBACK
+            _hl_token_cache["fetched_at"] = now - HL_TOKEN_CACHE_TTL + 120  # retry in 2 min
+    return _hl_token_cache["tokens"]
+
+
+# Fallback only used if HL meta is down on first boot
+COMMON_CRYPTO_FALLBACK = {
     "BTC","ETH","SOL","XRP","BNB","ADA","AVAX","DOT","LINK","TON",
     "TRX","ATOM","NEAR","UNI","LTC","ETC","FIL","ICP","HBAR",
     "ARB","OP","MATIC","APT","SUI","SEI","TIA","INJ","STX","STRK",
@@ -74,10 +135,11 @@ COMMON_CRYPTO = {
     "DOGE","PEPE","WIF","BONK","FLOKI","SHIB","TRUMP","MELANIA",
     "MOG","TURBO","POPCAT","GOAT","FARTCOIN","SPX","GIGA","BRETT",
     "IMX","BEAM","GALA","SAND","MANA","RONIN",
-    "ORDI","RUNE","SATS","STX",
-    "DYDX","PYTH","KAS","JTO","NOT","HYPE",
-    "SUI","FTM","ROSE","AR","MINA","HNT","CHZ",
+    "ORDI","RUNE","SATS",
+    "PYTH","KAS","JTO","NOT","HYPE",
+    "FTM","ROSE","AR","MINA","HNT","CHZ",
 }
+
 
 POS_PHRASES = [
     "longed","longing","going long","opened a long","opening long",
@@ -160,16 +222,18 @@ ALIAS_TO_CANON: Dict[str, str] = {
     "ARB-PERP":"ARB","SUI-PERP":"SUI","APT-PERP":"APT",
     "AVAX-PERP":"AVAX","LINK-PERP":"LINK","INJ-PERP":"INJ",
 }
-STRICT_CANON = False
-SUPPORTED_CANON: set[str] = set(ALIAS_TO_CANON.values()) | COMMON_CRYPTO
+
+# ★ NOW STRICT — only HL-listed tokens pass through normalize_ticker
+STRICT_CANON = True
 
 TICKER_BLACKLIST = {
+    # ── Common English words ──
     "THE","AND","FOR","ARE","BUT","NOT","YOU","ALL","CAN","HER","WAS","ONE",
     "OUR","OUT","HAS","HIS","HOW","ITS","MAY","NEW","NOW","OLD","SEE","WAY",
     "WHO","DID","GET","HIM","LET","SAY","SHE","TOO","USE","DAD","MOM","USA",
     "CEO","CTO","COO","CFO","IMO","TBH","LMAO","HODL","NGMI","WAGMI","DYOR",
     "NFA","PSA","FYI","ATH","ATL","API","ETF","SEC","USD","EUR","JPY","GBP",
-    "IPO","ICO","IDO","CEO","DEX","CEX","TVL","APR","APY","ROI","PNL","OTC",
+    "IPO","ICO","IDO","DEX","CEX","TVL","APR","APY","ROI","PNL","OTC",
     "NFT","DAO","DCA","KOL","RWA","GM","GN","CT","RT","DM","PM","AM",
     "JUST","THIS","THAT","WITH","FROM","THEY","BEEN","HAVE","WILL","YOUR",
     "WHEN","WHAT","MORE","MAKE","LIKE","TIME","VERY","THAN","LOOK","ONLY",
@@ -180,7 +244,34 @@ TICKER_BLACKLIST = {
     "LIVE","JUST","HERE","STILL","EVERY","MUCH","EVEN",
     "WIN","LOSS","CALL","PUT","STOP","ENTRY","EXIT",
     "WEEK","DAILY","TODAY","SOON",
+    # ── Stablecoins — never tradeable signals ──
+    "USDT","USDC","BUSD","DAI","TUSD","USDP","GUSD","FRAX","LUSD",
+    "PYUSD","FDUSD","CUSD","EUSD","SUSD","MIM","UST","USTC",
+    "USDD","CRVUSD","DOLA","ALUSD","EURT","EURS",
 }
+
+# ── Noise tweet patterns (whale alerts, transfers, mints) ──
+NOISE_PATTERNS = [
+    # Whale alert / on-chain transfer patterns
+    re.compile(r"(?:transferred|transfer)\s+(?:from|to)\s+(?:unknown|#?\w+)\s+wallet", re.I),
+    re.compile(r"\d[\d,]*\s+#?(?:USDC|USDT|BTC|ETH)\s+\(\$?[\d,]+", re.I),  # "300,000 #USDC ($300M)"
+    re.compile(r"(?:minted|burned|mint|burn)\s+(?:at|from|to)\s+", re.I),
+    re.compile(r"(?:circle|tether)\s+(?:minted|burned|treasury)", re.I),
+    re.compile(r"🚨\s*(?:\d[\d,.]*\s*)+#?\w+\s*(?:\(|\$)", re.I),  # "🚨 300,000,000 #USDC ($300M)"
+    # Generic alert bot patterns
+    re.compile(r"(?:whale|alert|tracker).*?(?:moved|deposited|withdrew|transferred)", re.I),
+    re.compile(r"(?:deposited|withdrew)\s+(?:into|from|to)\s+(?:binance|coinbase|okx|kraken|bybit|bitfinex)", re.I),
+    # Giveaway / engagement bait
+    re.compile(r"(?:giveaway|giving away|airdrop).*?(?:like|rt|retweet|follow)", re.I),
+    re.compile(r"(?:like|rt|retweet)\s+(?:and|&|to)\s+(?:follow|win|enter)", re.I),
+]
+
+# Accounts that are on-chain alert bots — their tweets about specific tokens are NOT trading signals
+ALERT_BOT_USERNAMES = {
+    "whale_alert", "lookonchain", "spot_on_chain", "Arkham", "tier10k",
+    "smartestmoney", "OnChainWizard",
+}
+
 
 LLM_FEW_SHOT_EXAMPLES = [
     {"tweet": "$BTC looking strong here, longed at 67.5k. TP 72k, SL 65k 🚀",
@@ -196,13 +287,20 @@ LLM_FEW_SHOT_EXAMPLES = [
     {"tweet": "🧵 Thread: Top 10 altcoins for 2025. Like and RT if you want me to cover more!",
      "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
     {"tweet": "$BTC whale just moved 5000 BTC to Binance. Watch closely.",
-     "label": {"ticker": "BTC", "sentiment": "neutral", "direction": "long"}},
+     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
     {"tweet": "$BTC short squeeze incoming. Funding is super negative, shorts gonna get rekt 🔥",
      "label": {"ticker": "BTC", "sentiment": "bullish", "direction": "long"}},
     {"tweet": "Just hit 100k followers! Thank you fam 🙏 Giveaway coming soon...",
      "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
     {"tweet": "$HYPE chart looking exactly like $SOL did before its run. Accumulating heavy.",
      "label": {"ticker": "HYPE", "sentiment": "bullish", "direction": "long"}},
+    # ★ NEW: whale alert / transfer noise examples
+    {"tweet": "🚨 300,000,000 #USDC (300,110,196 USD) transferred from unknown wallet to unknown wallet",
+     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
+    {"tweet": "ALERT: CIRCLE MINTED $500M USDC https://t.co/xyz",
+     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
+    {"tweet": "A whale deposited 5,000 $ETH ($10.5M) into Binance 2 hours ago",
+     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
 ]
 
 
@@ -277,9 +375,43 @@ def normalize_ticker(raw: str) -> str:
     s = ALNUM_RE.sub("", s)
     if not (2 <= len(s) <= 15):
         return "NOISE"
-    if STRICT_CANON and s not in SUPPORTED_CANON:
+    # ★ Blacklist check (stablecoins, common words)
+    if s in TICKER_BLACKLIST:
         return "NOISE"
+    # ★ STRICT: only allow tokens that exist on HyperLiquid
+    if STRICT_CANON:
+        hl_tokens = get_hl_tokens()
+        if hl_tokens and s not in hl_tokens:
+            return "NOISE"
     return s
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  NOISE DETECTION — pre-LLM fast filter
+# ═══════════════════════════════════════════════════════════════════════
+
+def _is_noise_tweet(text: str, username: str = "") -> bool:
+    """Fast check if a tweet is obviously noise before spending LLM tokens."""
+    if not text:
+        return True
+
+    # Alert bot accounts: their token mentions are on-chain data, not trading signals
+    if username.lower() in {u.lower() for u in ALERT_BOT_USERNAMES}:
+        t_lower = text.lower()
+        # Only pass through if they explicitly state a trading position
+        has_position = any(p in t_lower for p in [
+            "longed", "shorted", "buying", "selling", "entry", "tp ", "sl ",
+            "target", "stop loss", "take profit", "opened a",
+        ])
+        if not has_position:
+            return True
+
+    # Regex noise patterns (whale transfers, mints, giveaways)
+    for pattern in NOISE_PATTERNS:
+        if pattern.search(text):
+            return True
+
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -303,7 +435,6 @@ def _state_db_connect() -> sqlite3.Connection:
             updated_at       TEXT NOT NULL
         )
     """)
-    # migrate older schemas
     for col, defn in [
         ("avg_tweets_per_day",  "REAL NOT NULL DEFAULT 0"),
         ("empty_polls",         "INTEGER NOT NULL DEFAULT 0"),
@@ -324,8 +455,8 @@ MAX_POLL_INTERVAL_H = 24.0
 BACKOFF_FACTOR      = 1.5
 SPEEDUP_FACTOR      = 0.7
 PROFILE_REFRESH_DAYS = 7
-ERROR_BACKOFF_H     = 6.0       # back off 6h after repeated errors
-MAX_USER_ERRORS     = 5         # skip user entirely after 5 consecutive errors
+ERROR_BACKOFF_H     = 6.0
+MAX_USER_ERRORS     = 5
 
 def _state_get_user_id(con, username):
     row = con.execute("SELECT user_id FROM user_state WHERE username=?", (username,)).fetchone()
@@ -336,7 +467,6 @@ def _state_get_since_id(con, username):
     return row[0] if row else None
 
 def _state_should_poll(con, username) -> Tuple[bool, str]:
-    """Returns (should_poll, reason)."""
     row = con.execute(
         "SELECT last_polled_at, poll_interval_h, consecutive_errors FROM user_state WHERE username=?",
         (username,),
@@ -370,7 +500,6 @@ def _state_update_profile_time(con, username):
     con.commit()
 
 def _state_record_error(con, username, user_id):
-    """Increment error counter + still mark as polled so we don't retry instantly."""
     now = datetime.now(timezone.utc).isoformat()
     existing = con.execute("SELECT 1 FROM user_state WHERE username=?", (username,)).fetchone()
     if existing:
@@ -469,6 +598,8 @@ def _stable_tweet_hash(text: str) -> str:
 def _cheap_ticker(text):
     if not text:
         return None
+    hl_tokens = get_hl_tokens()
+
     dollar_tickers = []
     for m in DOLLAR_TICKER_RE.finditer(text):
         sym = normalize_ticker(m.group(1))
@@ -497,14 +628,16 @@ def _cheap_ticker(text):
                 best_score = score
                 best_sym = sym
         return best_sym
+
     for m in HASH_TICKER_RE.finditer(text):
         sym = normalize_ticker(m.group(1))
-        if sym in COMMON_CRYPTO:
+        if sym != "NOISE" and sym in hl_tokens:
             return sym
+
     candidates = set()
     for c in PLAIN_TICKER_RE.findall(text.upper()):
         sym = normalize_ticker(c)
-        if sym in COMMON_CRYPTO and sym not in TICKER_BLACKLIST:
+        if sym != "NOISE" and sym in hl_tokens and sym not in TICKER_BLACKLIST:
             candidates.add(sym)
     if len(candidates) == 1:
         return next(iter(candidates))
@@ -561,7 +694,6 @@ def _llm_request(messages, max_tokens, temperature, model=None, retries=4, base_
         except ShutdownRequested:
             raise
         except openai.AuthenticationError:
-            # don't retry auth errors — they'll never succeed
             raise
         except Exception as e:
             last_err = e
@@ -572,6 +704,10 @@ def _llm_request(messages, max_tokens, temperature, model=None, retries=4, base_
 
 
 def llm_batch_label(items):
+    # ★ Include HL token list in prompt so LLM knows what's tradeable
+    hl_tokens = get_hl_tokens()
+    hl_list_str = ", ".join(sorted(hl_tokens)[:80]) + ("…" if len(hl_tokens) > 80 else "")
+
     examples_str = "\n".join([
         f'  Tweet: "{ex["tweet"]}" → {json.dumps(ex["label"])}'
         for ex in LLM_FEW_SHOT_EXAMPLES
@@ -582,7 +718,10 @@ def llm_batch_label(items):
         "rules": [
             "Return JSON: {\"labels\": [{id, ticker, sentiment, direction}, ...]}",
             "Ticker: the PRIMARY crypto being traded/analyzed. Use symbol (BTC, ETH, SOL, HYPE, etc).",
+            f"  - ONLY use tickers from this tradeable set: {hl_list_str}",
             "  - 'NOISE' if tweet is not about a specific crypto trade/analysis.",
+            "  - 'NOISE' if tweet is a whale transfer alert, on-chain data, minting event, or giveaway.",
+            "  - 'NOISE' if the token mentioned is a stablecoin (USDC, USDT, DAI, etc).",
             "  - If multiple tickers, pick the one the trader is ACTING on most.",
             "Sentiment: 'bullish', 'bearish', or 'neutral'.",
             "Direction: 'long' or 'short'.",
@@ -596,7 +735,10 @@ def llm_batch_label(items):
     messages = [
         {"role": "system", "content": (
             "You are an expert crypto trading signal classifier. "
-            "Always return strict JSON. No markdown, no commentary."
+            "Always return strict JSON. No markdown, no commentary. "
+            "Only classify tweets as trading signals if the author is expressing "
+            "a directional view or taking a position. Whale alerts, transfer notifications, "
+            "minting events, and on-chain data dumps are NOISE, not trading signals."
         )},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
     ]
@@ -627,8 +769,11 @@ VISION_SYSTEM_PROMPT = (
     "You are an expert crypto trading signal classifier with chart analysis capability. "
     "Analyze the tweet text AND the attached image. "
     "Return strict JSON: {\"ticker\": \"...\", \"sentiment\": \"...\", \"direction\": \"...\"}\n"
-    "- ticker: crypto symbol or 'NOISE'.\n- sentiment: 'bullish','bearish','neutral'.\n"
-    "- direction: 'long' or 'short'.\nStrict JSON only."
+    "- ticker: crypto symbol or 'NOISE'. Only use tradeable tokens.\n"
+    "- sentiment: 'bullish','bearish','neutral'.\n"
+    "- direction: 'long' or 'short'.\n"
+    "- If the tweet is a whale alert, transfer notification, or stablecoin mention, ticker='NOISE'.\n"
+    "Strict JSON only."
 )
 
 def _llm_label_with_vision(text, image_url):
@@ -676,7 +821,6 @@ def _x_get(url, params=None, retries=3, base_delay=2.0):
                 reset_ts = r.headers.get("x-rate-limit-reset")
                 wait = max(int(reset_ts) - int(time.time()), 1) + 2 if reset_ts else int(r.headers.get("Retry-After", 60))
                 log.warning(f"X API 429 — sleeping {wait}s")
-                # sleep in small chunks so we can respond to shutdown
                 _interruptible_sleep(wait)
                 continue
             if r.status_code in (500, 502, 503, 504):
@@ -695,7 +839,6 @@ def _x_get(url, params=None, retries=3, base_delay=2.0):
     raise RuntimeError(f"X API failed after {retries} retries: {last_err}")
 
 def _interruptible_sleep(seconds):
-    """Sleep that can be interrupted by shutdown signal."""
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         if _shutdown.is_set():
@@ -796,6 +939,7 @@ def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
                 "likes": metrics.get("like_count", 0),
                 "retweets": metrics.get("retweet_count", 0),
                 "replies": metrics.get("reply_count", 0),
+                "author_username": username,  # ★ carry username for noise check
             })
         next_token = meta.get("next_token")
         if not next_token:
@@ -807,20 +951,27 @@ def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  LABEL ONE USER'S TWEETS  (cache → heuristic → LLM batch → vision)
+#  LABEL ONE USER'S TWEETS  (noise filter → cache → heuristic → LLM)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _label_tweets(tweets, cache_con, batch_size=20):
-    """Label a list of tweets. Returns list of labeled dicts.
-    Writes to label cache immediately. Never raises on LLM failure
-    for individual tweets — falls back to NOISE."""
+def _label_tweets(tweets, cache_con, username="", batch_size=20):
+    """Label a list of tweets. Returns list of labeled dicts."""
     results = []
-    llm_text_q  = []   # need LLM text
-    llm_vis_q   = []   # need LLM vision
+    llm_text_q  = []
+    llm_vis_q   = []
     token_stats = {"in": 0, "out": 0}
+    noise_filtered = 0
 
     for i, tw in enumerate(tweets):
         text = tw["text"]
+        author = tw.get("author_username", username)
+
+        # ★ 0) Pre-LLM noise filter — free, instant
+        if _is_noise_tweet(text, author):
+            results.append({**tw, "ticker": "NOISE", "sentiment": "neutral", "direction": "long"})
+            noise_filtered += 1
+            continue
+
         thash = _stable_tweet_hash(text)
 
         # 1) cache
@@ -844,6 +995,9 @@ def _label_tweets(tweets, cache_con, batch_size=20):
             llm_vis_q.append(item)
         else:
             llm_text_q.append(item)
+
+    if noise_filtered > 0:
+        log.info(f"    Pre-filtered {noise_filtered} noise tweets (whale alerts/transfers/stablecoins)")
 
     # -- batch text labeling --
     for start in range(0, len(llm_text_q), batch_size):
@@ -921,8 +1075,6 @@ def _signal_exists(session, tweet_id):
 
 
 def _write_user_signals(username, labeled_tweets, profile=None):
-    """Write one user's signals to DB in a single transaction.
-    Returns (inserted, skipped_dup, skipped_noise)."""
     relevant = [r for r in labeled_tweets if r.get("ticker") not in ("NOISE",)]
     if not relevant:
         return 0, 0, len(labeled_tweets)
@@ -966,15 +1118,13 @@ def _write_user_signals(username, labeled_tweets, profile=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  PROCESS ONE USER  (the atomic unit — fetch + label + write)
+#  PROCESS ONE USER
 # ═══════════════════════════════════════════════════════════════════════
 
 def _process_user(username, state_con, cache_con, max_days=3):
-    """Process a single user end-to-end. Returns stats dict or None."""
     cached_uid = _state_get_user_id(state_con, username)
     needs_profile = _state_needs_profile_refresh(state_con, username)
 
-    # -- resolve profile if needed --
     profile = None
     if needs_profile or not cached_uid:
         profile = _resolve_user_profile(username, state_con)
@@ -986,7 +1136,6 @@ def _process_user(username, state_con, cache_con, max_days=3):
     else:
         uid = cached_uid
 
-    # -- fetch tweets --
     since_id = _state_get_since_id(state_con, username)
     tweets = _fetch_user_tweets(uid, username, since_id=since_id, max_days=max_days)
 
@@ -994,13 +1143,10 @@ def _process_user(username, state_con, cache_con, max_days=3):
         _state_save(state_con, username, uid, tweets_found=0)
         return {"username": username, "fetched": 0, "inserted": 0, "skipped": 0, "noise": 0}
 
-    # -- label --
-    labeled, token_stats = _label_tweets(tweets, cache_con)
+    labeled, token_stats = _label_tweets(tweets, cache_con, username=username)
 
-    # -- write to DB --
     inserted, skipped, noise = _write_user_signals(username, labeled, profile=profile)
 
-    # -- update state (mark success, advance since_id) --
     newest_id = max(tweets, key=lambda t: t["tweet_id"])["tweet_id"]
     _state_save(state_con, username, uid, last_tweet_id=newest_id, tweets_found=len(tweets))
 
@@ -1020,9 +1166,12 @@ def _process_user(username, state_con, cache_con, max_days=3):
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_cycle(users, max_days=3, force_all=False):
-    """Run one full cycle over all users. Returns cycle stats."""
     state_con = _state_db_connect()
     cache_con = _label_cache_connect()
+
+    # ★ Pre-warm HL token list at cycle start
+    hl_tokens = get_hl_tokens()
+    log.info(f"📋 HL tradeable tokens: {len(hl_tokens)} loaded")
 
     stats = {
         "processed": 0, "skipped_not_due": 0, "skipped_circuit": 0,
@@ -1061,13 +1210,12 @@ def run_cycle(users, max_days=3, force_all=False):
             raise
         except openai.AuthenticationError as e:
             log.error(f"🔑 OpenAI auth error — aborting cycle: {e}")
-            raise  # bubble up, don't waste more API calls
+            raise
         except Exception as e:
             stats["failed"] += 1
             _state_record_error(state_con, username, _state_get_user_id(state_con, username) or "")
             log.error(f"  ✗ @{username} failed: {e}")
 
-        # polite delay between users
         if i < len(users) - 1:
             time.sleep(0.5)
 
@@ -1079,11 +1227,15 @@ def run_cycle(users, max_days=3, force_all=False):
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_daemon(max_days=3, force_first_cycle=False):
-    """Main entry point — runs forever until SIGTERM/SIGINT."""
     users = _resolve_user_list()
     log.info(f"🐦 Ingestor daemon starting — {len(users)} users, "
              f"cycle interval={CYCLE_INTERVAL_S}s, max_days={max_days}")
     log.info(f"   LLM={LLM_MODEL}, Vision={VISION_ENABLED} ({VISION_MODEL})")
+    log.info(f"   HL endpoint={HL_BASE_URL}")
+
+    # ★ Pre-fetch HL tokens on boot
+    hl_tokens = get_hl_tokens()
+    log.info(f"   📋 {len(hl_tokens)} tradeable tokens from HL")
 
     cycle_num = 0
     consecutive_cycle_failures = 0
@@ -1124,7 +1276,6 @@ def run_daemon(max_days=3, force_first_cycle=False):
                 log.critical(f"💀 {consecutive_cycle_failures} consecutive failures — exiting")
                 sys.exit(1)
 
-        # sleep between cycles (interruptible)
         log.info(f"💤 Sleeping {CYCLE_INTERVAL_S}s…")
         try:
             _interruptible_sleep(CYCLE_INTERVAL_S)
