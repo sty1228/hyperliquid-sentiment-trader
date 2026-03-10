@@ -493,22 +493,43 @@ def execute_copy_trade(
     size: float,
     price: float,
     reduce_only: bool = False,
+    builder_bps: int | None = None,
 ) -> dict:
+    """
+    Execute a trade on HyperLiquid with builder fee.
+
+    Args:
+        builder_bps: Override builder fee in basis points.
+                     None = use default (BUILDER_FEE from env).
+                     0 = no fee (free trade via referral).
+    """
     from hyperliquid.exchange import Exchange
     import eth_account as eth_acc
 
     acct = eth_acc.Account.from_key(private_key)
     exchange = Exchange(wallet=acct, base_url="https://api.hyperliquid.xyz")
 
-    result = exchange.order(
+    # Determine fee: explicit override > env default
+    fee_bps = builder_bps if builder_bps is not None else BUILDER_FEE
+
+    # Build order kwargs
+    order_kwargs = dict(
         name=coin,
         is_buy=is_buy,
         sz=size,
         limit_px=price,
         order_type={"limit": {"tif": "Ioc"}},
         reduce_only=reduce_only,
-        builder={"b": BUILDER_ADDRESS, "f": BUILDER_FEE},
     )
 
-    logger.info(f"Trade: {coin} {'BUY' if is_buy else 'SELL'} {size} @ {price}: {result}")
+    # Only attach builder if fee > 0 and address is set
+    if fee_bps > 0 and BUILDER_ADDRESS:
+        order_kwargs["builder"] = {"b": BUILDER_ADDRESS, "f": fee_bps}
+
+    result = exchange.order(**order_kwargs)
+
+    logger.info(
+        f"Trade: {coin} {'BUY' if is_buy else 'SELL'} {size} @ {price} "
+        f"(fee={fee_bps}bps, reduce_only={reduce_only}): {result}"
+    )
     return result
