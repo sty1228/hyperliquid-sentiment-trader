@@ -1669,6 +1669,16 @@ DEFAULT_USERS = [
     "benarmstrongsx","NeerajKA",
 ]
 
+# ═══════════════════════════════════════════════════════════════════════
+#  COMPAT: run_once() — called by ingestor_loop.py service wrapper
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_once(max_days=3):
+    """Single-cycle entry point for ingestor_loop.py compatibility."""
+    users = _resolve_user_list()
+    return run_cycle(users, max_days=max_days, force_all=False)
+
+
 def _resolve_user_list() -> List[str]:
     if SCRAPE_USERS_ENV:
         parts = [p.strip() for p in SCRAPE_USERS_ENV.split(",") if p.strip()]
