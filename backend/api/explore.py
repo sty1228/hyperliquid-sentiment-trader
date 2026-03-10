@@ -41,6 +41,10 @@ class TokenSignalRow(BaseModel):
     current_price: float | None = None
     pct_change: float | None = None
     tweet_text: str | None = None
+    tweet_image_url: str | None = None
+    likes: int | None = None
+    retweets: int | None = None
+    replies: int | None = None
     created_at: str
 
 
@@ -203,7 +207,11 @@ def get_token_detail(
                 entry_price=sig.entry_price,
                 current_price=sig.current_price,
                 pct_change=round(float(sig.pct_change), 2) if sig.pct_change is not None else None,
-                tweet_text=sig.tweet_text[:200] if sig.tweet_text else None,
+                tweet_text=sig.tweet_text or None,
+                tweet_image_url=sig.tweet_image_url or None,
+                likes=sig.likes,
+                retweets=sig.retweets,
+                replies=sig.replies,
                 created_at=sig.created_at.isoformat() if sig.created_at else "",
             ))
 
