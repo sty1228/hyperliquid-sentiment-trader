@@ -10,6 +10,9 @@ Key design principles:
   • Exponential backoff on transient errors, circuit-breaker on persistent ones.
   • Label cache ensures we never pay OpenAI twice for the same tweet text.
   • Token whitelist fetched from HyperLiquid meta — only tradeable tokens pass.
+  • ★ Confidence-gated signals: LLM must output confidence ≥ 60 AND is_signal=true.
+  • ★ neutral sentiment is never stored — only bullish/bearish with conviction.
+  • ★ Heuristic only fires on EXPLICIT trade language (entries, stops, targets).
 """
 from __future__ import annotations
 import os, re, time, json, hashlib, random, sqlite3, signal, sys
@@ -60,6 +63,9 @@ MAX_CONSECUTIVE_FAILURES = int(_env("MAX_CONSECUTIVE_FAILURES", "10"))
 
 HL_BASE_URL = _env("HL_BASE_URL", "https://api.hyperliquid.xyz")
 
+# ★ Signal quality gate
+CONFIDENCE_THRESHOLD = int(_env("CONFIDENCE_THRESHOLD", "60"))
+
 # ── regex / constants ──────────────────────────────────────────────────
 ALNUM_RE         = re.compile(r"[^A-Z0-9]")
 DOLLAR_TICKER_RE = re.compile(r"\$([A-Za-z0-9]{2,15})\b")
@@ -75,11 +81,9 @@ _hl_token_cache: Dict[str, Any] = {"tokens": set(), "fetched_at": 0.0}
 HL_TOKEN_CACHE_TTL = 3600  # refresh every hour
 
 def _fetch_hl_tokens() -> set[str]:
-    """Fetch all tradeable token symbols from HyperLiquid meta endpoint.
-    Includes both perps (meta) and spot (spotMeta) tokens."""
+    """Fetch all tradeable token symbols from HyperLiquid meta endpoint."""
     tokens: set[str] = set()
     try:
-        # Perps
         r = requests.post(f"{HL_BASE_URL}/info", json={"type": "meta"}, timeout=15)
         r.raise_for_status()
         meta = r.json()
@@ -87,8 +91,6 @@ def _fetch_hl_tokens() -> set[str]:
             name = asset.get("name", "").upper().strip()
             if name:
                 tokens.add(name)
-
-        # Spot
         try:
             r2 = requests.post(f"{HL_BASE_URL}/info", json={"type": "spotMeta"}, timeout=15)
             r2.raise_for_status()
@@ -99,16 +101,12 @@ def _fetch_hl_tokens() -> set[str]:
                     tokens.add(name)
         except Exception as e:
             log.warning(f"spotMeta fetch failed (non-fatal): {e}")
-
         log.info(f"📋 Fetched {len(tokens)} tradeable tokens from HL: {sorted(list(tokens))[:20]}…")
     except Exception as e:
         log.error(f"Failed to fetch HL tokens: {e}")
-
     return tokens
 
-
 def get_hl_tokens() -> set[str]:
-    """Get cached HL token set, refreshing if stale."""
     now = time.monotonic()
     if now - _hl_token_cache["fetched_at"] > HL_TOKEN_CACHE_TTL or not _hl_token_cache["tokens"]:
         fetched = _fetch_hl_tokens()
@@ -116,14 +114,11 @@ def get_hl_tokens() -> set[str]:
             _hl_token_cache["tokens"] = fetched
             _hl_token_cache["fetched_at"] = now
         elif not _hl_token_cache["tokens"]:
-            # Fallback: use COMMON_CRYPTO if HL is unreachable on first boot
             log.warning("Using COMMON_CRYPTO fallback — HL unreachable")
             _hl_token_cache["tokens"] = COMMON_CRYPTO_FALLBACK
-            _hl_token_cache["fetched_at"] = now - HL_TOKEN_CACHE_TTL + 120  # retry in 2 min
+            _hl_token_cache["fetched_at"] = now - HL_TOKEN_CACHE_TTL + 120
     return _hl_token_cache["tokens"]
 
-
-# Fallback only used if HL meta is down on first boot
 COMMON_CRYPTO_FALLBACK = {
     "BTC","ETH","SOL","XRP","BNB","ADA","AVAX","DOT","LINK","TON",
     "TRX","ATOM","NEAR","UNI","LTC","ETC","FIL","ICP","HBAR",
@@ -141,36 +136,58 @@ COMMON_CRYPTO_FALLBACK = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  PHRASE LISTS — tightened for precision
+# ═══════════════════════════════════════════════════════════════════════
+
+# ★ EXPLICIT TRADE LANGUAGE — only these trigger the heuristic bypass.
+# These indicate the author IS TAKING or HAS TAKEN a position.
+EXPLICIT_TRADE_PHRASES = [
+    # Position entries
+    "longed", "longing", "going long", "opened a long", "opening long",
+    "entered long", "long position", "long here", "long from", "long entry",
+    "shorted", "shorting", "going short", "opened a short", "opening short",
+    "entered short", "short position", "short here", "short from", "short entry",
+    # Trade management
+    "tp hit", "sl hit", "stop loss at", "take profit at", "target hit",
+    "closed my", "closing my", "exited my", "taking profit",
+    "entry at", "entry price", "entered at", "got in at",
+    # Explicit buy/sell with conviction
+    "loaded up", "loading up", "added more", "adding more",
+    "accumulated", "accumulating heavy",
+    "buying the dip", "btfd", "dip buy",
+    "sold my", "selling my", "fading this",
+]
+
+# Broader sentiment words — only used BY LLM, not for heuristic bypass
 POS_PHRASES = [
     "longed","longing","going long","opened a long","opening long",
     "entered long","long position","long here","long from",
     "buying","bought","loaded","loading up","adding","added more",
     "accumulating","accumulated","bid","bidding",
-    "bullish","bull case","bull flag","bull run","bull market",
+    "bullish","bull case","bull flag","bull run",
     "breakout","breaking out","broke out",
-    "pumping","ripping","flying","sending it","mooning",
-    "rally","rallying","surging","soaring","up only",
-    "new high","higher high","ath",
-    "bounce","bouncing","recovery","reversal to the upside",
+    "pumping","ripping","mooning",
+    "rally","rallying","surging",
+    "bounce","bouncing","recovery",
     "bottomed","bottom is in","dip buy","buying the dip","btfd",
-    "undervalued","outperform","strong","holding strong",
-    "🚀","✅","🔥","📈","🟢","💰","💎","⬆️",
+    "undervalued",
+    "🚀","📈","🟢",
 ]
 NEG_PHRASES = [
     "shorted","shorting","going short","opened a short","opening short",
     "entered short","short position","short here","short from",
     "selling","sold","exited","closed my","taking profit","tp hit",
     "fading","faded","cutting",
-    "bearish","bear case","bear flag","bear market",
+    "bearish","bear case","bear flag",
     "breakdown","breaking down","broke down",
-    "dumping","dumped","crashing","crashed","nuked","tanking","drilling",
-    "plunging","plunged",
-    "rejection","rejected","lower low","new low",
+    "dumping","crashed","nuked","tanking","drilling",
+    "rejection","rejected",
     "topped","top signal","top is in",
-    "overvalued","weak","dead cat","bull trap",
-    "rekt","liquidated","down bad",
-    "rug","rugged","rugpull","scam",
-    "🟥","🔻","📉","⬇️","💀","🪦",
+    "overvalued","dead cat","bull trap",
+    "rekt","liquidated",
+    "rug","rugged","scam",
+    "📉","💀",
 ]
 FALSE_POS_PATTERNS = [
     "short term","short-term","short squeeze","short covering",
@@ -221,26 +238,18 @@ ALIAS_TO_CANON: Dict[str, str] = {
     "ONDO-PERP":"ONDO","PEPE-PERP":"PEPE","DOGE-PERP":"DOGE",
     "ARB-PERP":"ARB","SUI-PERP":"SUI","APT-PERP":"APT",
     "AVAX-PERP":"AVAX","LINK-PERP":"LINK","INJ-PERP":"INJ",
-    # Stock / commodity / forex aliases → HL spot names
     "GOLD":"GLD","XAUUSD":"GLD","XAU":"GLD",
     "SILVER":"SLV","XAGUSD":"SLV","XAG":"SLV",
     "GOOG":"GOOGL","GOOGLE":"GOOGL",
-    "APPLE":"AAPL",
-    "AMAZON":"AMZN",
-    "TESLA":"TSLA",
-    "MICROSOFT":"MSFT",
-    "NVIDIA":"NVDA",
-    "ORACLE":"ORCL",
-    "SP500":"SPY","SNP500":"SPY",
-    "NASDAQ100":"QQQ","NDX":"QQQ",
+    "APPLE":"AAPL","AMAZON":"AMZN","TESLA":"TSLA",
+    "MICROSOFT":"MSFT","NVIDIA":"NVDA","ORACLE":"ORCL",
+    "SP500":"SPY","SNP500":"SPY","NASDAQ100":"QQQ","NDX":"QQQ",
     "EURUSD":"EUR",
 }
 
-# ★ NOW STRICT — only HL-listed tokens pass through normalize_ticker
 STRICT_CANON = True
 
 TICKER_BLACKLIST = {
-    # ── Common English words ──
     "THE","AND","FOR","ARE","BUT","NOT","YOU","ALL","CAN","HER","WAS","ONE",
     "OUR","OUT","HAS","HIS","HOW","ITS","MAY","NEW","NOW","OLD","SEE","WAY",
     "WHO","DID","GET","HIM","LET","SAY","SHE","TOO","USE","DAD","MOM","USA",
@@ -257,63 +266,102 @@ TICKER_BLACKLIST = {
     "LIVE","JUST","HERE","STILL","EVERY","MUCH","EVEN",
     "WIN","LOSS","CALL","PUT","STOP","ENTRY","EXIT",
     "WEEK","DAILY","TODAY","SOON",
-    # ── Stablecoins — never tradeable signals ──
     "USDT","USDC","BUSD","DAI","TUSD","USDP","GUSD","FRAX","LUSD",
     "PYUSD","FDUSD","CUSD","EUSD","SUSD","MIM","UST","USTC",
     "USDD","CRVUSD","DOLA","ALUSD","EURT","EURS",
 }
 
-# ── Noise tweet patterns (whale alerts, transfers, mints) ──
+# ── Noise tweet patterns ──
 NOISE_PATTERNS = [
-    # Whale alert / on-chain transfer patterns
     re.compile(r"(?:transferred|transfer)\s+(?:from|to)\s+(?:unknown|#?\w+)\s+wallet", re.I),
-    re.compile(r"\d[\d,]*\s+#?(?:USDC|USDT|BTC|ETH)\s+\(\$?[\d,]+", re.I),  # "300,000 #USDC ($300M)"
+    re.compile(r"\d[\d,]*\s+#?(?:USDC|USDT|BTC|ETH)\s+\(\$?[\d,]+", re.I),
     re.compile(r"(?:minted|burned|mint|burn)\s+(?:at|from|to)\s+", re.I),
     re.compile(r"(?:circle|tether)\s+(?:minted|burned|treasury)", re.I),
-    re.compile(r"🚨\s*(?:\d[\d,.]*\s*)+#?\w+\s*(?:\(|\$)", re.I),  # "🚨 300,000,000 #USDC ($300M)"
-    # Generic alert bot patterns
+    re.compile(r"🚨\s*(?:\d[\d,.]*\s*)+#?\w+\s*(?:\(|\$)", re.I),
     re.compile(r"(?:whale|alert|tracker).*?(?:moved|deposited|withdrew|transferred)", re.I),
     re.compile(r"(?:deposited|withdrew)\s+(?:into|from|to)\s+(?:binance|coinbase|okx|kraken|bybit|bitfinex)", re.I),
-    # Giveaway / engagement bait
     re.compile(r"(?:giveaway|giving away|airdrop).*?(?:like|rt|retweet|follow)", re.I),
     re.compile(r"(?:like|rt|retweet)\s+(?:and|&|to)\s+(?:follow|win|enter)", re.I),
 ]
 
-# Accounts that are on-chain alert bots — their tweets about specific tokens are NOT trading signals
 ALERT_BOT_USERNAMES = {
     "whale_alert", "lookonchain", "spot_on_chain", "Arkham", "tier10k",
     "smartestmoney", "OnChainWizard",
 }
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  ★ FEW-SHOT EXAMPLES — expanded with common false positives
+# ═══════════════════════════════════════════════════════════════════════
+
 LLM_FEW_SHOT_EXAMPLES = [
+    # ── TRUE SIGNALS: author is taking/recommending a position ──
     {"tweet": "$BTC looking strong here, longed at 67.5k. TP 72k, SL 65k 🚀",
-     "label": {"ticker": "BTC", "sentiment": "bullish", "direction": "long"}},
+     "label": {"is_signal": True, "ticker": "BTC", "sentiment": "bullish", "direction": "long", "confidence": 95}},
     {"tweet": "Shorted $ETH at 2450. This is going to 2200. Bear flag on 4H.",
-     "label": {"ticker": "ETH", "sentiment": "bearish", "direction": "short"}},
-    {"tweet": "GM CT! What a wild week. Markets are crazy right now. Stay safe out there.",
-     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
+     "label": {"is_signal": True, "ticker": "ETH", "sentiment": "bearish", "direction": "short", "confidence": 95}},
     {"tweet": "$SOL breaking out while $BTC chops. Longed SOL at $98, this is going to $120+",
-     "label": {"ticker": "SOL", "sentiment": "bullish", "direction": "long"}},
-    {"tweet": "$DOGE looks weak. Expecting a dump to 0.12. Not touching this.",
-     "label": {"ticker": "DOGE", "sentiment": "bearish", "direction": "short"}},
-    {"tweet": "🧵 Thread: Top 10 altcoins for 2025. Like and RT if you want me to cover more!",
-     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
-    {"tweet": "$BTC whale just moved 5000 BTC to Binance. Watch closely.",
-     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
+     "label": {"is_signal": True, "ticker": "SOL", "sentiment": "bullish", "direction": "long", "confidence": 90}},
+    {"tweet": "$DOGE chart looks terrible. Shorting from 0.15, expecting dump to 0.12.",
+     "label": {"is_signal": True, "ticker": "DOGE", "sentiment": "bearish", "direction": "short", "confidence": 90}},
     {"tweet": "$BTC short squeeze incoming. Funding is super negative, shorts gonna get rekt 🔥",
-     "label": {"ticker": "BTC", "sentiment": "bullish", "direction": "long"}},
-    {"tweet": "Just hit 100k followers! Thank you fam 🙏 Giveaway coming soon...",
-     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
+     "label": {"is_signal": True, "ticker": "BTC", "sentiment": "bullish", "direction": "long", "confidence": 75}},
     {"tweet": "$HYPE chart looking exactly like $SOL did before its run. Accumulating heavy.",
-     "label": {"ticker": "HYPE", "sentiment": "bullish", "direction": "long"}},
-    # ★ NEW: whale alert / transfer noise examples
+     "label": {"is_signal": True, "ticker": "HYPE", "sentiment": "bullish", "direction": "long", "confidence": 85}},
+    {"tweet": "$ETH needs to hold $2000 or we're going much lower. Bearish below that level.",
+     "label": {"is_signal": True, "ticker": "ETH", "sentiment": "bearish", "direction": "short", "confidence": 70}},
+    {"tweet": "Loading $INJ here. This is one of the most undervalued L1s. Target $50+.",
+     "label": {"is_signal": True, "ticker": "INJ", "sentiment": "bullish", "direction": "long", "confidence": 85}},
+
+    # ── NOISE: discussion, news, questions, memes, alerts ──
+    {"tweet": "GM CT! What a wild week. Markets are crazy right now. Stay safe out there.",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    {"tweet": "🧵 Thread: Top 10 altcoins for 2025. Like and RT if you want me to cover more!",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    {"tweet": "$BTC whale just moved 5000 BTC to Binance. Watch closely.",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    {"tweet": "Just hit 100k followers! Thank you fam 🙏 Giveaway coming soon...",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
     {"tweet": "🚨 300,000,000 #USDC (300,110,196 USD) transferred from unknown wallet to unknown wallet",
-     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
     {"tweet": "ALERT: CIRCLE MINTED $500M USDC https://t.co/xyz",
-     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
     {"tweet": "A whale deposited 5,000 $ETH ($10.5M) into Binance 2 hours ago",
-     "label": {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}},
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+
+    # ★ NEW: common false positives that MUST be NOISE
+    {"tweet": "guys you can trade oil on hype. not sure why that is going down",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    {"tweet": "What do you think about $ETH? Is it a good buy here or should I wait?",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    {"tweet": "Ethcoin. Basically free money. Go mine it. https://t.co/xxx",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    {"tweet": "Even Zoomer can't resist those polymarket bucks https://t.co/xxx",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    {"tweet": "$ETH is in constant overdrive mode. Only people do not comprehend it.",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 10}},
+    {"tweet": "Remember when they told you Bitcoin is Digital gold and ETH is digital oil?",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 5}},
+    {"tweet": "yeah literally, you AI agent can now trade perps on a DEX while you sleep.",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    {"tweet": "This is where I bought my first ETH back in 2017. 17 square meter in Paris.",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    {"tweet": "ETH isn't trading like digital oil at all",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 5}},
+    {"tweet": "Reports like this only strengthen my ultra bullish ETH thesis. Because they're without any real substance...",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 20}},
+    {"tweet": "AI can compress the Ethereum straw man roadmap from Completion by 2029 to 1 year if we push hard",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    {"tweet": "Broskis. As a matter of fact. 25k ETH is still the basecase.",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 25}},
+    {"tweet": "Congrats to everyone who bought $SOL under $10. What a ride.",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 5}},
+    {"tweet": "I'm not trading this chop. Sitting on my hands until we get clarity.",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    {"tweet": "$BTC dominance rising. Alts getting crushed. Be careful out there.",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 15}},
+    {"tweet": "Seems that $HYPE is preparing for a correction. Price action started to slow down and is locally breaking down.",
+     "label": {"is_signal": True, "ticker": "HYPE", "sentiment": "bearish", "direction": "short", "confidence": 70}},
 ]
 
 
@@ -388,10 +436,8 @@ def normalize_ticker(raw: str) -> str:
     s = ALNUM_RE.sub("", s)
     if not (2 <= len(s) <= 15):
         return "NOISE"
-    # ★ Blacklist check (stablecoins, common words)
     if s in TICKER_BLACKLIST:
         return "NOISE"
-    # ★ STRICT: only allow tokens that exist on HyperLiquid
     if STRICT_CANON:
         hl_tokens = get_hl_tokens()
         if hl_tokens and s not in hl_tokens:
@@ -408,18 +454,17 @@ def _is_noise_tweet(text: str, username: str = "") -> bool:
     if not text:
         return True
 
-    # Alert bot accounts: their token mentions are on-chain data, not trading signals
+    # Alert bot accounts
     if username.lower() in {u.lower() for u in ALERT_BOT_USERNAMES}:
         t_lower = text.lower()
-        # Only pass through if they explicitly state a trading position
         has_position = any(p in t_lower for p in [
-            "longed", "shorted", "buying", "selling", "entry", "tp ", "sl ",
-            "target", "stop loss", "take profit", "opened a",
+            "longed", "shorted", "buying", "selling", "entry", "tp ",
+            "sl ", "target", "stop loss", "take profit", "opened a",
         ])
         if not has_position:
             return True
 
-    # Regex noise patterns (whale transfers, mints, giveaways)
+    # Regex noise patterns
     for pattern in NOISE_PATTERNS:
         if pattern.search(text):
             return True
@@ -568,7 +613,7 @@ def _state_save(con, username, user_id, last_tweet_id=None, tweets_found=0):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  LABEL CACHE
+#  LABEL CACHE — ★ now stores confidence + is_signal
 # ═══════════════════════════════════════════════════════════════════════
 
 def _label_cache_connect() -> sqlite3.Connection:
@@ -580,23 +625,38 @@ def _label_cache_connect() -> sqlite3.Connection:
             ticker     TEXT NOT NULL,
             sentiment  TEXT NOT NULL,
             direction  TEXT NOT NULL DEFAULT 'long',
+            confidence INTEGER NOT NULL DEFAULT 50,
+            is_signal  INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         )
     """)
-    try:
-        con.execute("ALTER TABLE label_cache ADD COLUMN direction TEXT NOT NULL DEFAULT 'long'")
-    except Exception:
-        pass
+    for col, defn in [
+        ("direction",  "TEXT NOT NULL DEFAULT 'long'"),
+        ("confidence", "INTEGER NOT NULL DEFAULT 50"),
+        ("is_signal",  "INTEGER NOT NULL DEFAULT 1"),
+    ]:
+        try:
+            con.execute(f"ALTER TABLE label_cache ADD COLUMN {col} {defn}")
+        except Exception:
+            pass
     return con
 
 def _label_cache_get(con, h):
-    row = con.execute("SELECT ticker, sentiment, direction FROM label_cache WHERE tweet_hash=?", (h,)).fetchone()
-    return (row[0], row[1], row[2]) if row else None
+    row = con.execute(
+        "SELECT ticker, sentiment, direction, confidence, is_signal FROM label_cache WHERE tweet_hash=?",
+        (h,),
+    ).fetchone()
+    if row:
+        return {"ticker": row[0], "sentiment": row[1], "direction": row[2],
+                "confidence": row[3], "is_signal": bool(row[4])}
+    return None
 
-def _label_cache_put(con, h, ticker, sentiment, direction):
+def _label_cache_put(con, h, ticker, sentiment, direction, confidence=50, is_signal=True):
     con.execute(
-        "INSERT OR REPLACE INTO label_cache (tweet_hash,ticker,sentiment,direction,created_at) VALUES (?,?,?,?,?)",
-        (h, ticker, sentiment, direction, datetime.now(timezone.utc).isoformat()),
+        "INSERT OR REPLACE INTO label_cache (tweet_hash,ticker,sentiment,direction,confidence,is_signal,created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (h, ticker, sentiment, direction, confidence, int(is_signal),
+         datetime.now(timezone.utc).isoformat()),
     )
     con.commit()
 
@@ -605,7 +665,7 @@ def _stable_tweet_hash(text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  CHEAP HEURISTIC LABELING
+#  ★ HEURISTIC LABELING — much stricter, requires explicit trade language
 # ═══════════════════════════════════════════════════════════════════════
 
 def _cheap_ticker(text):
@@ -632,7 +692,7 @@ def _cheap_ticker(text):
             ctx_end = min(len(text), pos + 80)
             ctx = text[ctx_start:ctx_end].lower()
             for w in ["long","short","buy","sell","entry","target","tp","sl","stop",
-                       "loaded","shorted","longed","bullish","bearish","pump","dump","breakout"]:
+                       "loaded","shorted","longed","bullish","bearish","breakout"]:
                 if w in ctx:
                     score += 3
             if pos == dollar_tickers[0][1]:
@@ -656,7 +716,19 @@ def _cheap_ticker(text):
         return next(iter(candidates))
     return None
 
+
+def _has_explicit_trade_language(text: str) -> bool:
+    """★ Returns True only if the tweet contains EXPLICIT trade entry/exit language.
+    This is the gate for heuristic-only labeling (bypassing LLM)."""
+    t = text.lower()
+    # Check false positives first
+    for fp in FALSE_POS_PATTERNS:
+        t = t.replace(fp, "")
+    return any(phrase in t for phrase in EXPLICIT_TRADE_PHRASES)
+
+
 def _cheap_sentiment(text):
+    """Only used when _has_explicit_trade_language is True."""
     if not text:
         return None
     t = text.lower()
@@ -685,7 +757,7 @@ def _sentiment_to_direction(sentiment, text):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  OPENAI LLM
+#  ★ OPENAI LLM — with confidence + is_signal
 # ═══════════════════════════════════════════════════════════════════════
 
 def _llm_request(messages, max_tokens, temperature, model=None, retries=4, base_delay=1.0):
@@ -717,7 +789,6 @@ def _llm_request(messages, max_tokens, temperature, model=None, retries=4, base_
 
 
 def llm_batch_label(items):
-    # ★ Include HL token list in prompt so LLM knows what's tradeable
     hl_tokens = get_hl_tokens()
     hl_list_str = ", ".join(sorted(hl_tokens)[:80]) + ("…" if len(hl_tokens) > 80 else "")
 
@@ -727,65 +798,102 @@ def llm_batch_label(items):
     ])
     user_payload = {
         "task": "label_crypto_tweets",
-        "schema": {"id": "str", "ticker": "str", "sentiment": "str", "direction": "str"},
+        "schema": {"id": "str", "is_signal": "bool", "ticker": "str",
+                    "sentiment": "str", "direction": "str", "confidence": "int"},
         "rules": [
-            "Return JSON: {\"labels\": [{id, ticker, sentiment, direction}, ...]}",
-            "Ticker: the PRIMARY crypto being traded/analyzed. Use symbol (BTC, ETH, SOL, HYPE, etc).",
-            f"  - ONLY use tickers from this tradeable set: {hl_list_str}",
-            "  - 'NOISE' if tweet is not about a specific crypto trade/analysis.",
-            "  - 'NOISE' if tweet is a whale transfer alert, on-chain data, minting event, or giveaway.",
-            "  - 'NOISE' if the token mentioned is a stablecoin (USDC, USDT, DAI, etc).",
-            "  - If multiple tickers, pick the one the trader is ACTING on most.",
+            "Return JSON: {\"labels\": [{id, is_signal, ticker, sentiment, direction, confidence}, ...]}",
+            "",
+            "★ CRITICAL: is_signal (boolean) — Is the author expressing a DIRECTIONAL TRADING VIEW or TAKING A POSITION?",
+            "  TRUE if: author says they longed/shorted, gives entry/target/SL, recommends buying/selling,",
+            "    makes a specific price prediction with direction, or provides technical analysis with a clear conclusion.",
+            "  FALSE if: casual mention, question, news sharing, whale alert, on-chain data, meme, personal story,",
+            "    vague commentary ('ETH is great'), thread/engagement bait, discussion without position.",
+            "",
+            "★ confidence (0-100) — How confident are you this is a real trading signal?",
+            "  90-100: Explicit trade entry with price levels (longed at X, shorted at Y, TP/SL)",
+            "  70-89:  Clear directional view with analysis (chart breakdown, bearish below X)",
+            "  50-69:  Moderate directional opinion (bullish on X, accumulating)",
+            "  30-49:  Weak signal, could be discussion",
+            "  0-29:   Not a signal, just mentioning a token",
+            "",
+            "Ticker: the PRIMARY crypto being traded/analyzed. Use symbol (BTC, ETH, SOL, etc).",
+            f"  ONLY use tickers from: {hl_list_str}",
+            "  'NOISE' if is_signal=false, or if stablecoin, or no specific crypto.",
+            "",
             "Sentiment: 'bullish', 'bearish', or 'neutral'.",
-            "Direction: 'long' or 'short'.",
-            "  - 'short squeeze' = direction 'long'.",
-            "  - Default: bullish→long, bearish→short, neutral→long.",
-            "Strict JSON only.",
+            "  ONLY use bullish/bearish if author has a clear directional view.",
+            "  Use 'neutral' for anything ambiguous.",
+            "",
+            "Direction: 'long' or 'short'. Default: bullish→long, bearish→short, neutral→long.",
+            "  'short squeeze' = direction 'long'.",
+            "",
+            "Strict JSON only. No markdown.",
         ],
         "examples": examples_str,
         "items": [{"id": it["id"], "tweet": it["tweet"][:1000]} for it in items],
     }
     messages = [
         {"role": "system", "content": (
-            "You are an expert crypto trading signal classifier. "
-            "Always return strict JSON. No markdown, no commentary. "
-            "Only classify tweets as trading signals if the author is expressing "
-            "a directional view or taking a position. Whale alerts, transfer notifications, "
-            "minting events, and on-chain data dumps are NOISE, not trading signals."
+            "You are an expert crypto trading signal classifier for a copy-trading platform. "
+            "Your job is to determine if a tweet is an ACTIONABLE TRADING SIGNAL that someone could copy-trade. "
+            "Be STRICT. Most tweets that mention crypto are NOT trading signals. "
+            "A signal requires the author to be TAKING or RECOMMENDING a specific directional position. "
+            "Casual discussion, news, memes, questions, on-chain alerts, and vague bullishness are NOT signals. "
+            "Always return strict JSON. No markdown, no commentary."
         )},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
     ]
-    raw, tin, tout = _llm_request(messages, max_tokens=min(2500, 300 + 60 * len(items)), temperature=0.05)
+    raw, tin, tout = _llm_request(messages, max_tokens=min(3000, 400 + 80 * len(items)), temperature=0.05)
     try:
         parsed = json.loads(raw)
         out = {}
         for rec in parsed.get("labels", []):
             _id = str(rec.get("id"))
-            ticker = normalize_ticker(str(rec.get("ticker", "")))
+            is_signal = bool(rec.get("is_signal", False))
+            confidence = int(rec.get("confidence", 0))
+            ticker_raw = str(rec.get("ticker", ""))
+
+            if not is_signal or confidence < CONFIDENCE_THRESHOLD:
+                out[_id] = {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
+                            "confidence": confidence, "is_signal": False}
+                continue
+
+            ticker = normalize_ticker(ticker_raw)
             sentiment = str(rec.get("sentiment", "")).lower().strip()
             direction = str(rec.get("direction", "")).lower().strip()
             if sentiment not in ("bullish", "bearish", "neutral"):
                 sentiment = "neutral"
             if direction not in ("long", "short"):
                 direction = "long" if sentiment != "bearish" else "short"
-            out[_id] = {"ticker": ticker, "sentiment": sentiment, "direction": direction}
+
+            # ★ neutral sentiment with low confidence → NOISE
+            if sentiment == "neutral" and confidence < 80:
+                out[_id] = {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
+                            "confidence": confidence, "is_signal": False}
+                continue
+
+            out[_id] = {"ticker": ticker, "sentiment": sentiment, "direction": direction,
+                        "confidence": confidence, "is_signal": True}
         return out, tin, tout
     except Exception:
         log.warning(f"LLM parse error, fallback. Raw: {raw[:200]}")
         return (
-            {it["id"]: {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"} for it in items},
+            {it["id"]: {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
+                        "confidence": 0, "is_signal": False} for it in items},
             tin, tout,
         )
 
 
 VISION_SYSTEM_PROMPT = (
-    "You are an expert crypto trading signal classifier with chart analysis capability. "
-    "Analyze the tweet text AND the attached image. "
-    "Return strict JSON: {\"ticker\": \"...\", \"sentiment\": \"...\", \"direction\": \"...\"}\n"
+    "You are an expert crypto trading signal classifier for a copy-trading platform. "
+    "Analyze the tweet text AND the attached image (chart, screenshot, etc). "
+    "Return strict JSON: {\"is_signal\": bool, \"ticker\": \"...\", \"sentiment\": \"...\", "
+    "\"direction\": \"...\", \"confidence\": int}\n"
+    "- is_signal: true ONLY if author is taking/recommending a specific directional trade.\n"
     "- ticker: crypto symbol or 'NOISE'. Only use tradeable tokens.\n"
     "- sentiment: 'bullish','bearish','neutral'.\n"
     "- direction: 'long' or 'short'.\n"
-    "- If the tweet is a whale alert, transfer notification, or stablecoin mention, ticker='NOISE'.\n"
+    "- confidence: 0-100 how certain this is an actionable trading signal.\n"
     "Strict JSON only."
 )
 
@@ -798,19 +906,33 @@ def _llm_label_with_vision(text, image_url):
         ]},
     ]
     try:
-        raw, tin, tout = _llm_request(messages, max_tokens=100, temperature=0.05, model=VISION_MODEL)
+        raw, tin, tout = _llm_request(messages, max_tokens=120, temperature=0.05, model=VISION_MODEL)
         parsed = json.loads(raw)
+        is_signal = bool(parsed.get("is_signal", False))
+        confidence = int(parsed.get("confidence", 0))
+
+        if not is_signal or confidence < CONFIDENCE_THRESHOLD:
+            return {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
+                    "confidence": confidence, "is_signal": False}, tin, tout
+
         ticker = normalize_ticker(str(parsed.get("ticker", "")))
         sentiment = str(parsed.get("sentiment", "")).lower().strip()
         direction = str(parsed.get("direction", "")).lower().strip()
         if sentiment not in ("bullish", "bearish", "neutral"): sentiment = "neutral"
         if direction not in ("long", "short"): direction = "long" if sentiment != "bearish" else "short"
-        return {"ticker": ticker, "sentiment": sentiment, "direction": direction}, tin, tout
+
+        if sentiment == "neutral" and confidence < 80:
+            return {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
+                    "confidence": confidence, "is_signal": False}, tin, tout
+
+        return {"ticker": ticker, "sentiment": sentiment, "direction": direction,
+                "confidence": confidence, "is_signal": True}, tin, tout
     except (ShutdownRequested, openai.AuthenticationError):
         raise
     except Exception as e:
         log.warning(f"Vision failed for {image_url[:60]}…: {e}")
-        return {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}, 0, 0
+        return {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
+                "confidence": 0, "is_signal": False}, 0, 0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -952,7 +1074,7 @@ def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
                 "likes": metrics.get("like_count", 0),
                 "retweets": metrics.get("retweet_count", 0),
                 "replies": metrics.get("reply_count", 0),
-                "author_username": username,  # ★ carry username for noise check
+                "author_username": username,
             })
         next_token = meta.get("next_token")
         if not next_token:
@@ -964,7 +1086,7 @@ def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  LABEL ONE USER'S TWEETS  (noise filter → cache → heuristic → LLM)
+#  ★ LABEL ONE USER'S TWEETS — stricter pipeline
 # ═══════════════════════════════════════════════════════════════════════
 
 def _label_tweets(tweets, cache_con, username="", batch_size=20):
@@ -974,33 +1096,38 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
     llm_vis_q   = []
     token_stats = {"in": 0, "out": 0}
     noise_filtered = 0
+    heuristic_labeled = 0
 
     for i, tw in enumerate(tweets):
         text = tw["text"]
         author = tw.get("author_username", username)
 
-        # ★ 0) Pre-LLM noise filter — free, instant
+        # 0) Pre-LLM noise filter — free, instant
         if _is_noise_tweet(text, author):
-            results.append({**tw, "ticker": "NOISE", "sentiment": "neutral", "direction": "long"})
+            results.append({**tw, "ticker": "NOISE", "sentiment": "neutral",
+                            "direction": "long", "confidence": 0, "is_signal": False})
             noise_filtered += 1
             continue
 
         thash = _stable_tweet_hash(text)
 
-        # 1) cache
+        # 1) cache hit
         cached = _label_cache_get(cache_con, thash)
         if cached:
-            results.append({**tw, "ticker": cached[0], "sentiment": cached[1], "direction": cached[2]})
+            results.append({**tw, **cached})
             continue
 
-        # 2) heuristic
+        # 2) ★ Heuristic — ONLY if tweet has explicit trade language
         tk = _cheap_ticker(text)
-        st = _cheap_sentiment(text)
-        if tk and st:
-            dr = _sentiment_to_direction(st, text)
-            _label_cache_put(cache_con, thash, tk, st, dr)
-            results.append({**tw, "ticker": tk, "sentiment": st, "direction": dr})
-            continue
+        if tk and _has_explicit_trade_language(text):
+            st = _cheap_sentiment(text)
+            if st and st != "neutral":
+                dr = _sentiment_to_direction(st, text)
+                _label_cache_put(cache_con, thash, tk, st, dr, confidence=80, is_signal=True)
+                results.append({**tw, "ticker": tk, "sentiment": st, "direction": dr,
+                                "confidence": 80, "is_signal": True})
+                heuristic_labeled += 1
+                continue
 
         # 3) queue for LLM
         item = {"idx": i, "id": str(i), "tweet": text, "tw": tw}
@@ -1010,7 +1137,9 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
             llm_text_q.append(item)
 
     if noise_filtered > 0:
-        log.info(f"    Pre-filtered {noise_filtered} noise tweets (whale alerts/transfers/stablecoins)")
+        log.info(f"    Pre-filtered {noise_filtered} noise tweets")
+    if heuristic_labeled > 0:
+        log.info(f"    Heuristic-labeled {heuristic_labeled} (explicit trade language)")
 
     # -- batch text labeling --
     for start in range(0, len(llm_text_q), batch_size):
@@ -1024,12 +1153,15 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
             raise
         except Exception as e:
             log.error(f"LLM batch failed: {e} — marking {len(chunk)} as NOISE")
-            labels = {it["id"]: {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"} for it in chunk}
+            labels = {it["id"]: {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
+                                  "confidence": 0, "is_signal": False} for it in chunk}
 
         for item in chunk:
-            res = labels.get(item["id"], {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"})
+            res = labels.get(item["id"], {"ticker": "NOISE", "sentiment": "neutral",
+                                          "direction": "long", "confidence": 0, "is_signal": False})
             thash = _stable_tweet_hash(item["tweet"])
-            _label_cache_put(cache_con, thash, res["ticker"], res["sentiment"], res["direction"])
+            _label_cache_put(cache_con, thash, res["ticker"], res["sentiment"], res["direction"],
+                             res.get("confidence", 0), res.get("is_signal", False))
             results.append({**item["tw"], **res})
 
     # -- vision labeling --
@@ -1044,9 +1176,11 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
             raise
         except Exception as e:
             log.warning(f"Vision failed: {e}")
-            res = {"ticker": "NOISE", "sentiment": "neutral", "direction": "long"}
+            res = {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
+                   "confidence": 0, "is_signal": False}
         thash = _stable_tweet_hash(item["tweet"])
-        _label_cache_put(cache_con, thash, res["ticker"], res["sentiment"], res["direction"])
+        _label_cache_put(cache_con, thash, res["ticker"], res["sentiment"], res["direction"],
+                         res.get("confidence", 0), res.get("is_signal", False))
         results.append({**item["tw"], **res})
         time.sleep(0.15)
 
@@ -1054,7 +1188,7 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  DATABASE WRITE — per-user atomic commit
+#  ★ DATABASE WRITE — filters NOISE + neutral + low confidence
 # ═══════════════════════════════════════════════════════════════════════
 
 from backend.database import SessionLocal
@@ -1088,9 +1222,17 @@ def _signal_exists(session, tweet_id):
 
 
 def _write_user_signals(username, labeled_tweets, profile=None):
-    relevant = [r for r in labeled_tweets if r.get("ticker") not in ("NOISE",)]
+    # ★ THREE gates: not NOISE, is_signal=True, sentiment is bullish/bearish
+    relevant = [
+        r for r in labeled_tweets
+        if r.get("ticker") not in ("NOISE",)
+        and r.get("is_signal", False) is True
+        and r.get("sentiment") in ("bullish", "bearish")
+        and r.get("confidence", 0) >= CONFIDENCE_THRESHOLD
+    ]
     if not relevant:
-        return 0, 0, len(labeled_tweets)
+        noise = len(labeled_tweets) - len(relevant)
+        return 0, 0, noise
 
     session = SessionLocal()
     inserted = skipped = 0
@@ -1182,9 +1324,9 @@ def run_cycle(users, max_days=3, force_all=False):
     state_con = _state_db_connect()
     cache_con = _label_cache_connect()
 
-    # ★ Pre-warm HL token list at cycle start
     hl_tokens = get_hl_tokens()
     log.info(f"📋 HL tradeable tokens: {len(hl_tokens)} loaded")
+    log.info(f"🎯 Confidence threshold: {CONFIDENCE_THRESHOLD}")
 
     stats = {
         "processed": 0, "skipped_not_due": 0, "skipped_circuit": 0,
@@ -1245,8 +1387,8 @@ def run_daemon(max_days=3, force_first_cycle=False):
              f"cycle interval={CYCLE_INTERVAL_S}s, max_days={max_days}")
     log.info(f"   LLM={LLM_MODEL}, Vision={VISION_ENABLED} ({VISION_MODEL})")
     log.info(f"   HL endpoint={HL_BASE_URL}")
+    log.info(f"   🎯 Confidence threshold={CONFIDENCE_THRESHOLD}")
 
-    # ★ Pre-fetch HL tokens on boot
     hl_tokens = get_hl_tokens()
     log.info(f"   📋 {len(hl_tokens)} tradeable tokens from HL")
 
