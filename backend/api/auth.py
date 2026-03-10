@@ -103,6 +103,8 @@ def connect_wallet(body: ConnectWalletRequest, db: Session = Depends(get_db)):
     )
 
 
+# ── NOTE: single /me endpoint (was duplicated before) ────
+
 @router.get("/me", response_model=MeResponse)
 def get_me(current_user: User = Depends(get_current_user)):
     return MeResponse(
@@ -137,13 +139,3 @@ def save_sub_account(
 @router.post("/logout")
 def logout():
     return {"message": "Logged out successfully"}
-
-@router.get("/me")
-async def get_me(
-    current_user: User = Depends(get_current_user),
-):
-    return {
-        "id": current_user.id,
-        "wallet_address": current_user.wallet_address,
-        "twitter_username": current_user.twitter_username,
-    }
