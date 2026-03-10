@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 import requests as http_requests
-
+import math
 from backend.deps import get_db, get_current_user
 from backend.models.user import User
 from backend.models.trade import Trade
@@ -27,16 +27,26 @@ HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 # ── Helpers (duplicated from trading_engine to avoid circular import) ──
 
 
+
 def _round_price(raw: float) -> float:
-    """Tiered price rounding to satisfy HL tick size requirements."""
-    if raw >= 10000:
-        return round(raw)
-    elif raw >= 100:
-        return round(raw, 1)
-    elif raw >= 1:
-        return round(raw, 2)
-    else:
-        return round(raw, 4)
+    """
+    Round price to 5 significant figures — HyperLiquid's rule.
+    
+    HL rejects orders where the price has more than 5 significant figures.
+    Examples:
+      87432.1  → 87432.0  (5 sig figs)
+      1923.456 → 1923.5   (5 sig figs)
+      0.04312  → 0.043120 (5 sig figs)
+      65.432   → 65.432   (5 sig figs, already ok)
+      0.00789  → 0.007890 (already ok)
+    """
+    if raw <= 0:
+        return 0.0
+    # Number of digits before decimal point
+    magnitude = math.floor(math.log10(raw)) + 1
+    # We want 5 significant figures total
+    decimal_places = max(0, 5 - magnitude)
+    return round(raw, decimal_places)
 
 
 def _parse_order_result(result: dict) -> tuple[bool, float]:

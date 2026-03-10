@@ -17,6 +17,7 @@ import os, sys, time, math, logging, requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
+import math
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
@@ -127,16 +128,26 @@ def _parse_order_result(result: dict) -> tuple[bool, float]:
     return False, 0.0
 
 
+
 def _round_price(raw: float) -> float:
-    """Tiered price rounding to satisfy HL tick size requirements."""
-    if raw >= 10000:
-        return round(raw)
-    elif raw >= 100:
-        return round(raw, 1)
-    elif raw >= 1:
-        return round(raw, 2)
-    else:
-        return round(raw, 4)
+    """
+    Round price to 5 significant figures — HyperLiquid's rule.
+    
+    HL rejects orders where the price has more than 5 significant figures.
+    Examples:
+      87432.1  → 87432.0  (5 sig figs)
+      1923.456 → 1923.5   (5 sig figs)
+      0.04312  → 0.043120 (5 sig figs)
+      65.432   → 65.432   (5 sig figs, already ok)
+      0.00789  → 0.007890 (already ok)
+    """
+    if raw <= 0:
+        return 0.0
+    # Number of digits before decimal point
+    magnitude = math.floor(math.log10(raw)) + 1
+    # We want 5 significant figures total
+    decimal_places = max(0, 5 - magnitude)
+    return round(raw, decimal_places)
 
 
 # ═══════════════════════════════════════════════════════════════
