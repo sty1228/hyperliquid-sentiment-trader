@@ -388,10 +388,14 @@ def hl_internal_transfer(private_key: str, amount: float, destination: str) -> d
 # ═══════════════════════════════════════════════════════
 
 def approve_builder_fee_for_wallet(private_key: str) -> dict:
-    """Auto-approve builder fee for a dedicated wallet on HL.
-    Called after first deposit bridges to HL so the wallet is
-    ready for copy trading without any user-facing approval step.
-    Idempotent — safe to call multiple times."""
+    """
+    Auto-approve builder fee for a dedicated wallet on HL.
+    Called during first trade or after deposit bridges to HL.
+    Idempotent — safe to call multiple times.
+
+    ★ FIX 2026-03-14: HL SDK expects a decimal string (e.g. "0.001"),
+    not a percentage string (e.g. "0.1%"). 10 bps = 0.001.
+    """
     from hyperliquid.exchange import Exchange
     import eth_account as eth_acc
 
@@ -401,12 +405,21 @@ def approve_builder_fee_for_wallet(private_key: str) -> dict:
 
     acct = eth_acc.Account.from_key(private_key)
     exchange = Exchange(wallet=acct, base_url="https://api.hyperliquid.xyz")
-    result = exchange.approve_builder_fee(BUILDER_ADDRESS, f"{BUILDER_FEE / 100}%")
 
-    logger.info(
-        f"[{acct.address[:10]}...] Builder fee approved "
-        f"(builder={BUILDER_ADDRESS[:10]}..., fee={BUILDER_FEE} bps): {result}"
-    )
+    # ★ Convert bps to decimal string: 10 bps → 0.001
+    fee_decimal = str(BUILDER_FEE / 10_000)
+    result = exchange.approve_builder_fee(BUILDER_ADDRESS, fee_decimal)
+
+    status = result.get("status", "unknown")
+    if status == "ok":
+        logger.info(
+            f"[{acct.address[:10]}...] Builder fee approved "
+            f"(builder={BUILDER_ADDRESS[:10]}..., fee={BUILDER_FEE}bps)"
+        )
+    else:
+        logger.warning(
+            f"[{acct.address[:10]}...] Builder fee approval response: {result}"
+        )
     return result
 
 

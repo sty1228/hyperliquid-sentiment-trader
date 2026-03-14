@@ -1,7 +1,7 @@
 from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, Float, DateTime, ForeignKey
+from sqlalchemy import String, Float, Boolean, DateTime, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.database import Base
@@ -31,6 +31,10 @@ class Trade(Base):
 
     status: Mapped[str] = mapped_column(String(20), default="open")  # open | closed
     source: Mapped[str] = mapped_column(String(20), default="copy")  # copy | counter | manual
+
+    # ★ Fee tracking for affiliate revenue share
+    fee_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    is_fee_free: Mapped[bool] = mapped_column(Boolean, default=False)
 
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

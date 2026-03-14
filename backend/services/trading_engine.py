@@ -10,6 +10,11 @@ Background service handling the full trade lifecycle:
   6. Stats Recompute      — refresh TraderStats for leaderboard
   7. Mark Stale Signals
 
+★ 2026-03-14 fixes:
+  - Ghost position prevention: if DB write fails after HL fill, close on HL
+  - Auto builder fee approval: on "not approved" error, approve + retry once
+  - Session-level cache of approved wallets to avoid repeated HL calls
+
 Run:  python -m backend.services.trading_engine
 """
 from backend.services.rewards_engine import recompute_kol_points, run_weekly_distribution
@@ -17,7 +22,6 @@ import os, sys, time, math, logging, requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
-import math
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
@@ -33,7 +37,10 @@ from backend.models.follow import Follow
 from backend.models.user import User
 from backend.models.wallet import UserWallet
 from backend.models.setting import CopySetting, BalanceSnapshot
-from backend.services.wallet_manager import decrypt_key, execute_copy_trade, get_hl_balance
+from backend.services.wallet_manager import (
+    decrypt_key, execute_copy_trade, get_hl_balance,
+    approve_builder_fee_for_wallet,
+)
 
 log = logging.getLogger("trading_engine")
 
@@ -53,10 +60,14 @@ META_REFRESH_INTERVAL  = 3600       # 1 hour
 EQUITY_SKIP_THRESHOLD  = 5.0        # ★ Skip new trades below this equity
 MIN_EQUITY_CLOSE_ALL   = 2.0        # ★ Force-close ALL positions below this equity
 
-# ★ Referral / free-trade config (must match referral_api.py)
+# ★ Referral / free-trade config
 FREE_COPY_TRADES_LIMIT  = 10
 BUILDER_BPS_DEFAULT     = int(os.environ.get("HL_DEFAULT_BUILDER_BPS", "10"))
 BUILDER_ADDRESS         = os.environ.get("HL_BUILDER_ADDRESS", "")
+
+# ★ Session-level cache: wallets that have been confirmed builder-fee-approved
+#   Avoids repeated HL API calls. Cleared on engine restart.
+_approved_wallets: set[str] = set()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -108,7 +119,11 @@ def _hl_set_leverage(private_key: str, coin: str, leverage: int, cross: bool = T
         log.warning(f"Set leverage {coin} {leverage}x failed: {e}")
 
 
-def _parse_order_result(result: dict) -> tuple[bool, float]:
+def _parse_order_result(result: dict) -> tuple[bool, float, str]:
+    """
+    Parse HL order result. Returns (filled, avg_price, error_msg).
+    error_msg is empty string if no error.
+    """
     try:
         statuses = (
             result.get("response", {})
@@ -117,37 +132,78 @@ def _parse_order_result(result: dict) -> tuple[bool, float]:
         )
         for st in statuses:
             if "filled" in st:
-                return True, float(st["filled"].get("avgPx", 0))
+                return True, float(st["filled"].get("avgPx", 0)), ""
             if "resting" in st:
-                return True, 0.0
+                return True, 0.0, ""
             if "error" in st:
-                log.warning(f"Order error: {st['error']}")
-                return False, 0.0
+                return False, 0.0, st["error"]
     except Exception:
         pass
-    return False, 0.0
-
+    return False, 0.0, "unknown error"
 
 
 def _round_price(raw: float) -> float:
-    """
-    Round price to 5 significant figures — HyperLiquid's rule.
-    
-    HL rejects orders where the price has more than 5 significant figures.
-    Examples:
-      87432.1  → 87432.0  (5 sig figs)
-      1923.456 → 1923.5   (5 sig figs)
-      0.04312  → 0.043120 (5 sig figs)
-      65.432   → 65.432   (5 sig figs, already ok)
-      0.00789  → 0.007890 (already ok)
-    """
+    """Round price to 5 significant figures — HyperLiquid's rule."""
     if raw <= 0:
         return 0.0
-    # Number of digits before decimal point
     magnitude = math.floor(math.log10(raw)) + 1
-    # We want 5 significant figures total
     decimal_places = max(0, 5 - magnitude)
     return round(raw, decimal_places)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ★ BUILDER FEE AUTO-APPROVAL
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_builder_approved(pk: str, wallet_address: str) -> bool:
+    """
+    Ensure builder fee is approved for this wallet.
+    Uses session cache to avoid repeated HL calls.
+    Returns True if approved (or was already approved).
+    """
+    if wallet_address in _approved_wallets:
+        return True
+    try:
+        result = approve_builder_fee_for_wallet(pk)
+        if result.get("status") in ("ok", "skipped"):
+            _approved_wallets.add(wallet_address)
+            return True
+        # HL returns "ok" even if already approved (idempotent)
+        log.warning(f"Builder fee approval unexpected: {result}")
+        # Still add to cache — if it fails, the order will fail and we handle it
+        _approved_wallets.add(wallet_address)
+        return True
+    except Exception as e:
+        log.error(f"Builder fee approval failed for {wallet_address[:10]}…: {e}")
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ★ GHOST POSITION PREVENTION
+# ═══════════════════════════════════════════════════════════════
+
+def _emergency_close_position(pk: str, coin: str, is_buy: bool, qty: float, mid: float):
+    """
+    Emergency close: if DB write fails after HL order filled,
+    immediately send a reduce_only order to close the ghost position.
+    """
+    try:
+        close_is_buy = not is_buy  # reverse direction
+        slip = SLIPPAGE_BPS / 10_000
+        raw_price = mid * (1 + slip) if close_is_buy else mid * (1 - slip)
+        price = _round_price(raw_price)
+
+        result = execute_copy_trade(
+            private_key=pk, coin=coin, is_buy=close_is_buy,
+            size=qty, price=price, reduce_only=True,
+        )
+        filled, _, err = _parse_order_result(result)
+        if filled:
+            log.warning(f"  🛡️ Ghost position closed: {coin} qty={qty}")
+        else:
+            log.error(f"  🚨 GHOST POSITION REMAINS: {coin} qty={qty} — close failed: {err}")
+    except Exception as e:
+        log.error(f"  🚨 GHOST POSITION REMAINS: {coin} qty={qty} — emergency close error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -171,8 +227,10 @@ def _consume_free_trade(db: Session, user_id: str) -> bool:
     used = getattr(user, "free_copy_trades_used", 0) or 0
     if used >= FREE_COPY_TRADES_LIMIT:
         return False
-    user.free_copy_trades_used = used + 1
-    # Note: caller is responsible for db.commit() or it will be batched
+    try:
+        user.free_copy_trades_used = used + 1
+    except Exception:
+        pass  # Column may not exist yet — safe to skip
     return True
 
 
@@ -257,6 +315,8 @@ def _execute_for_user(
     Execute a copy (or counter) trade for one user.
     ★ is_counter=True  → flips direction (long→short, short→long).
     ★ Referral boost   → first FREE_COPY_TRADES_LIMIT trades are fee-free.
+    ★ Ghost prevention → if DB fails after HL fill, closes position on HL.
+    ★ Auto builder fee → if HL rejects for missing approval, approve + retry.
     """
     wallet = (
         db.query(UserWallet)
@@ -345,26 +405,36 @@ def _execute_for_user(
     # ── ★ Referral: check free-trade eligibility ──
     free_trades_left = _get_free_trades_remaining(db, user_id)
     is_fee_free      = free_trades_left > 0
+    builder_bps      = 0 if is_fee_free else BUILDER_BPS_DEFAULT
 
-    # builder_bps = 0 means no fee charged to the user
-    builder_bps = 0 if is_fee_free else BUILDER_BPS_DEFAULT
-
-    # ── Execute on HL ──
+    # ── ★ Ensure builder fee is approved before trading ──
     pk       = decrypt_key(wallet.encrypted_private_key)
     is_cross = (settings.margin_mode == "cross") if settings else True
     _hl_set_leverage(pk, coin, int(leverage), cross=is_cross)
 
-    result         = execute_copy_trade(
-        private_key=pk,
-        coin=coin,
-        is_buy=is_buy,
-        size=qty,
-        price=price,
-        builder_bps=builder_bps,          # ★ 0 for free trades
+    _ensure_builder_approved(pk, wallet.address)
+
+    # ── Execute on HL (with auto-retry on builder fee error) ──
+    result = execute_copy_trade(
+        private_key=pk, coin=coin, is_buy=is_buy,
+        size=qty, price=price, builder_bps=builder_bps,
     )
-    filled, avg_px = _parse_order_result(result)
+    filled, avg_px, err_msg = _parse_order_result(result)
+
+    # ★ Auto-retry: if builder fee not approved, approve and retry once
+    if not filled and "Builder fee has not been approved" in err_msg:
+        log.warning(f"  ⚡ Builder fee not approved for {wallet.address[:10]}… — approving now")
+        _approved_wallets.discard(wallet.address)  # clear cache
+        approved = _ensure_builder_approved(pk, wallet.address)
+        if approved:
+            result = execute_copy_trade(
+                private_key=pk, coin=coin, is_buy=is_buy,
+                size=qty, price=price, builder_bps=builder_bps,
+            )
+            filled, avg_px, err_msg = _parse_order_result(result)
+
     if not filled:
-        log.warning(f"  ✗ order not filled user {user_id[:8]}… {coin}")
+        log.warning(f"  ✗ order not filled user {user_id[:8]}… {coin}: {err_msg}")
         return
 
     fill_price = avg_px if avg_px > 0 else mid
@@ -373,26 +443,35 @@ def _execute_for_user(
     size_usd = qty * fill_price
     fee_usd  = 0.0 if is_fee_free else round(size_usd * builder_bps / 10_000, 6)
 
-    # ── Persist trade ──
+    # ── ★ Persist trade (with ghost position prevention) ──
     trader = db.query(Trader).filter(Trader.id == sig.trader_id).first()
-    trade  = Trade(
-        user_id        = user_id,
-        signal_id      = sig.id,
-        trader_username= trader.username if trader else None,
-        ticker         = coin,
-        direction      = effective_direction,
-        entry_price    = fill_price,
-        size_usd       = usd_alloc,
-        size_qty       = qty,
-        leverage       = leverage,
-        status         = "open",
-        source         = "counter" if is_counter else "copy",
-        fee_usd        = fee_usd,        # ★ stored for affiliate revenue share
-        is_fee_free    = is_fee_free,    # ★ flag for UI / audit
-    )
-    db.add(trade)
+    try:
+        trade = Trade(
+            user_id         = user_id,
+            signal_id       = sig.id,
+            trader_username = trader.username if trader else None,
+            ticker          = coin,
+            direction       = effective_direction,
+            entry_price     = fill_price,
+            size_usd        = usd_alloc,
+            size_qty        = qty,
+            leverage        = leverage,
+            status          = "open",
+            source          = "counter" if is_counter else "copy",
+            fee_usd         = fee_usd,
+            is_fee_free     = is_fee_free,
+        )
+        db.add(trade)
+        db.flush()  # ★ Catch DB errors immediately, before commit
+    except Exception as db_err:
+        log.error(
+            f"  🚨 DB WRITE FAILED after HL fill — closing ghost position: {db_err}"
+        )
+        db.rollback()
+        _emergency_close_position(pk, coin, is_buy, qty, mid)
+        return
 
-    # ── ★ Consume free trade slot after successful fill ──
+    # ── ★ Consume free trade slot after successful fill + DB write ──
     if is_fee_free:
         _consume_free_trade(db, user_id)
         log.info(
@@ -491,12 +570,12 @@ def _close_trade(db: Session, trade: Trade, wallet: UserWallet, mid: float, reas
         raw_price= mid * (1 + slip) if is_buy else mid * (1 - slip)
         price    = _round_price(raw_price)
 
-        result         = execute_copy_trade(
+        result          = execute_copy_trade(
             private_key=pk, coin=trade.ticker, is_buy=is_buy,
             size=trade.size_qty, price=price, reduce_only=True,
         )
-        filled, avg_px = _parse_order_result(result)
-        exit_px        = avg_px if (filled and avg_px > 0) else mid
+        filled, avg_px, _ = _parse_order_result(result)
+        exit_px         = avg_px if (filled and avg_px > 0) else mid
 
         trade.status    = "closed"
         trade.exit_price= exit_px
@@ -521,11 +600,6 @@ def _close_trade(db: Session, trade: Trade, wallet: UserWallet, mid: float, reas
 # ═══════════════════════════════════════════════════════════════
 
 def check_equity_protection(db: Session, mids: dict[str, float]):
-    """
-    ★ EQUITY PROTECTION (simple mode):
-    If a user's HL equity drops below MIN_EQUITY_CLOSE_ALL,
-    force-close ALL their open positions to prevent total wipeout.
-    """
     open_trades = db.query(Trade).filter(Trade.status == "open").all()
     if not open_trades:
         return
@@ -556,7 +630,6 @@ def check_equity_protection(db: Session, mids: dict[str, float]):
                     if mid:
                         _close_trade(db, trade, wallet, mid, "EQUITY_PROTECT")
                     else:
-                        # Can't get price — mark closed at entry (better than leaving open)
                         trade.status = "closed"
                         trade.exit_price = trade.entry_price
                         trade.closed_at = datetime.now(timezone.utc)
@@ -876,7 +949,7 @@ def run():
                 process_new_signals(db, coins, mids)
                 expire_old_signals(db)
                 update_positions(db, mids)
-                check_equity_protection(db, mids)      # ★ NEW
+                check_equity_protection(db, mids)
                 update_signal_prices(db, mids)
 
                 if loop_start - last_balance_sync >= BALANCE_SYNC_INTERVAL:
