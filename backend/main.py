@@ -24,11 +24,16 @@ from backend.api.deposit import router as deposit_router
 from backend.api.wallet import router as wallet_router
 from backend.api.explore import router as explore_router
 from backend.api.rewards import router as rewards_router
-from backend.api.referral_api import router as referral_router
+
+# referral_api is optional — skip gracefully if file doesn't exist
+try:
+    from backend.api.referral_api import router as referral_router
+    _has_referral = True
+except ImportError:
+    _has_referral = False
 
 settings = get_settings()
 
-# --- Rate Limiting (global default: 60 req/min per IP) ---
 limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 
 app = FastAPI(title="HyperCopy API", version="3.0.0")
@@ -43,7 +48,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount routers
 app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(leaderboard_router)
@@ -57,9 +61,10 @@ app.include_router(deposit_router)
 app.include_router(wallet_router)
 app.include_router(explore_router)
 app.include_router(rewards_router)
-app.include_router(referral_router)
+
+if _has_referral:
+    app.include_router(referral_router)
 
 @app.get("/")
 def root():
     return {"ok": True, "message": "HyperCopy API v3", "docs": "/docs"}
-

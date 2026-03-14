@@ -4,21 +4,22 @@ Portfolio API — Dashboard 数据（余额、持仓、盈亏曲线）
 ★ Fix 1: positions current_price 从 pnl_pct 反推，不再用 exit_price
 ★ Fix 2: 新增 GET /api/portfolio/trader-pnl — 用户实际跟单盈亏 per KOL
 ★ Fix 3: trader-pnl 新增 pnl_pct 字段（基于 size_usd 计算）
-★ Fix 4: get_dashboard_summary 用 user_wallets.hl_equity（实时），不用日快照
+★ Fix 4: _get_realtime_balance 调用 get_hl_balance()，fallback 到 balance_snapshot
 """
 from __future__ import annotations
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, func
-from sqlalchemy import case
+from sqlalchemy import desc, func, case
 from backend.deps import get_db, get_current_user
 from backend.models.user import User
 from backend.models.trade import Trade
 from backend.models.follow import Follow
 from backend.models.trader import Trader
 from backend.models.setting import BalanceSnapshot, BalanceEvent
+from backend.models.wallet import UserWallet
+from backend.services.wallet_manager import get_hl_balance
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
 
@@ -87,7 +88,6 @@ class PnlHistoryResponse(BaseModel):
     total_pnl: float = 0.0
 
 
-# ★ per-trader PnL response
 class TraderPnlItem(BaseModel):
     trader_username: str
     pnl_usd: float
@@ -116,22 +116,20 @@ def _calc_trade_pnl(db: Session, user_id: str, since: datetime | None = None) ->
 
 def _get_realtime_balance(db: Session, user_id: str) -> float:
     """
-    Primary: live HL API equity (same source as wallet/balance endpoint).
-    Fallback: latest balance_snapshot.
+    Primary: live HL API equity via get_hl_balance() (same as wallet/balance endpoint).
+    Fallback: latest balance_snapshot row.
+    Returns 0.0 if user has no dedicated wallet yet (new user).
     """
     try:
-        from backend.models.wallet import UserWallet as _UW
-        from backend.services.wallet_manager import get_hl_balance as _get_hl
-        wallet = db.query(_UW).filter(_UW.user_id == user_id).first()
+        wallet = db.query(UserWallet).filter(UserWallet.user_id == user_id).first()
         if wallet:
-            hl_state = _get_hl(wallet.address)
-            equity = hl_state.get("equity", 0.0)
+            hl_state = get_hl_balance(wallet.address)
+            equity = float(hl_state.get("equity", 0.0))
             if equity > 0:
-                return float(equity)
+                return equity
     except Exception:
         pass
 
-    # Fallback to snapshot
     latest_snap = (
         db.query(BalanceSnapshot)
         .filter(BalanceSnapshot.user_id == user_id)
@@ -143,7 +141,6 @@ def _get_realtime_balance(db: Session, user_id: str) -> float:
 
 def _compute_current_price(t: Trade) -> float | None:
     """
-    Open positions have no exit_price.
     Reverse-compute current price from pnl_pct (updated every 15s by engine).
       long:  mid = entry * (1 + pnl_pct/100)
       short: mid = entry * (1 - pnl_pct/100)
@@ -187,7 +184,8 @@ def get_profile_data(
     streak, streak_pnl = 0, 0.0
     for t in recent_trades:
         if t.pnl_usd and t.pnl_usd > 0:
-            streak += 1; streak_pnl += t.pnl_usd
+            streak += 1
+            streak_pnl += t.pnl_usd
         else:
             break
     return ProfileDataResponse(
@@ -222,15 +220,18 @@ def get_balance_history(
             .filter(BalanceEvent.user_id == current_user.id, BalanceEvent.created_at <= since_24h)
             .order_by(desc(BalanceEvent.created_at)).first()
         )
-        if latest_before:
-            opening_balance = latest_before.balance_after
-        else:
+        opening_balance = latest_before.balance_after if latest_before else 0.0
+        if not latest_before:
             snap_before = (
                 db.query(BalanceSnapshot)
-                .filter(BalanceSnapshot.user_id == current_user.id, BalanceSnapshot.snapshot_date < since_24h.date())
+                .filter(
+                    BalanceSnapshot.user_id == current_user.id,
+                    BalanceSnapshot.snapshot_date < since_24h.date(),
+                )
                 .order_by(desc(BalanceSnapshot.snapshot_date)).first()
             )
             opening_balance = snap_before.balance if snap_before else 0.0
+
         events = (
             db.query(BalanceEvent)
             .filter(BalanceEvent.user_id == current_user.id, BalanceEvent.created_at > since_24h)
@@ -243,24 +244,32 @@ def get_balance_history(
             hour_time = start_hour + timedelta(hours=h)
             hour_ts = int(hour_time.timestamp())
             while evt_idx < len(events) and int(events[evt_idx].created_at.timestamp()) <= hour_ts:
-                bal = events[evt_idx].balance_after; evt_idx += 1
+                bal = events[evt_idx].balance_after
+                evt_idx += 1
             result.append(BalanceHistoryItem(accountValue=bal, timestamp=hour_ts))
         while evt_idx < len(events):
-            bal = events[evt_idx].balance_after; evt_idx += 1
-        # ★ 最后一个点用实时余额
+            bal = events[evt_idx].balance_after
+            evt_idx += 1
         final_bal = _get_realtime_balance(db, current_user.id)
         if result:
             result[-1] = BalanceHistoryItem(accountValue=final_bal, timestamp=result[-1].timestamp)
         return result
 
-    if timeRange == "W": since = now - timedelta(weeks=1)
-    elif timeRange == "M": since = now - timedelta(days=30)
-    elif timeRange == "YTD": since = datetime(now.year, 1, 1, tzinfo=timezone.utc)
-    else: since = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    if timeRange == "W":
+        since = now - timedelta(weeks=1)
+    elif timeRange == "M":
+        since = now - timedelta(days=30)
+    elif timeRange == "YTD":
+        since = datetime(now.year, 1, 1, tzinfo=timezone.utc)
+    else:
+        since = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
     snapshots = (
         db.query(BalanceSnapshot)
-        .filter(BalanceSnapshot.user_id == current_user.id, BalanceSnapshot.snapshot_date >= since.date())
+        .filter(
+            BalanceSnapshot.user_id == current_user.id,
+            BalanceSnapshot.snapshot_date >= since.date(),
+        )
         .order_by(BalanceSnapshot.snapshot_date).all()
     )
     result: list[BalanceHistoryItem] = []
@@ -280,7 +289,6 @@ def get_balance_history(
         )
         for s in snapshots
     )
-    # ★ 最后一个点用实时余额，反映当前真实账户价值
     if result:
         final_bal = _get_realtime_balance(db, current_user.id)
         result[-1] = BalanceHistoryItem(accountValue=final_bal, timestamp=result[-1].timestamp)
@@ -321,9 +329,7 @@ def get_dashboard_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # ★ 用最新 balance_snapshot（每天由 engine 写入），不再依赖不存在的 hl_equity 字段
     balance = _get_realtime_balance(db, current_user.id)
-
     total_trades = db.query(Trade).filter(Trade.user_id == current_user.id).count()
     open_positions = db.query(Trade).filter(
         Trade.user_id == current_user.id, Trade.status == "open"
@@ -352,8 +358,8 @@ def get_trader_pnl(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Returns the user's actual trade PnL grouped by KOL.
-    pnl_pct = pnl_usd / total_size_usd * 100 (user's real return %, not KOL's stats)
+    User's actual trade PnL grouped by KOL.
+    pnl_pct = pnl_usd / total_size_usd * 100
     """
     rows = (
         db.query(
@@ -418,11 +424,16 @@ def get_pnl_history(
     user_id = current_user.id
     all_time_pnl = _calc_trade_pnl(db, user_id)
 
-    if timeRange == "D": since = now - timedelta(hours=24)
-    elif timeRange == "W": since = now - timedelta(weeks=1)
-    elif timeRange == "M": since = now - timedelta(days=30)
-    elif timeRange == "YTD": since = datetime(now.year, 1, 1, tzinfo=timezone.utc)
-    else: since = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    if timeRange == "D":
+        since = now - timedelta(hours=24)
+    elif timeRange == "W":
+        since = now - timedelta(weeks=1)
+    elif timeRange == "M":
+        since = now - timedelta(days=30)
+    elif timeRange == "YTD":
+        since = datetime(now.year, 1, 1, tzinfo=timezone.utc)
+    else:
+        since = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
     closed_trades = (
         db.query(Trade)
@@ -444,17 +455,28 @@ def get_pnl_history(
             hour_ts = int(hour_time.timestamp())
             while trade_idx < len(closed_trades):
                 t = closed_trades[trade_idx]
-                t_ts = int(t.closed_at.replace(tzinfo=timezone.utc).timestamp()) if not t.closed_at.tzinfo else int(t.closed_at.timestamp())
-                if t_ts > hour_ts: break
-                cum_pnl += float(t.pnl_usd or 0); trade_idx += 1
+                t_ts = (
+                    int(t.closed_at.replace(tzinfo=timezone.utc).timestamp())
+                    if not t.closed_at.tzinfo
+                    else int(t.closed_at.timestamp())
+                )
+                if t_ts > hour_ts:
+                    break
+                cum_pnl += float(t.pnl_usd or 0)
+                trade_idx += 1
             pnl_points.append(PnlHistoryItem(timestamp=hour_ts, pnl=round(cum_pnl, 2)))
-        unrealized = float(db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
-            Trade.user_id == user_id, Trade.status == "open"
-        ).scalar())
+        unrealized = float(
+            db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0))
+            .filter(Trade.user_id == user_id, Trade.status == "open")
+            .scalar()
+        )
         while trade_idx < len(closed_trades):
-            cum_pnl += float(closed_trades[trade_idx].pnl_usd or 0); trade_idx += 1
+            cum_pnl += float(closed_trades[trade_idx].pnl_usd or 0)
+            trade_idx += 1
         if pnl_points:
-            pnl_points[-1] = PnlHistoryItem(timestamp=pnl_points[-1].timestamp, pnl=round(cum_pnl + unrealized, 2))
+            pnl_points[-1] = PnlHistoryItem(
+                timestamp=pnl_points[-1].timestamp, pnl=round(cum_pnl + unrealized, 2)
+            )
     else:
         trade_idx, cum_pnl = 0, pnl_before
         current_date, today = since.date(), now.date()
@@ -463,16 +485,27 @@ def get_pnl_history(
             day_end_ts = day_start.timestamp() + 86400
             while trade_idx < len(closed_trades):
                 t = closed_trades[trade_idx]
-                t_ts = t.closed_at.replace(tzinfo=timezone.utc).timestamp() if not t.closed_at.tzinfo else t.closed_at.timestamp()
-                if t_ts >= day_end_ts: break
-                cum_pnl += float(t.pnl_usd or 0); trade_idx += 1
+                t_ts = (
+                    t.closed_at.replace(tzinfo=timezone.utc).timestamp()
+                    if not t.closed_at.tzinfo
+                    else t.closed_at.timestamp()
+                )
+                if t_ts >= day_end_ts:
+                    break
+                cum_pnl += float(t.pnl_usd or 0)
+                trade_idx += 1
             pnl_points.append(PnlHistoryItem(timestamp=int(day_start.timestamp()), pnl=round(cum_pnl, 2)))
             current_date += timedelta(days=1)
-        unrealized = float(db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
-            Trade.user_id == user_id, Trade.status == "open"
-        ).scalar())
+        unrealized = float(
+            db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0))
+            .filter(Trade.user_id == user_id, Trade.status == "open")
+            .scalar()
+        )
         if pnl_points:
-            pnl_points[-1] = PnlHistoryItem(timestamp=pnl_points[-1].timestamp, pnl=round(pnl_points[-1].pnl + unrealized, 2))
+            pnl_points[-1] = PnlHistoryItem(
+                timestamp=pnl_points[-1].timestamp,
+                pnl=round(pnl_points[-1].pnl + unrealized, 2),
+            )
 
     max_points = 60
     if len(pnl_points) > max_points:
