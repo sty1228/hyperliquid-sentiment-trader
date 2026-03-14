@@ -1,281 +1,500 @@
-import logging
-from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy.orm import Session
-from sqlalchemy import desc
+"""
+Portfolio API — Dashboard 数据（余额、持仓、盈亏曲线）
+
+★ Fix 1: positions current_price 从 pnl_pct 反推，不再用 exit_price
+★ Fix 2: 新增 GET /api/portfolio/trader-pnl — 用户实际跟单盈亏 per KOL
+★ Fix 3: trader-pnl 新增 pnl_pct 字段（基于 size_usd 计算）
+★ Fix 4: get_dashboard_summary 用 user_wallets.hl_equity（实时），不用日快照
+"""
+from __future__ import annotations
+from datetime import datetime, timedelta, timezone, date
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from backend.deps import get_db
+from sqlalchemy.orm import Session
+from sqlalchemy import desc, func
+from sqlalchemy import case
+from backend.deps import get_db, get_current_user
+from backend.models.user import User
+from backend.models.trade import Trade
+from backend.models.follow import Follow
+from backend.models.trader import Trader
 from backend.models.setting import BalanceSnapshot, BalanceEvent
-from backend.api.auth import get_current_user
-from backend.models.wallet import UserWallet, WalletDeposit
-from backend.services.wallet_manager import (
-    generate_wallet, encrypt_key,
-    get_usdc_balance, get_hl_balance,
-    CHAIN_ID_TO_LZ_EID,
-)
+from backend.models.wallet import UserWallet
+from backend.services.wallet_manager import get_hl_balance
 
-logger = logging.getLogger(__name__)
-
-limiter = Limiter(key_func=get_remote_address)
-router = APIRouter(prefix="/api/wallet", tags=["wallet"])
-
-# Allowed withdraw destination chain IDs
-ALLOWED_WITHDRAW_CHAINS = {42161} | set(CHAIN_ID_TO_LZ_EID.keys())
-
-CHAIN_NAMES = {
-    42161: "Arbitrum", 1: "Ethereum", 10: "Optimism", 137: "Polygon",
-    8453: "Base", 43114: "Avalanche", 5000: "Mantle", 534352: "Scroll",
-}
+router = APIRouter(prefix="/api", tags=["portfolio"])
 
 
-class WalletResponse(BaseModel):
-    address: str
-    withdraw_address: str
+# ── Response 模型 ────────────────────────────────────────
+
+class FollowerItem(BaseModel):
+    name: str
+    twitterId: str
 
 
-class BalanceResponse(BaseModel):
-    address: str
-    arb_usdc: float
-    hl_equity: float
-    hl_withdrawable: float
-    hl_positions: float
+class ProfileDataResponse(BaseModel):
+    name: str
+    twitterId: str
+    followingCount: int = 0
+    followerCount: int = 0
+    accountValue: float = 0.0
+    followerList: list[FollowerItem] = []
+    traderCopyingCount: int = 0
+    signalCount: int = 0
+    noiseCount: int = 0
+    streakCount: int = 0
+    streakCumulativePnLRate: float = 0.0
+    tradeTicks: int = 0
+    collectedPoints: float = 0.0
 
 
-class WithdrawRequest(BaseModel):
-    amount: float
-    chain_id: int = 42161
+class BalanceHistoryItem(BaseModel):
+    accountValue: float
+    timestamp: int
 
 
-class WithdrawResponse(BaseModel):
-    status: str
-    message: str
-
-
-class TransactionItem(BaseModel):
+class PositionItem(BaseModel):
     id: str
-    type: str
-    amount: float
-    status: str
-    target_chain_id: int | None = None
-    tx_hash: str | None = None
-    created_at: str
-    completed_at: str | None = None
+    ticker: str
+    direction: str
+    entry_price: float
+    current_price: float | None = None
+    size_usd: float
+    size_qty: float
+    leverage: float
+    pnl_usd: float | None = None
+    pnl_pct: float | None = None
+    trader_username: str | None = None
+    opened_at: datetime
 
 
-# ═══════════════════════════════════════════════════════
-# Wallet CRUD
-# ═══════════════════════════════════════════════════════
+class DashboardSummary(BaseModel):
+    total_balance: float = 0.0
+    total_pnl: float = 0.0
+    total_pnl_pct: float = 0.0
+    open_positions: int = 0
+    total_trades: int = 0
+    win_rate: float = 0.0
 
-@router.post("/create", response_model=WalletResponse)
-@limiter.limit("3/minute")
-def create_or_get_wallet(
-    request: Request,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user),
-):
-    existing = db.query(UserWallet).filter(UserWallet.user_id == user.id).first()
-    if existing:
-        return WalletResponse(
-            address=existing.address,
-            withdraw_address=existing.withdraw_address,
-        )
 
-    wallet_data = generate_wallet()
-    wallet = UserWallet(
-        user_id=user.id,
-        address=wallet_data["address"],
-        encrypted_private_key=encrypt_key(wallet_data["private_key"]),
-        withdraw_address=user.wallet_address,
+class PnlHistoryItem(BaseModel):
+    timestamp: int
+    pnl: float
+
+
+class PnlHistoryResponse(BaseModel):
+    data: list[PnlHistoryItem] = []
+    range_pnl: float = 0.0
+    range_pnl_pct: float = 0.0
+    total_pnl: float = 0.0
+
+
+# ★ per-trader PnL response
+class TraderPnlItem(BaseModel):
+    trader_username: str
+    pnl_usd: float
+    pnl_pct: float = 0.0
+    trade_count: int
+    open_count: int
+    source: str | None = None     # "copy" | "counter" | "mixed"
+
+
+# ── helpers ──────────────────────────────────────────────
+
+def _calc_trade_pnl(db: Session, user_id: str, since: datetime | None = None) -> float:
+    closed_q = db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+        Trade.user_id == user_id, Trade.status == "closed",
     )
-    db.add(wallet)
-    db.commit()
-    db.refresh(wallet)
-
-    return WalletResponse(
-        address=wallet.address,
-        withdraw_address=wallet.withdraw_address,
+    if since:
+        closed_q = closed_q.filter(Trade.closed_at >= since)
+    realized = float(closed_q.scalar())
+    unrealized = float(
+        db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+            Trade.user_id == user_id, Trade.status == "open",
+        ).scalar()
     )
+    return round(realized + unrealized, 2)
 
 
-@router.get("/balance", response_model=BalanceResponse)
-@limiter.limit("20/minute")
-def get_wallet_balance(
-    request: Request,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user),
-):
-    wallet = db.query(UserWallet).filter(UserWallet.user_id == user.id).first()
-    if not wallet:
-        raise HTTPException(status_code=404, detail="No wallet found")
-
-    arb_bal = get_usdc_balance(wallet.address)
-    hl_state = get_hl_balance(wallet.address)
-
-    return BalanceResponse(
-        address=wallet.address,
-        arb_usdc=arb_bal,
-        hl_equity=hl_state["equity"],
-        hl_withdrawable=hl_state["withdrawable"],
-        hl_positions=hl_state["positions"],
-    )
-
-
-@router.get("/deposits")
-@limiter.limit("20/minute")
-def get_deposit_history(
-    request: Request,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user),
-):
-    deposits = (
-        db.query(WalletDeposit)
-        .filter(WalletDeposit.user_id == user.id)
-        .order_by(WalletDeposit.created_at.desc())
-        .limit(50)
-        .all()
-    )
-    return [
-        {
-            "amount": d.amount,
-            "status": d.status,
-            "arb_tx_hash": d.arb_tx_hash,
-            "bridge_tx_hash": d.bridge_tx_hash,
-            "created_at": d.created_at.isoformat(),
-            "bridged_at": d.bridged_at.isoformat() if d.bridged_at else None,
-        }
-        for d in deposits
-    ]
-
-
-# ═══════════════════════════════════════════════════════
-# Unified Transaction History
-# ═══════════════════════════════════════════════════════
-
-@router.get("/transactions", response_model=list[TransactionItem])
-@limiter.limit("20/minute")
-def get_transactions(
-    request: Request,
-    limit: int = Query(30, ge=1, le=100),
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user),
-):
-    records = (
-        db.query(WalletDeposit)
-        .filter(WalletDeposit.user_id == user.id)
-        .order_by(desc(WalletDeposit.created_at))
-        .limit(limit)
-        .all()
-    )
-    return [
-        TransactionItem(
-            id=str(r.id),
-            type=r.type or "deposit",
-            amount=r.amount,
-            status=r.status,
-            target_chain_id=r.target_chain_id,
-            tx_hash=r.bridge_tx_hash or r.arb_tx_hash,
-            created_at=r.created_at.isoformat(),
-            completed_at=r.bridged_at.isoformat() if r.bridged_at else None,
-        )
-        for r in records
-    ]
-
-
-# ═══════════════════════════════════════════════════════
-# Withdraw — just set flag, deposit_monitor handles everything
-#
-# Flow:
-#   1. API: validate balance, record tx, set withdraw_pending=True
-#   2. Monitor detects withdraw_pending + HL balance:
-#      a) usd_transfer to master wallet (free, instant)
-#      b) master Arb USDC → user's wallet (15s)
-#   3. No $1 HL bridge fee in normal path
-# ═══════════════════════════════════════════════════════
-
-@router.post("/withdraw", response_model=WithdrawResponse)
-@limiter.limit("5/minute")
-def withdraw_to_user(
-    request: Request,
-    req: WithdrawRequest,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user),
-):
-    wallet = db.query(UserWallet).filter(UserWallet.user_id == user.id).first()
-    if not wallet:
-        raise HTTPException(status_code=404, detail="No wallet found")
-
-    if req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Invalid amount")
-
-    if req.chain_id not in ALLOWED_WITHDRAW_CHAINS:
-        raise HTTPException(status_code=400, detail=f"Unsupported chain: {req.chain_id}")
-
-    if wallet.withdraw_pending:
-        raise HTTPException(
-            status_code=409,
-            detail="A withdrawal is already in progress. Please wait.",
-        )
-
-    # Check HL balance (this is where the funds are)
-    hl_state = get_hl_balance(wallet.address)
-    if hl_state["withdrawable"] < req.amount:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Insufficient balance. Available: {hl_state['withdrawable']:.2f}",
-        )
-
-    is_cross_chain = req.chain_id != 42161
-    chain_name = CHAIN_NAMES.get(req.chain_id, f"chain {req.chain_id}")
-
+def _get_realtime_balance(db: Session, user_id: str) -> float:
+    """
+    Primary: live HL API equity (same source as wallet/balance endpoint).
+    Fallback: latest balance_snapshot.
+    """
     try:
-        # 1. Record transaction
-        tx_record = WalletDeposit(
-            user_id=user.id,
-            wallet_address=wallet.address,
-            amount=req.amount,
-            type="withdraw",
-            status="initiated",
-            target_chain_id=req.chain_id,
-            destination_address=wallet.withdraw_address,
-        )
-        db.add(tx_record)
+        wallet = db.query(UserWallet).filter(UserWallet.user_id == user_id).first()
+        if wallet:
+            hl_state = get_hl_balance(wallet.address)
+            equity = hl_state.get("equity", 0.0)
+            if equity > 0:
+                return equity
+    except Exception:
+        pass
 
-        # 2. Set withdraw_pending — monitor will handle everything
-        wallet.withdraw_pending = True
-        db.commit()
+    # Fallback to snapshot
+    latest_snap = (
+        db.query(BalanceSnapshot)
+        .filter(BalanceSnapshot.user_id == user_id)
+        .order_by(desc(BalanceSnapshot.snapshot_date))
+        .first()
+    )
+    return float(latest_snap.balance) if latest_snap else 0.0
 
-        # NOTE: We do NOT call withdraw_from_hl here anymore.
-        # The deposit_monitor will:
-        #   1. Detect HL balance + withdraw_pending
-        #   2. usd_transfer to master wallet (free)
-        #   3. Master pays user from Arb USDC
 
-        if is_cross_chain:
-            msg = (
-                f"Withdrawal of {req.amount:.2f} USDC initiated. "
-                f"Bridging to {chain_name} via Stargate V2. "
-                f"Funds will arrive in ~3-5 minutes."
-            )
+def _compute_current_price(t: Trade) -> float | None:
+    """
+    Open positions have no exit_price.
+    Reverse-compute current price from pnl_pct (updated every 15s by engine).
+      long:  mid = entry * (1 + pnl_pct/100)
+      short: mid = entry * (1 - pnl_pct/100)
+    """
+    if t.pnl_pct is None or t.entry_price is None:
+        return None
+    if t.direction == "long":
+        return round(t.entry_price * (1 + t.pnl_pct / 100), 6)
+    else:
+        return round(t.entry_price * (1 - t.pnl_pct / 100), 6)
+
+
+# ── API 端点 ─────────────────────────────────────────────
+
+@router.get("/portfolio/profile", response_model=ProfileDataResponse)
+def get_profile_data(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    following_count = db.query(Follow).filter(Follow.user_id == current_user.id).count()
+    copy_trading_count = (
+        db.query(Follow)
+        .filter(Follow.user_id == current_user.id, Follow.is_copy_trading.is_(True))
+        .count()
+    )
+    total_trades = db.query(Trade).filter(Trade.user_id == current_user.id).count()
+    account_value = _get_realtime_balance(db, current_user.id)
+    copiers_count = 0
+    if current_user.twitter_username:
+        my_trader = db.query(Trader).filter(Trader.username == current_user.twitter_username).first()
+        if my_trader:
+            copiers_count = db.query(Follow).filter(
+                Follow.trader_id == my_trader.id, Follow.is_copy_trading.is_(True),
+            ).count()
+    recent_trades = (
+        db.query(Trade)
+        .filter(Trade.user_id == current_user.id, Trade.status == "closed")
+        .order_by(desc(Trade.closed_at))
+        .limit(50).all()
+    )
+    streak, streak_pnl = 0, 0.0
+    for t in recent_trades:
+        if t.pnl_usd and t.pnl_usd > 0:
+            streak += 1; streak_pnl += t.pnl_usd
         else:
-            msg = (
-                f"Withdrawal of {req.amount:.2f} USDC initiated. "
-                f"Funds will arrive in your Arbitrum wallet in ~1-2 minutes."
-            )
+            break
+    return ProfileDataResponse(
+        name=current_user.display_name or current_user.wallet_address[:10],
+        twitterId=current_user.wallet_address,
+        followingCount=following_count,
+        followerCount=copiers_count,
+        followerList=[],
+        accountValue=account_value,
+        traderCopyingCount=copy_trading_count,
+        signalCount=total_trades,
+        noiseCount=0,
+        streakCount=streak,
+        streakCumulativePnLRate=streak_pnl,
+        tradeTicks=total_trades,
+        collectedPoints=0.0,
+    )
 
-        logger.info(
-            f"[Withdraw] User {user.id}: {req.amount:.2f} USDC "
-            f"→ {chain_name} ({wallet.withdraw_address[:10]}...). "
-            f"Monitor will process via zero-fee path."
+
+@router.get("/portfolio/balance-history", response_model=list[BalanceHistoryItem])
+def get_balance_history(
+    timeRange: str = Query("W", regex="^(D|W|M|YTD|ALL)$"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    now = datetime.now(timezone.utc)
+
+    if timeRange == "D":
+        since_24h = now - timedelta(hours=24)
+        latest_before = (
+            db.query(BalanceEvent)
+            .filter(BalanceEvent.user_id == current_user.id, BalanceEvent.created_at <= since_24h)
+            .order_by(desc(BalanceEvent.created_at)).first()
         )
+        if latest_before:
+            opening_balance = latest_before.balance_after
+        else:
+            snap_before = (
+                db.query(BalanceSnapshot)
+                .filter(BalanceSnapshot.user_id == current_user.id, BalanceSnapshot.snapshot_date < since_24h.date())
+                .order_by(desc(BalanceSnapshot.snapshot_date)).first()
+            )
+            opening_balance = snap_before.balance if snap_before else 0.0
+        events = (
+            db.query(BalanceEvent)
+            .filter(BalanceEvent.user_id == current_user.id, BalanceEvent.created_at > since_24h)
+            .order_by(BalanceEvent.created_at).all()
+        )
+        start_hour = since_24h.replace(minute=0, second=0, microsecond=0)
+        evt_idx, bal = 0, opening_balance
+        result: list[BalanceHistoryItem] = []
+        for h in range(0, 25, 2):
+            hour_time = start_hour + timedelta(hours=h)
+            hour_ts = int(hour_time.timestamp())
+            while evt_idx < len(events) and int(events[evt_idx].created_at.timestamp()) <= hour_ts:
+                bal = events[evt_idx].balance_after; evt_idx += 1
+            result.append(BalanceHistoryItem(accountValue=bal, timestamp=hour_ts))
+        while evt_idx < len(events):
+            bal = events[evt_idx].balance_after; evt_idx += 1
+        # ★ 最后一个点用实时余额
+        final_bal = _get_realtime_balance(db, current_user.id)
+        if result:
+            result[-1] = BalanceHistoryItem(accountValue=final_bal, timestamp=result[-1].timestamp)
+        return result
 
-        return WithdrawResponse(status="processing", message=msg)
+    if timeRange == "W": since = now - timedelta(weeks=1)
+    elif timeRange == "M": since = now - timedelta(days=30)
+    elif timeRange == "YTD": since = datetime(now.year, 1, 1, tzinfo=timezone.utc)
+    else: since = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
-    except Exception as e:
-        wallet.withdraw_pending = False
-        if tx_record:
-            tx_record.status = "failed"
-        db.commit()
-        logger.error(f"[Withdraw] Failed for user {user.id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Withdrawal failed: {str(e)}")
+    snapshots = (
+        db.query(BalanceSnapshot)
+        .filter(BalanceSnapshot.user_id == current_user.id, BalanceSnapshot.snapshot_date >= since.date())
+        .order_by(BalanceSnapshot.snapshot_date).all()
+    )
+    result: list[BalanceHistoryItem] = []
+    if snapshots and len(snapshots) < 7:
+        first_date = snapshots[0].snapshot_date
+        days_available = (first_date - since.date()).days
+        for i in range(min(7 - len(snapshots), days_available), 0, -1):
+            pad_date = first_date - timedelta(days=i)
+            result.append(BalanceHistoryItem(
+                accountValue=0.0,
+                timestamp=int(datetime.combine(pad_date, datetime.min.time()).replace(tzinfo=timezone.utc).timestamp()),
+            ))
+    result.extend(
+        BalanceHistoryItem(
+            accountValue=s.balance,
+            timestamp=int(datetime.combine(s.snapshot_date, datetime.min.time()).replace(tzinfo=timezone.utc).timestamp()),
+        )
+        for s in snapshots
+    )
+    # ★ 最后一个点用实时余额，反映当前真实账户价值
+    if result:
+        final_bal = _get_realtime_balance(db, current_user.id)
+        result[-1] = BalanceHistoryItem(accountValue=final_bal, timestamp=result[-1].timestamp)
+    return result
+
+
+@router.get("/portfolio/positions", response_model=list[PositionItem])
+def get_open_positions(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    positions = (
+        db.query(Trade)
+        .filter(Trade.user_id == current_user.id, Trade.status == "open")
+        .order_by(desc(Trade.opened_at)).all()
+    )
+    return [
+        PositionItem(
+            id=t.id,
+            ticker=t.ticker,
+            direction=t.direction,
+            entry_price=t.entry_price,
+            current_price=_compute_current_price(t),
+            size_usd=t.size_usd,
+            size_qty=t.size_qty,
+            leverage=t.leverage,
+            pnl_usd=t.pnl_usd,
+            pnl_pct=t.pnl_pct,
+            trader_username=t.trader_username,
+            opened_at=t.opened_at,
+        )
+        for t in positions
+    ]
+
+
+@router.get("/portfolio/summary", response_model=DashboardSummary)
+def get_dashboard_summary(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # ★ 用最新 balance_snapshot（每天由 engine 写入），不再依赖不存在的 hl_equity 字段
+    balance = _get_realtime_balance(db, current_user.id)
+
+    total_trades = db.query(Trade).filter(Trade.user_id == current_user.id).count()
+    open_positions = db.query(Trade).filter(
+        Trade.user_id == current_user.id, Trade.status == "open"
+    ).count()
+    total_pnl = _calc_trade_pnl(db, current_user.id)
+    closed_trades = db.query(Trade).filter(
+        Trade.user_id == current_user.id, Trade.status == "closed"
+    ).all()
+    wins = sum(1 for t in closed_trades if t.pnl_usd and t.pnl_usd > 0)
+    win_rate = (wins / len(closed_trades) * 100) if closed_trades else 0.0
+    pnl_pct = (total_pnl / balance * 100) if balance > 0 else 0.0
+
+    return DashboardSummary(
+        total_balance=balance,
+        total_pnl=total_pnl,
+        total_pnl_pct=pnl_pct,
+        open_positions=open_positions,
+        total_trades=total_trades,
+        win_rate=win_rate,
+    )
+
+
+@router.get("/portfolio/trader-pnl", response_model=list[TraderPnlItem])
+def get_trader_pnl(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Returns the user's actual trade PnL grouped by KOL.
+    pnl_pct = pnl_usd / total_size_usd * 100 (user's real return %, not KOL's stats)
+    """
+    rows = (
+        db.query(
+            Trade.trader_username,
+            Trade.source,
+            func.coalesce(func.sum(Trade.pnl_usd), 0.0).label("pnl_usd"),
+            func.coalesce(func.sum(Trade.size_usd), 0.0).label("total_size_usd"),
+            func.count(Trade.id).label("trade_count"),
+            func.sum(case((Trade.status == "open", 1), else_=0)).label("open_count"),
+        )
+        .filter(Trade.user_id == current_user.id, Trade.trader_username.isnot(None))
+        .group_by(Trade.trader_username, Trade.source)
+        .all()
+    )
+
+    merged: dict[str, dict] = {}
+    for r in rows:
+        uname = r.trader_username
+        pnl = round(float(r.pnl_usd), 2)
+        size = float(r.total_size_usd or 0)
+        cnt = int(r.trade_count)
+        open_cnt = int(r.open_count or 0)
+        src = r.source or "copy"
+
+        if uname in merged:
+            m = merged[uname]
+            m["pnl_usd"] = round(m["pnl_usd"] + pnl, 2)
+            m["total_size_usd"] += size
+            m["trade_count"] += cnt
+            m["open_count"] += open_cnt
+            m["source"] = "mixed" if m["source"] != src else src
+        else:
+            merged[uname] = {
+                "pnl_usd": pnl,
+                "total_size_usd": size,
+                "trade_count": cnt,
+                "open_count": open_cnt,
+                "source": src,
+            }
+
+    result = []
+    for uname, m in merged.items():
+        pnl_pct = round(m["pnl_usd"] / m["total_size_usd"] * 100, 2) if m["total_size_usd"] > 0 else 0.0
+        result.append(TraderPnlItem(
+            trader_username=uname,
+            pnl_usd=m["pnl_usd"],
+            pnl_pct=pnl_pct,
+            trade_count=m["trade_count"],
+            open_count=m["open_count"],
+            source=m["source"],
+        ))
+    return result
+
+
+@router.get("/portfolio/pnl-history", response_model=PnlHistoryResponse)
+def get_pnl_history(
+    timeRange: str = Query("M", regex="^(D|W|M|YTD|ALL)$"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    now = datetime.now(timezone.utc)
+    user_id = current_user.id
+    all_time_pnl = _calc_trade_pnl(db, user_id)
+
+    if timeRange == "D": since = now - timedelta(hours=24)
+    elif timeRange == "W": since = now - timedelta(weeks=1)
+    elif timeRange == "M": since = now - timedelta(days=30)
+    elif timeRange == "YTD": since = datetime(now.year, 1, 1, tzinfo=timezone.utc)
+    else: since = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+    closed_trades = (
+        db.query(Trade)
+        .filter(Trade.user_id == user_id, Trade.status == "closed", Trade.closed_at >= since)
+        .order_by(Trade.closed_at).all()
+    )
+    pnl_before = float(
+        db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+            Trade.user_id == user_id, Trade.status == "closed", Trade.closed_at < since,
+        ).scalar()
+    )
+    pnl_points: list[PnlHistoryItem] = []
+
+    if timeRange == "D":
+        start_hour = since.replace(minute=0, second=0, microsecond=0)
+        trade_idx, cum_pnl = 0, pnl_before
+        for h in range(0, 25, 2):
+            hour_time = start_hour + timedelta(hours=h)
+            hour_ts = int(hour_time.timestamp())
+            while trade_idx < len(closed_trades):
+                t = closed_trades[trade_idx]
+                t_ts = int(t.closed_at.replace(tzinfo=timezone.utc).timestamp()) if not t.closed_at.tzinfo else int(t.closed_at.timestamp())
+                if t_ts > hour_ts: break
+                cum_pnl += float(t.pnl_usd or 0); trade_idx += 1
+            pnl_points.append(PnlHistoryItem(timestamp=hour_ts, pnl=round(cum_pnl, 2)))
+        unrealized = float(db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+            Trade.user_id == user_id, Trade.status == "open"
+        ).scalar())
+        while trade_idx < len(closed_trades):
+            cum_pnl += float(closed_trades[trade_idx].pnl_usd or 0); trade_idx += 1
+        if pnl_points:
+            pnl_points[-1] = PnlHistoryItem(timestamp=pnl_points[-1].timestamp, pnl=round(cum_pnl + unrealized, 2))
+    else:
+        trade_idx, cum_pnl = 0, pnl_before
+        current_date, today = since.date(), now.date()
+        while current_date <= today:
+            day_start = datetime.combine(current_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+            day_end_ts = day_start.timestamp() + 86400
+            while trade_idx < len(closed_trades):
+                t = closed_trades[trade_idx]
+                t_ts = t.closed_at.replace(tzinfo=timezone.utc).timestamp() if not t.closed_at.tzinfo else t.closed_at.timestamp()
+                if t_ts >= day_end_ts: break
+                cum_pnl += float(t.pnl_usd or 0); trade_idx += 1
+            pnl_points.append(PnlHistoryItem(timestamp=int(day_start.timestamp()), pnl=round(cum_pnl, 2)))
+            current_date += timedelta(days=1)
+        unrealized = float(db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+            Trade.user_id == user_id, Trade.status == "open"
+        ).scalar())
+        if pnl_points:
+            pnl_points[-1] = PnlHistoryItem(timestamp=pnl_points[-1].timestamp, pnl=round(pnl_points[-1].pnl + unrealized, 2))
+
+    max_points = 60
+    if len(pnl_points) > max_points:
+        step = len(pnl_points) / max_points
+        thinned = [pnl_points[int(i * step)] for i in range(max_points - 1)]
+        thinned.append(pnl_points[-1])
+        pnl_points = thinned
+
+    if len(pnl_points) < 2:
+        since_ts = int(since.replace(tzinfo=timezone.utc).timestamp()) if not since.tzinfo else int(since.timestamp())
+        pnl_points.insert(0, PnlHistoryItem(timestamp=since_ts, pnl=round(pnl_before, 2)))
+
+    range_pnl, range_pnl_pct = 0.0, 0.0
+    if len(pnl_points) >= 2:
+        range_pnl = round(pnl_points[-1].pnl - pnl_points[0].pnl, 2)
+        balance = _get_realtime_balance(db, user_id)
+        if balance > 0:
+            range_pnl_pct = round(range_pnl / balance * 100, 2)
+
+    return PnlHistoryResponse(
+        data=pnl_points,
+        range_pnl=range_pnl,
+        range_pnl_pct=range_pnl_pct,
+        total_pnl=all_time_pnl,
+    )
