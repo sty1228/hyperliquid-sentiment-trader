@@ -116,29 +116,29 @@ def _calc_trade_pnl(db: Session, user_id: str, since: datetime | None = None) ->
 
 def _get_realtime_balance(db: Session, user_id: str) -> float:
     """
-    Latest balance_event → latest balance_snapshot.
+    Primary: live HL API equity (same source as wallet/balance endpoint).
+    Fallback: latest balance_snapshot.
     """
-    latest_evt = (
-        db.query(BalanceEvent)
-        .filter(BalanceEvent.user_id == user_id)
-        .order_by(desc(BalanceEvent.created_at))
-        .first()
-    )
+    try:
+        from backend.models.wallet import UserWallet as _UW
+        from backend.services.wallet_manager import get_hl_balance as _get_hl
+        wallet = db.query(_UW).filter(_UW.user_id == user_id).first()
+        if wallet:
+            hl_state = _get_hl(wallet.address)
+            equity = hl_state.get("equity", 0.0)
+            if equity > 0:
+                return float(equity)
+    except Exception:
+        pass
+
+    # Fallback to snapshot
     latest_snap = (
         db.query(BalanceSnapshot)
         .filter(BalanceSnapshot.user_id == user_id)
         .order_by(desc(BalanceSnapshot.snapshot_date))
         .first()
     )
-    if latest_evt and latest_snap:
-        snap_ts = datetime.combine(latest_snap.snapshot_date, datetime.min.time()).replace(tzinfo=timezone.utc).timestamp()
-        evt_ts = latest_evt.created_at.replace(tzinfo=timezone.utc).timestamp() if not latest_evt.created_at.tzinfo else latest_evt.created_at.timestamp()
-        return float(latest_evt.balance_after) if evt_ts >= snap_ts else float(latest_snap.balance)
-    elif latest_evt:
-        return float(latest_evt.balance_after)
-    elif latest_snap:
-        return float(latest_snap.balance)
-    return 0.0
+    return float(latest_snap.balance) if latest_snap else 0.0
 
 
 def _compute_current_price(t: Trade) -> float | None:
