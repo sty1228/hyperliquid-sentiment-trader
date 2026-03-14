@@ -19,7 +19,6 @@ from backend.models.trade import Trade
 from backend.models.follow import Follow
 from backend.models.trader import Trader
 from backend.models.setting import BalanceSnapshot, BalanceEvent
-from backend.models.wallet import UserWallet
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
 
@@ -117,13 +116,8 @@ def _calc_trade_pnl(db: Session, user_id: str, since: datetime | None = None) ->
 
 def _get_realtime_balance(db: Session, user_id: str) -> float:
     """
-    Primary: user_wallets.hl_equity (updated every 15s by engine).
-    Fallback: latest balance_event → latest balance_snapshot.
+    Latest balance_event → latest balance_snapshot.
     """
-    wallet = db.query(UserWallet).filter(UserWallet.user_id == user_id).first()
-    if wallet and wallet.hl_equity and float(wallet.hl_equity) > 0:
-        return float(wallet.hl_equity)
-
     latest_evt = (
         db.query(BalanceEvent)
         .filter(BalanceEvent.user_id == user_id)
@@ -327,7 +321,7 @@ def get_dashboard_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # ★ 用 hl_equity（engine 每 15s 更新），不用日快照，消除余额闪烁
+    # ★ 用最新 balance_snapshot（每天由 engine 写入），不再依赖不存在的 hl_equity 字段
     balance = _get_realtime_balance(db, current_user.id)
 
     total_trades = db.query(Trade).filter(Trade.user_id == current_user.id).count()
