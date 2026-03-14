@@ -4,6 +4,7 @@ Portfolio API — Dashboard 数据（余额、持仓、盈亏曲线）
 ★ Fix 1: positions current_price 从 pnl_pct 反推，不再用 exit_price
 ★ Fix 2: 新增 GET /api/portfolio/trader-pnl — 用户实际跟单盈亏 per KOL
 ★ Fix 3: trader-pnl 新增 pnl_pct 字段（基于 size_usd 计算）
+★ Fix 4: get_dashboard_summary 用 user_wallets.hl_equity（实时），不用日快照
 """
 from __future__ import annotations
 from datetime import datetime, timedelta, timezone, date
@@ -18,6 +19,7 @@ from backend.models.trade import Trade
 from backend.models.follow import Follow
 from backend.models.trader import Trader
 from backend.models.setting import BalanceSnapshot, BalanceEvent
+from backend.models.wallet import UserWallet
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
 
@@ -86,11 +88,11 @@ class PnlHistoryResponse(BaseModel):
     total_pnl: float = 0.0
 
 
-# ★ per-trader PnL response — 新增 pnl_pct
+# ★ per-trader PnL response
 class TraderPnlItem(BaseModel):
     trader_username: str
     pnl_usd: float
-    pnl_pct: float = 0.0          # ★ 新增：用户在该KOL名下的实际回报%
+    pnl_pct: float = 0.0
     trade_count: int
     open_count: int
     source: str | None = None     # "copy" | "counter" | "mixed"
@@ -114,6 +116,14 @@ def _calc_trade_pnl(db: Session, user_id: str, since: datetime | None = None) ->
 
 
 def _get_realtime_balance(db: Session, user_id: str) -> float:
+    """
+    Primary: user_wallets.hl_equity (updated every 15s by engine).
+    Fallback: latest balance_event → latest balance_snapshot.
+    """
+    wallet = db.query(UserWallet).filter(UserWallet.user_id == user_id).first()
+    if wallet and wallet.hl_equity and float(wallet.hl_equity) > 0:
+        return float(wallet.hl_equity)
+
     latest_evt = (
         db.query(BalanceEvent)
         .filter(BalanceEvent.user_id == user_id)
@@ -139,7 +149,7 @@ def _get_realtime_balance(db: Session, user_id: str) -> float:
 
 def _compute_current_price(t: Trade) -> float | None:
     """
-    ★ FIX: open positions have no exit_price.
+    Open positions have no exit_price.
     Reverse-compute current price from pnl_pct (updated every 15s by engine).
       long:  mid = entry * (1 + pnl_pct/100)
       short: mid = entry * (1 - pnl_pct/100)
@@ -166,13 +176,7 @@ def get_profile_data(
         .count()
     )
     total_trades = db.query(Trade).filter(Trade.user_id == current_user.id).count()
-    latest_snapshot = (
-        db.query(BalanceSnapshot)
-        .filter(BalanceSnapshot.user_id == current_user.id)
-        .order_by(desc(BalanceSnapshot.snapshot_date))
-        .first()
-    )
-    account_value = latest_snapshot.balance if latest_snapshot else 0.0
+    account_value = _get_realtime_balance(db, current_user.id)
     copiers_count = 0
     if current_user.twitter_username:
         my_trader = db.query(Trader).filter(Trader.username == current_user.twitter_username).first()
@@ -249,12 +253,8 @@ def get_balance_history(
             result.append(BalanceHistoryItem(accountValue=bal, timestamp=hour_ts))
         while evt_idx < len(events):
             bal = events[evt_idx].balance_after; evt_idx += 1
-        latest_snap = (
-            db.query(BalanceSnapshot)
-            .filter(BalanceSnapshot.user_id == current_user.id)
-            .order_by(desc(BalanceSnapshot.snapshot_date)).first()
-        )
-        final_bal = latest_snap.balance if latest_snap else bal
+        # ★ 最后一个点用实时余额
+        final_bal = _get_realtime_balance(db, current_user.id)
         if result:
             result[-1] = BalanceHistoryItem(accountValue=final_bal, timestamp=result[-1].timestamp)
         return result
@@ -286,6 +286,10 @@ def get_balance_history(
         )
         for s in snapshots
     )
+    # ★ 最后一个点用实时余额，反映当前真实账户价值
+    if result:
+        final_bal = _get_realtime_balance(db, current_user.id)
+        result[-1] = BalanceHistoryItem(accountValue=final_bal, timestamp=result[-1].timestamp)
     return result
 
 
@@ -323,26 +327,31 @@ def get_dashboard_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    latest_snapshot = (
-        db.query(BalanceSnapshot)
-        .filter(BalanceSnapshot.user_id == current_user.id)
-        .order_by(desc(BalanceSnapshot.snapshot_date)).first()
-    )
+    # ★ 用 hl_equity（engine 每 15s 更新），不用日快照，消除余额闪烁
+    balance = _get_realtime_balance(db, current_user.id)
+
     total_trades = db.query(Trade).filter(Trade.user_id == current_user.id).count()
-    open_positions = db.query(Trade).filter(Trade.user_id == current_user.id, Trade.status == "open").count()
+    open_positions = db.query(Trade).filter(
+        Trade.user_id == current_user.id, Trade.status == "open"
+    ).count()
     total_pnl = _calc_trade_pnl(db, current_user.id)
-    closed_trades = db.query(Trade).filter(Trade.user_id == current_user.id, Trade.status == "closed").all()
+    closed_trades = db.query(Trade).filter(
+        Trade.user_id == current_user.id, Trade.status == "closed"
+    ).all()
     wins = sum(1 for t in closed_trades if t.pnl_usd and t.pnl_usd > 0)
     win_rate = (wins / len(closed_trades) * 100) if closed_trades else 0.0
-    balance = latest_snapshot.balance if latest_snapshot else 0.0
     pnl_pct = (total_pnl / balance * 100) if balance > 0 else 0.0
+
     return DashboardSummary(
-        total_balance=balance, total_pnl=total_pnl, total_pnl_pct=pnl_pct,
-        open_positions=open_positions, total_trades=total_trades, win_rate=win_rate,
+        total_balance=balance,
+        total_pnl=total_pnl,
+        total_pnl_pct=pnl_pct,
+        open_positions=open_positions,
+        total_trades=total_trades,
+        win_rate=win_rate,
     )
 
 
-# ★ 用户实际跟单盈亏 per KOL（含 pnl_pct）
 @router.get("/portfolio/trader-pnl", response_model=list[TraderPnlItem])
 def get_trader_pnl(
     db: Session = Depends(get_db),
@@ -357,7 +366,7 @@ def get_trader_pnl(
             Trade.trader_username,
             Trade.source,
             func.coalesce(func.sum(Trade.pnl_usd), 0.0).label("pnl_usd"),
-            func.coalesce(func.sum(Trade.size_usd), 0.0).label("total_size_usd"),  # ★ 新增
+            func.coalesce(func.sum(Trade.size_usd), 0.0).label("total_size_usd"),
             func.count(Trade.id).label("trade_count"),
             func.sum(case((Trade.status == "open", 1), else_=0)).label("open_count"),
         )
@@ -366,8 +375,6 @@ def get_trader_pnl(
         .all()
     )
 
-    # 按 trader_username 合并（可能有 copy + counter 两条）
-    # 用 total_size_usd 累加来正确计算合并后的 pnl_pct
     merged: dict[str, dict] = {}
     for r in rows:
         uname = r.trader_username
@@ -399,7 +406,7 @@ def get_trader_pnl(
         result.append(TraderPnlItem(
             trader_username=uname,
             pnl_usd=m["pnl_usd"],
-            pnl_pct=pnl_pct,          # ★ 真实用户回报%
+            pnl_pct=pnl_pct,
             trade_count=m["trade_count"],
             open_count=m["open_count"],
             source=m["source"],
@@ -447,7 +454,9 @@ def get_pnl_history(
                 if t_ts > hour_ts: break
                 cum_pnl += float(t.pnl_usd or 0); trade_idx += 1
             pnl_points.append(PnlHistoryItem(timestamp=hour_ts, pnl=round(cum_pnl, 2)))
-        unrealized = float(db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(Trade.user_id == user_id, Trade.status == "open").scalar())
+        unrealized = float(db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+            Trade.user_id == user_id, Trade.status == "open"
+        ).scalar())
         while trade_idx < len(closed_trades):
             cum_pnl += float(closed_trades[trade_idx].pnl_usd or 0); trade_idx += 1
         if pnl_points:
@@ -465,7 +474,9 @@ def get_pnl_history(
                 cum_pnl += float(t.pnl_usd or 0); trade_idx += 1
             pnl_points.append(PnlHistoryItem(timestamp=int(day_start.timestamp()), pnl=round(cum_pnl, 2)))
             current_date += timedelta(days=1)
-        unrealized = float(db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(Trade.user_id == user_id, Trade.status == "open").scalar())
+        unrealized = float(db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0)).filter(
+            Trade.user_id == user_id, Trade.status == "open"
+        ).scalar())
         if pnl_points:
             pnl_points[-1] = PnlHistoryItem(timestamp=pnl_points[-1].timestamp, pnl=round(pnl_points[-1].pnl + unrealized, 2))
 
@@ -487,4 +498,9 @@ def get_pnl_history(
         if balance > 0:
             range_pnl_pct = round(range_pnl / balance * 100, 2)
 
-    return PnlHistoryResponse(data=pnl_points, range_pnl=range_pnl, range_pnl_pct=range_pnl_pct, total_pnl=all_time_pnl)
+    return PnlHistoryResponse(
+        data=pnl_points,
+        range_pnl=range_pnl,
+        range_pnl_pct=range_pnl_pct,
+        total_pnl=all_time_pnl,
+    )
