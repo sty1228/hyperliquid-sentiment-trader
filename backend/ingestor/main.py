@@ -508,6 +508,17 @@ def _state_db_connect() -> sqlite3.Connection:
     con.commit()
     return con
 
+def _close_sqlite(con: sqlite3.Connection, label: str = ""):
+    """Checkpoint WAL and close cleanly — prevents corruption on shutdown."""
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception as e:
+        log.warning(f"WAL checkpoint failed ({label}): {e}")
+    try:
+        con.close()
+    except Exception:
+        pass
+
 MIN_POLL_INTERVAL_H = 1.0
 MAX_POLL_INTERVAL_H = 24.0
 BACKOFF_FACTOR      = 1.5
@@ -1315,7 +1326,6 @@ def _process_user(username, state_con, cache_con, max_days=3):
         "tokens_out": token_stats["out"],
     }
 
-
 # ═══════════════════════════════════════════════════════════════════════
 #  MAIN CYCLE
 # ═══════════════════════════════════════════════════════════════════════
@@ -1323,7 +1333,14 @@ def _process_user(username, state_con, cache_con, max_days=3):
 def run_cycle(users, max_days=3, force_all=False):
     state_con = _state_db_connect()
     cache_con = _label_cache_connect()
+    try:
+        return _run_cycle_inner(state_con, cache_con, users, max_days, force_all)
+    finally:
+        _close_sqlite(cache_con, "label_cache")
+        _close_sqlite(state_con, "ingestor_state")
 
+
+def _run_cycle_inner(state_con, cache_con, users, max_days, force_all):
     hl_tokens = get_hl_tokens()
     log.info(f"📋 HL tradeable tokens: {len(hl_tokens)} loaded")
     log.info(f"🎯 Confidence threshold: {CONFIDENCE_THRESHOLD}")
