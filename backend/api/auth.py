@@ -1,11 +1,17 @@
 """
 认证 API — 钱包连接 + JWT
+
+★ 2026-03-15: Dual-account merge fix
+  connect-wallet now looks up by twitter_username FIRST, then wallet_address.
+  If a user with the same twitter_username exists, update their wallet_address
+  instead of creating a duplicate account.
 """
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 import jwt  # pyjwt
+import logging
 
 from backend.config import get_settings
 from backend.deps import get_db, get_current_user
@@ -13,6 +19,7 @@ from backend.models.user import User
 
 settings = get_settings()
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+log = logging.getLogger("auth")
 
 
 # ── Request / Response 模型 ──────────────────────────────
@@ -73,20 +80,71 @@ def create_jwt_token(user_id: str) -> str:
 
 @router.post("/connect-wallet", response_model=AuthResponse)
 def connect_wallet(body: ConnectWalletRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(
-        User.wallet_address == body.wallet_address
-    ).first()
+    """
+    ★ Dual-account merge logic (priority order):
+      1. If twitter_username provided → find existing user by twitter_username
+         - If found, update wallet_address on that user (merge)
+      2. Otherwise → find by wallet_address (original behavior)
+      3. If neither found → create new user
+    """
+    user = None
 
+    # ── Step 1: Look up by twitter_username (highest priority) ──
+    if body.twitter_username:
+        user = (
+            db.query(User)
+            .filter(User.twitter_username == body.twitter_username)
+            .first()
+        )
+        if user and user.wallet_address != body.wallet_address:
+            log.info(
+                f"🔗 MERGE: twitter_username={body.twitter_username} "
+                f"updating wallet {user.wallet_address} → {body.wallet_address}"
+            )
+            # Check if the NEW wallet_address belongs to a DIFFERENT user
+            other = (
+                db.query(User)
+                .filter(
+                    User.wallet_address == body.wallet_address,
+                    User.id != user.id,
+                )
+                .first()
+            )
+            if other:
+                # Another user row owns this wallet but has no twitter
+                # or a different twitter — deactivate it to prevent conflicts
+                log.warning(
+                    f"⚠️ DEACTIVATE orphan user {other.id[:8]}… "
+                    f"(wallet {other.wallet_address}, twitter={other.twitter_username}) "
+                    f"— wallet now belongs to {user.id[:8]}…"
+                )
+                other.is_active = False
+                # Clear wallet to avoid unique constraint violation if applicable
+                other.wallet_address = f"merged-into-{user.id}-{other.wallet_address}"
+
+            user.wallet_address = body.wallet_address
+            db.commit()
+            db.refresh(user)
+
+    # ── Step 2: Fall back to wallet_address lookup ──
+    if not user:
+        user = (
+            db.query(User)
+            .filter(User.wallet_address == body.wallet_address)
+            .first()
+        )
+        if user and body.twitter_username and user.twitter_username != body.twitter_username:
+            user.twitter_username = body.twitter_username
+            db.commit()
+            db.refresh(user)
+
+    # ── Step 3: Create new user ──
     if not user:
         user = User(
             wallet_address=body.wallet_address,
             twitter_username=body.twitter_username,
         )
         db.add(user)
-        db.commit()
-        db.refresh(user)
-    elif body.twitter_username and user.twitter_username != body.twitter_username:
-        user.twitter_username = body.twitter_username
         db.commit()
         db.refresh(user)
 

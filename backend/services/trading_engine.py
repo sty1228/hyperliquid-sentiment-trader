@@ -15,6 +15,11 @@ Background service handling the full trade lifecycle:
   - Auto builder fee approval: on "not approved" error, approve + retry once
   - Session-level cache of approved wallets to avoid repeated HL calls
 
+★ 2026-03-15 fixes:
+  - Same-ticker conflict guard: skip if user already has ANY open trade
+    on the same coin (regardless of which trader), preventing HL net
+    position cancellation and close failures.
+
 Run:  python -m backend.services.trading_engine
 """
 from backend.services.rewards_engine import recompute_kol_points, run_weekly_distribution
@@ -313,11 +318,34 @@ def _execute_for_user(
 ):
     """
     Execute a copy (or counter) trade for one user.
-    ★ is_counter=True  → flips direction (long→short, short→long).
-    ★ Referral boost   → first FREE_COPY_TRADES_LIMIT trades are fee-free.
-    ★ Ghost prevention → if DB fails after HL fill, closes position on HL.
-    ★ Auto builder fee → if HL rejects for missing approval, approve + retry.
+    ★ Same-ticker guard → skip if user has ANY open trade on this coin.
+    ★ is_counter=True   → flips direction (long→short, short→long).
+    ★ Referral boost    → first FREE_COPY_TRADES_LIMIT trades are fee-free.
+    ★ Ghost prevention  → if DB fails after HL fill, closes position on HL.
+    ★ Auto builder fee  → if HL rejects for missing approval, approve + retry.
     """
+
+    # ── ★ P0: Same-ticker conflict guard ──────────────────
+    #    HL uses net position model — if two KOLs signal opposite
+    #    directions on the same coin, the positions cancel out and
+    #    neither can be closed with reduce_only. Prevent this by
+    #    skipping if the user already has ANY open trade on this coin.
+    existing_any = (
+        db.query(Trade)
+        .filter(
+            Trade.user_id == user_id,
+            Trade.ticker == coin,
+            Trade.status == "open",
+        )
+        .first()
+    )
+    if existing_any:
+        log.info(
+            f"  ⏭️ SKIP {coin} — user {user_id[:8]}… already has open "
+            f"{existing_any.direction} {coin} (trader {existing_any.trader_username})"
+        )
+        return
+
     wallet = (
         db.query(UserWallet)
         .filter(UserWallet.user_id == user_id, UserWallet.is_active.is_(True))
@@ -359,6 +387,9 @@ def _execute_for_user(
     if dup:
         return
 
+    # NOTE: The old per-trader+ticker check is now redundant because the
+    # cross-trader same-ticker guard above is strictly more restrictive.
+    # Kept for clarity but will never trigger.
     trader_username = (
         db.query(Trader.username).filter(Trader.id == sig.trader_id).scalar()
     )
