@@ -407,7 +407,7 @@ def approve_builder_fee_for_wallet(private_key: str) -> dict:
     exchange = Exchange(wallet=acct, base_url="https://api.hyperliquid.xyz")
 
     # ★ Convert bps to decimal string: 10 bps → 0.001
-    fee_decimal = str(BUILDER_FEE / 10_000)
+    fee_decimal = f"{BUILDER_FEE / 100:.2f}%"
     result = exchange.approve_builder_fee(BUILDER_ADDRESS, fee_decimal)
 
     status = result.get("status", "unknown")
