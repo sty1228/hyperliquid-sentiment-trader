@@ -20,6 +20,11 @@ Background service handling the full trade lifecycle:
     on the same coin (regardless of which trader), preventing HL net
     position cancellation and close failures.
 
+★ 2026-03-16 fixes:
+  - Withdrawable margin check: use HL withdrawable (not just equity) to
+    decide if user can open a new trade. Prevents HL margin rejections.
+  - Size cap uses min(equity*0.9, withdrawable*0.9) to stay within margin.
+
 Run:  python -m backend.services.trading_engine
 """
 from backend.services.rewards_engine import recompute_kol_points, run_weekly_distribution
@@ -173,9 +178,7 @@ def _ensure_builder_approved(pk: str, wallet_address: str) -> bool:
         if result.get("status") in ("ok", "skipped"):
             _approved_wallets.add(wallet_address)
             return True
-        # HL returns "ok" even if already approved (idempotent)
         log.warning(f"Builder fee approval unexpected: {result}")
-        # Still add to cache — if it fails, the order will fail and we handle it
         _approved_wallets.add(wallet_address)
         return True
     except Exception as e:
@@ -193,7 +196,7 @@ def _emergency_close_position(pk: str, coin: str, is_buy: bool, qty: float, mid:
     immediately send a reduce_only order to close the ghost position.
     """
     try:
-        close_is_buy = not is_buy  # reverse direction
+        close_is_buy = not is_buy
         slip = SLIPPAGE_BPS / 10_000
         raw_price = mid * (1 + slip) if close_is_buy else mid * (1 - slip)
         price = _round_price(raw_price)
@@ -216,7 +219,6 @@ def _emergency_close_position(pk: str, coin: str, is_buy: bool, qty: float, mid:
 # ═══════════════════════════════════════════════════════════════
 
 def _get_free_trades_remaining(db: Session, user_id: str) -> int:
-    """How many fee-free copy trades this user still has."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user or not getattr(user, "referral_code_used", None):
         return 0
@@ -225,7 +227,6 @@ def _get_free_trades_remaining(db: Session, user_id: str) -> int:
 
 
 def _consume_free_trade(db: Session, user_id: str) -> bool:
-    """Consume one free trade slot. Returns True if a slot was consumed."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user or not getattr(user, "referral_code_used", None):
         return False
@@ -235,7 +236,7 @@ def _consume_free_trade(db: Session, user_id: str) -> bool:
     try:
         user.free_copy_trades_used = used + 1
     except Exception:
-        pass  # Column may not exist yet — safe to skip
+        pass
     return True
 
 
@@ -278,7 +279,6 @@ def _dispatch_signal(db: Session, sig: Signal, coins: dict, mids: dict):
     if not sig.entry_price:
         sig.entry_price = mid
 
-    # ★ Include both copy AND counter traders in one query
     followers = (
         db.query(Follow)
         .filter(
@@ -318,18 +318,15 @@ def _execute_for_user(
 ):
     """
     Execute a copy (or counter) trade for one user.
-    ★ Same-ticker guard → skip if user has ANY open trade on this coin.
-    ★ is_counter=True   → flips direction (long→short, short→long).
-    ★ Referral boost    → first FREE_COPY_TRADES_LIMIT trades are fee-free.
-    ★ Ghost prevention  → if DB fails after HL fill, closes position on HL.
-    ★ Auto builder fee  → if HL rejects for missing approval, approve + retry.
+    ★ Same-ticker guard   → skip if user has ANY open trade on this coin.
+    ★ Margin guard        → skip if withdrawable < MIN_TRADE_USD.
+    ★ is_counter=True     → flips direction (long→short, short→long).
+    ★ Referral boost      → first FREE_COPY_TRADES_LIMIT trades are fee-free.
+    ★ Ghost prevention    → if DB fails after HL fill, closes position on HL.
+    ★ Auto builder fee    → if HL rejects for missing approval, approve + retry.
     """
 
     # ── ★ P0: Same-ticker conflict guard ──────────────────
-    #    HL uses net position model — if two KOLs signal opposite
-    #    directions on the same coin, the positions cancel out and
-    #    neither can be closed with reduce_only. Prevent this by
-    #    skipping if the user already has ANY open trade on this coin.
     existing_any = (
         db.query(Trade)
         .filter(
@@ -354,12 +351,22 @@ def _execute_for_user(
     if not wallet:
         return
 
-    bal    = get_hl_balance(wallet.address)
-    equity = bal.get("equity", 0.0)
+    # ── ★ Balance + margin check ──────────────────────────
+    bal          = get_hl_balance(wallet.address)
+    equity       = bal.get("equity", 0.0)
+    withdrawable = bal.get("withdrawable", 0.0)
+
     if equity < EQUITY_SKIP_THRESHOLD:
         log.info(
             f"  ⏭️ SKIP user {user_id[:8]}… equity=${equity:.2f} "
             f"< ${EQUITY_SKIP_THRESHOLD} — insufficient balance"
+        )
+        return
+
+    if withdrawable < MIN_TRADE_USD:
+        log.info(
+            f"  ⏭️ SKIP user {user_id[:8]}… withdrawable=${withdrawable:.2f} "
+            f"< ${MIN_TRADE_USD} — no free margin"
         )
         return
 
@@ -387,9 +394,6 @@ def _execute_for_user(
     if dup:
         return
 
-    # NOTE: The old per-trader+ticker check is now redundant because the
-    # cross-trader same-ticker guard above is strictly more restrictive.
-    # Kept for clarity but will never trigger.
     trader_username = (
         db.query(Trader.username).filter(Trader.id == sig.trader_id).scalar()
     )
@@ -410,13 +414,21 @@ def _execute_for_user(
         usd_alloc = equity * pct
     usd_alloc = max(usd_alloc, MIN_TRADE_USD)
 
-    # ★ Extra guard: don't allocate more than 90% of equity
-    if usd_alloc > equity * 0.9:
-        usd_alloc = equity * 0.9
+    # ★ Cap to 90% of equity AND 90% of withdrawable margin
+    max_alloc = min(equity * 0.9, withdrawable * 0.9)
+    if usd_alloc > max_alloc:
+        usd_alloc = max_alloc
         log.info(
-            f"  ⚠️ Capped allocation to 90% of equity for user {user_id[:8]}… "
-            f"→ ${usd_alloc:.2f}"
+            f"  ⚠️ Capped allocation for user {user_id[:8]}… "
+            f"→ ${usd_alloc:.2f} (equity=${equity:.2f}, withdrawable=${withdrawable:.2f})"
         )
+
+    if usd_alloc < MIN_TRADE_USD:
+        log.info(
+            f"  ⏭️ SKIP user {user_id[:8]}… alloc=${usd_alloc:.2f} "
+            f"< ${MIN_TRADE_USD} after cap — insufficient margin"
+        )
+        return
 
     notional = usd_alloc * leverage
     qty      = round(notional / mid, sz_decimals)
@@ -455,7 +467,7 @@ def _execute_for_user(
     # ★ Auto-retry: if builder fee not approved, approve and retry once
     if not filled and "Builder fee has not been approved" in err_msg:
         log.warning(f"  ⚡ Builder fee not approved for {wallet.address[:10]}… — approving now")
-        _approved_wallets.discard(wallet.address)  # clear cache
+        _approved_wallets.discard(wallet.address)
         approved = _ensure_builder_approved(pk, wallet.address)
         if approved:
             result = execute_copy_trade(
@@ -493,7 +505,7 @@ def _execute_for_user(
             is_fee_free     = is_fee_free,
         )
         db.add(trade)
-        db.flush()  # ★ Catch DB errors immediately, before commit
+        db.flush()
     except Exception as db_err:
         log.error(
             f"  🚨 DB WRITE FAILED after HL fill — closing ghost position: {db_err}"
