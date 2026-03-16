@@ -13,6 +13,8 @@ Key design principles:
   • ★ Confidence-gated signals: LLM must output confidence ≥ 60 AND is_signal=true.
   • ★ neutral sentiment is never stored — only bullish/bearish with conviction.
   • ★ Heuristic only fires on EXPLICIT trade language (entries, stops, targets).
+  • ★ COST OPTIMIZATION (2026-03-16): dynamic 3-tier polling, smaller fetches,
+  •   all KOLs kept but cold ones polled once/day. Target: ~90% cost reduction.
 """
 from __future__ import annotations
 import os, re, time, json, hashlib, random, sqlite3, signal, sys
@@ -141,25 +143,20 @@ COMMON_CRYPTO_FALLBACK = {
 # ═══════════════════════════════════════════════════════════════════════
 
 # ★ EXPLICIT TRADE LANGUAGE — only these trigger the heuristic bypass.
-# These indicate the author IS TAKING or HAS TAKEN a position.
 EXPLICIT_TRADE_PHRASES = [
-    # Position entries
     "longed", "longing", "going long", "opened a long", "opening long",
     "entered long", "long position", "long here", "long from", "long entry",
     "shorted", "shorting", "going short", "opened a short", "opening short",
     "entered short", "short position", "short here", "short from", "short entry",
-    # Trade management
     "tp hit", "sl hit", "stop loss at", "take profit at", "target hit",
     "closed my", "closing my", "exited my", "taking profit",
     "entry at", "entry price", "entered at", "got in at",
-    # Explicit buy/sell with conviction
     "loaded up", "loading up", "added more", "adding more",
     "accumulated", "accumulating heavy",
     "buying the dip", "btfd", "dip buy",
     "sold my", "selling my", "fading this",
 ]
 
-# Broader sentiment words — only used BY LLM, not for heuristic bypass
 POS_PHRASES = [
     "longed","longing","going long","opened a long","opening long",
     "entered long","long position","long here","long from",
@@ -291,11 +288,10 @@ ALERT_BOT_USERNAMES = {
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  ★ FEW-SHOT EXAMPLES — expanded with common false positives
+#  ★ FEW-SHOT EXAMPLES
 # ═══════════════════════════════════════════════════════════════════════
 
 LLM_FEW_SHOT_EXAMPLES = [
-    # ── TRUE SIGNALS: author is taking/recommending a position ──
     {"tweet": "$BTC looking strong here, longed at 67.5k. TP 72k, SL 65k 🚀",
      "label": {"is_signal": True, "ticker": "BTC", "sentiment": "bullish", "direction": "long", "confidence": 95}},
     {"tweet": "Shorted $ETH at 2450. This is going to 2200. Bear flag on 4H.",
@@ -312,8 +308,6 @@ LLM_FEW_SHOT_EXAMPLES = [
      "label": {"is_signal": True, "ticker": "ETH", "sentiment": "bearish", "direction": "short", "confidence": 70}},
     {"tweet": "Loading $INJ here. This is one of the most undervalued L1s. Target $50+.",
      "label": {"is_signal": True, "ticker": "INJ", "sentiment": "bullish", "direction": "long", "confidence": 85}},
-
-    # ── NOISE: discussion, news, questions, memes, alerts ──
     {"tweet": "GM CT! What a wild week. Markets are crazy right now. Stay safe out there.",
      "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
     {"tweet": "🧵 Thread: Top 10 altcoins for 2025. Like and RT if you want me to cover more!",
@@ -328,8 +322,6 @@ LLM_FEW_SHOT_EXAMPLES = [
      "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
     {"tweet": "A whale deposited 5,000 $ETH ($10.5M) into Binance 2 hours ago",
      "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
-
-    # ★ NEW: common false positives that MUST be NOISE
     {"tweet": "guys you can trade oil on hype. not sure why that is going down",
      "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
     {"tweet": "What do you think about $ETH? Is it a good buy here or should I wait?",
@@ -450,11 +442,8 @@ def normalize_ticker(raw: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 def _is_noise_tweet(text: str, username: str = "") -> bool:
-    """Fast check if a tweet is obviously noise before spending LLM tokens."""
     if not text:
         return True
-
-    # Alert bot accounts
     if username.lower() in {u.lower() for u in ALERT_BOT_USERNAMES}:
         t_lower = text.lower()
         has_position = any(p in t_lower for p in [
@@ -463,12 +452,9 @@ def _is_noise_tweet(text: str, username: str = "") -> bool:
         ])
         if not has_position:
             return True
-
-    # Regex noise patterns
     for pattern in NOISE_PATTERNS:
         if pattern.search(text):
             return True
-
     return False
 
 
@@ -519,13 +505,56 @@ def _close_sqlite(con: sqlite3.Connection, label: str = ""):
     except Exception:
         pass
 
-MIN_POLL_INTERVAL_H = 1.0
+
+# ═══════════════════════════════════════════════════════════════════════
+#  ★ DYNAMIC TIERING — based on avg_tweets_per_day from state DB
+#  Hot  (>20 tweets/day): poll every 3h  — prolific tweeters
+#  Warm (5-20 tweets/day): poll every 8h — moderate activity
+#  Cold (<5 tweets/day):  poll every 24h — rare tweeters
+#  New  (never seen):     poll at 8h     — discover, then adapt
+# ═══════════════════════════════════════════════════════════════════════
+
+HOT_POLL_H  = 3.0     # avg_td > 20
+WARM_POLL_H = 8.0     # avg_td 5-20
+COLD_POLL_H = 24.0    # avg_td < 5
+NEW_POLL_H  = 8.0     # never polled before
+
 MAX_POLL_INTERVAL_H = 24.0
 BACKOFF_FACTOR      = 1.5
 SPEEDUP_FACTOR      = 0.7
-PROFILE_REFRESH_DAYS = 7
+PROFILE_REFRESH_DAYS = 14     # ★ was 7 — halves profile fetch cost
 ERROR_BACKOFF_H     = 6.0
 MAX_USER_ERRORS     = 5
+
+def _get_user_tier_interval(con, username) -> float:
+    """Determine minimum poll interval based on user's avg_tweets_per_day."""
+    row = con.execute(
+        "SELECT avg_tweets_per_day, empty_polls FROM user_state WHERE username=?",
+        (username,),
+    ).fetchone()
+    if not row:
+        return NEW_POLL_H
+    avg_td = row[0] or 0.0
+    empty = row[1] or 0
+    # ★ If 10+ consecutive empty polls, they've gone quiet — treat as cold
+    if empty >= 10:
+        return COLD_POLL_H
+    if avg_td > 20:
+        return HOT_POLL_H
+    if avg_td > 5:
+        return WARM_POLL_H
+    return COLD_POLL_H
+
+def _get_user_tier_label(avg_td, empty_polls=0) -> str:
+    """Human-readable tier for logging."""
+    if empty_polls >= 10:
+        return "cold(quiet)"
+    if avg_td > 20:
+        return "hot"
+    if avg_td > 5:
+        return "warm"
+    return "cold"
+
 
 def _state_get_user_id(con, username):
     row = con.execute("SELECT user_id FROM user_state WHERE username=?", (username,)).fetchone()
@@ -537,7 +566,8 @@ def _state_get_since_id(con, username):
 
 def _state_should_poll(con, username) -> Tuple[bool, str]:
     row = con.execute(
-        "SELECT last_polled_at, poll_interval_h, consecutive_errors FROM user_state WHERE username=?",
+        "SELECT last_polled_at, poll_interval_h, consecutive_errors, avg_tweets_per_day, empty_polls "
+        "FROM user_state WHERE username=?",
         (username,),
     ).fetchone()
     if not row or not row[0]:
@@ -545,13 +575,18 @@ def _state_should_poll(con, username) -> Tuple[bool, str]:
     errs = row[2] or 0
     if errs >= MAX_USER_ERRORS:
         return False, f"circuit_open({errs}_errors)"
-    interval = row[1] or 2.0
+    # ★ Use dynamic tier minimum as floor
+    tier_min = _get_user_tier_interval(con, username)
+    interval = max(row[1] or 2.0, tier_min)
     if errs > 0:
         interval = max(interval, ERROR_BACKOFF_H)
     last = datetime.fromisoformat(row[0])
     due = last + timedelta(hours=interval)
     if datetime.now(timezone.utc) >= due:
-        return True, "due"
+        avg_td = row[3] or 0.0
+        empty = row[4] or 0
+        tier = _get_user_tier_label(avg_td, empty)
+        return True, f"due(tier={tier},int={interval:.0f}h)"
     return False, "not_due"
 
 def _state_needs_profile_refresh(con, username) -> bool:
@@ -585,6 +620,8 @@ def _state_record_error(con, username, user_id):
 
 def _state_save(con, username, user_id, last_tweet_id=None, tweets_found=0):
     now = datetime.now(timezone.utc).isoformat()
+    # ★ Get tier-specific floor BEFORE computing new interval
+    tier_min = _get_user_tier_interval(con, username)
     existing = con.execute(
         "SELECT last_tweet_id, avg_tweets_per_day, empty_polls, poll_interval_h "
         "FROM user_state WHERE username=?", (username,)
@@ -599,11 +636,14 @@ def _state_save(con, username, user_id, last_tweet_id=None, tweets_found=0):
             new_interval = min(old_interval * BACKOFF_FACTOR, MAX_POLL_INTERVAL_H)
         else:
             new_empty = 0
-            if new_avg > 5:    target = MIN_POLL_INTERVAL_H
-            elif new_avg > 2:  target = 2.0
-            elif new_avg > 0.5: target = 4.0
-            else:              target = 8.0
-            new_interval = max(old_interval * SPEEDUP_FACTOR, target, MIN_POLL_INTERVAL_H)
+            # ★ Tier-aware target intervals
+            if new_avg > 20:   target = HOT_POLL_H
+            elif new_avg > 5:  target = WARM_POLL_H
+            elif new_avg > 1:  target = max(WARM_POLL_H, 12.0)
+            else:              target = COLD_POLL_H
+            new_interval = max(old_interval * SPEEDUP_FACTOR, target, tier_min)
+        # ★ Always enforce tier floor
+        new_interval = max(new_interval, tier_min)
         con.execute(
             """UPDATE user_state SET user_id=?, last_tweet_id=COALESCE(?,last_tweet_id),
                avg_tweets_per_day=?, empty_polls=?, poll_interval_h=?,
@@ -618,13 +658,13 @@ def _state_save(con, username, user_id, last_tweet_id=None, tweets_found=0):
                (username, user_id, last_tweet_id, avg_tweets_per_day,
                 empty_polls, poll_interval_h, last_polled_at, consecutive_errors, updated_at)
                VALUES (?,?,?,?,?,?,?,0,?)""",
-            (username, user_id, last_tweet_id, 0.0, 0, 2.0, now, now),
+            (username, user_id, last_tweet_id, 0.0, 0, NEW_POLL_H, now, now),
         )
     con.commit()
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  LABEL CACHE — ★ now stores confidence + is_signal
+#  LABEL CACHE
 # ═══════════════════════════════════════════════════════════════════════
 
 def _label_cache_connect() -> sqlite3.Connection:
@@ -676,14 +716,13 @@ def _stable_tweet_hash(text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  ★ HEURISTIC LABELING — much stricter, requires explicit trade language
+#  HEURISTIC LABELING
 # ═══════════════════════════════════════════════════════════════════════
 
 def _cheap_ticker(text):
     if not text:
         return None
     hl_tokens = get_hl_tokens()
-
     dollar_tickers = []
     for m in DOLLAR_TICKER_RE.finditer(text):
         sym = normalize_ticker(m.group(1))
@@ -712,12 +751,10 @@ def _cheap_ticker(text):
                 best_score = score
                 best_sym = sym
         return best_sym
-
     for m in HASH_TICKER_RE.finditer(text):
         sym = normalize_ticker(m.group(1))
         if sym != "NOISE" and sym in hl_tokens:
             return sym
-
     candidates = set()
     for c in PLAIN_TICKER_RE.findall(text.upper()):
         sym = normalize_ticker(c)
@@ -727,19 +764,13 @@ def _cheap_ticker(text):
         return next(iter(candidates))
     return None
 
-
 def _has_explicit_trade_language(text: str) -> bool:
-    """★ Returns True only if the tweet contains EXPLICIT trade entry/exit language.
-    This is the gate for heuristic-only labeling (bypassing LLM)."""
     t = text.lower()
-    # Check false positives first
     for fp in FALSE_POS_PATTERNS:
         t = t.replace(fp, "")
     return any(phrase in t for phrase in EXPLICIT_TRADE_PHRASES)
 
-
 def _cheap_sentiment(text):
-    """Only used when _has_explicit_trade_language is True."""
     if not text:
         return None
     t = text.lower()
@@ -768,7 +799,7 @@ def _sentiment_to_direction(sentiment, text):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  ★ OPENAI LLM — with confidence + is_signal
+#  OPENAI LLM
 # ═══════════════════════════════════════════════════════════════════════
 
 def _llm_request(messages, max_tokens, temperature, model=None, retries=4, base_delay=1.0):
@@ -802,7 +833,6 @@ def _llm_request(messages, max_tokens, temperature, model=None, retries=4, base_
 def llm_batch_label(items):
     hl_tokens = get_hl_tokens()
     hl_list_str = ", ".join(sorted(hl_tokens)[:80]) + ("…" if len(hl_tokens) > 80 else "")
-
     examples_str = "\n".join([
         f'  Tweet: "{ex["tweet"]}" → {json.dumps(ex["label"])}'
         for ex in LLM_FEW_SHOT_EXAMPLES
@@ -863,12 +893,10 @@ def llm_batch_label(items):
             is_signal = bool(rec.get("is_signal", False))
             confidence = int(rec.get("confidence", 0))
             ticker_raw = str(rec.get("ticker", ""))
-
             if not is_signal or confidence < CONFIDENCE_THRESHOLD:
                 out[_id] = {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
                             "confidence": confidence, "is_signal": False}
                 continue
-
             ticker = normalize_ticker(ticker_raw)
             sentiment = str(rec.get("sentiment", "")).lower().strip()
             direction = str(rec.get("direction", "")).lower().strip()
@@ -876,13 +904,10 @@ def llm_batch_label(items):
                 sentiment = "neutral"
             if direction not in ("long", "short"):
                 direction = "long" if sentiment != "bearish" else "short"
-
-            # ★ neutral sentiment with low confidence → NOISE
             if sentiment == "neutral" and confidence < 80:
                 out[_id] = {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
                             "confidence": confidence, "is_signal": False}
                 continue
-
             out[_id] = {"ticker": ticker, "sentiment": sentiment, "direction": direction,
                         "confidence": confidence, "is_signal": True}
         return out, tin, tout
@@ -921,21 +946,17 @@ def _llm_label_with_vision(text, image_url):
         parsed = json.loads(raw)
         is_signal = bool(parsed.get("is_signal", False))
         confidence = int(parsed.get("confidence", 0))
-
         if not is_signal or confidence < CONFIDENCE_THRESHOLD:
             return {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
                     "confidence": confidence, "is_signal": False}, tin, tout
-
         ticker = normalize_ticker(str(parsed.get("ticker", "")))
         sentiment = str(parsed.get("sentiment", "")).lower().strip()
         direction = str(parsed.get("direction", "")).lower().strip()
         if sentiment not in ("bullish", "bearish", "neutral"): sentiment = "neutral"
         if direction not in ("long", "short"): direction = "long" if sentiment != "bearish" else "short"
-
         if sentiment == "neutral" and confidence < 80:
             return {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
                     "confidence": confidence, "is_signal": False}, tin, tout
-
         return {"ticker": ticker, "sentiment": sentiment, "direction": direction,
                 "confidence": confidence, "is_signal": True}, tin, tout
     except (ShutdownRequested, openai.AuthenticationError):
@@ -1037,7 +1058,10 @@ def _resolve_user_profile(username, state_con):
 
 
 def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
-                       max_results_per_page=100, max_pages=10):
+                       max_results_per_page=None, max_pages=3):
+    """★ COST OPTIMIZATION: smaller pages (10 incremental / 20 backfill), max 3 pages."""
+    if max_results_per_page is None:
+        max_results_per_page = 10 if since_id else 20
     params = {
         "max_results": max_results_per_page,
         "tweet.fields": "created_at,author_id,public_metrics,attachments",
@@ -1097,11 +1121,10 @@ def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  ★ LABEL ONE USER'S TWEETS — stricter pipeline
+#  LABEL ONE USER'S TWEETS
 # ═══════════════════════════════════════════════════════════════════════
 
 def _label_tweets(tweets, cache_con, username="", batch_size=20):
-    """Label a list of tweets. Returns list of labeled dicts."""
     results = []
     llm_text_q  = []
     llm_vis_q   = []
@@ -1112,23 +1135,16 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
     for i, tw in enumerate(tweets):
         text = tw["text"]
         author = tw.get("author_username", username)
-
-        # 0) Pre-LLM noise filter — free, instant
         if _is_noise_tweet(text, author):
             results.append({**tw, "ticker": "NOISE", "sentiment": "neutral",
                             "direction": "long", "confidence": 0, "is_signal": False})
             noise_filtered += 1
             continue
-
         thash = _stable_tweet_hash(text)
-
-        # 1) cache hit
         cached = _label_cache_get(cache_con, thash)
         if cached:
             results.append({**tw, **cached})
             continue
-
-        # 2) ★ Heuristic — ONLY if tweet has explicit trade language
         tk = _cheap_ticker(text)
         if tk and _has_explicit_trade_language(text):
             st = _cheap_sentiment(text)
@@ -1139,8 +1155,6 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
                                 "confidence": 80, "is_signal": True})
                 heuristic_labeled += 1
                 continue
-
-        # 3) queue for LLM
         item = {"idx": i, "id": str(i), "tweet": text, "tw": tw}
         if VISION_ENABLED and tw.get("images"):
             llm_vis_q.append(item)
@@ -1152,7 +1166,6 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
     if heuristic_labeled > 0:
         log.info(f"    Heuristic-labeled {heuristic_labeled} (explicit trade language)")
 
-    # -- batch text labeling --
     for start in range(0, len(llm_text_q), batch_size):
         _check_shutdown()
         chunk = llm_text_q[start:start + batch_size]
@@ -1166,7 +1179,6 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
             log.error(f"LLM batch failed: {e} — marking {len(chunk)} as NOISE")
             labels = {it["id"]: {"ticker": "NOISE", "sentiment": "neutral", "direction": "long",
                                   "confidence": 0, "is_signal": False} for it in chunk}
-
         for item in chunk:
             res = labels.get(item["id"], {"ticker": "NOISE", "sentiment": "neutral",
                                           "direction": "long", "confidence": 0, "is_signal": False})
@@ -1175,7 +1187,6 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
                              res.get("confidence", 0), res.get("is_signal", False))
             results.append({**item["tw"], **res})
 
-    # -- vision labeling --
     for item in llm_vis_q:
         _check_shutdown()
         imgs = item["tw"].get("images", [])
@@ -1199,7 +1210,7 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  ★ DATABASE WRITE — filters NOISE + neutral + low confidence
+#  DATABASE WRITE
 # ═══════════════════════════════════════════════════════════════════════
 
 from backend.database import SessionLocal
@@ -1233,7 +1244,6 @@ def _signal_exists(session, tweet_id):
 
 
 def _write_user_signals(username, labeled_tweets, profile=None):
-    # ★ THREE gates: not NOISE, is_signal=True, sentiment is bullish/bearish
     relevant = [
         r for r in labeled_tweets
         if r.get("ticker") not in ("NOISE",)
@@ -1326,6 +1336,7 @@ def _process_user(username, state_con, cache_con, max_days=3):
         "tokens_out": token_stats["out"],
     }
 
+
 # ═══════════════════════════════════════════════════════════════════════
 #  MAIN CYCLE
 # ═══════════════════════════════════════════════════════════════════════
@@ -1344,6 +1355,19 @@ def _run_cycle_inner(state_con, cache_con, users, max_days, force_all):
     hl_tokens = get_hl_tokens()
     log.info(f"📋 HL tradeable tokens: {len(hl_tokens)} loaded")
     log.info(f"🎯 Confidence threshold: {CONFIDENCE_THRESHOLD}")
+
+    # ★ Log tier distribution at cycle start
+    tier_counts = {"hot": 0, "warm": 0, "cold": 0}
+    for u in users:
+        row = state_con.execute(
+            "SELECT avg_tweets_per_day, empty_polls FROM user_state WHERE username=?", (u,)
+        ).fetchone()
+        if row:
+            tier_counts[_get_user_tier_label(row[0] or 0, row[1] or 0)] += 1
+        else:
+            tier_counts["cold"] += 1  # new users start cold-ish
+    log.info(f"👥 {len(users)} KOLs — hot({HOT_POLL_H}h)={tier_counts['hot']}, "
+             f"warm({WARM_POLL_H}h)={tier_counts['warm']}, cold({COLD_POLL_H}h)={tier_counts['cold']}")
 
     stats = {
         "processed": 0, "skipped_not_due": 0, "skipped_circuit": 0,
@@ -1400,11 +1424,13 @@ def _run_cycle_inner(state_con, cache_con, users, max_days, force_all):
 
 def run_daemon(max_days=3, force_first_cycle=False):
     users = _resolve_user_list()
-    log.info(f"🐦 Ingestor daemon starting — {len(users)} users, "
-             f"cycle interval={CYCLE_INTERVAL_S}s, max_days={max_days}")
+    log.info(f"🐦 Ingestor daemon starting — {len(users)} KOLs (all kept, dynamic tiering)")
+    log.info(f"   cycle interval={CYCLE_INTERVAL_S}s, max_days={max_days}")
     log.info(f"   LLM={LLM_MODEL}, Vision={VISION_ENABLED} ({VISION_MODEL})")
     log.info(f"   HL endpoint={HL_BASE_URL}")
     log.info(f"   🎯 Confidence threshold={CONFIDENCE_THRESHOLD}")
+    log.info(f"   💰 COST MODE: hot={HOT_POLL_H}h, warm={WARM_POLL_H}h, cold={COLD_POLL_H}h")
+    log.info(f"   💰 Fetch: max_results=10(incr)/20(backfill), max_pages=3, profile_refresh={PROFILE_REFRESH_DAYS}d")
 
     hl_tokens = get_hl_tokens()
     log.info(f"   📋 {len(hl_tokens)} tradeable tokens from HL")
@@ -1459,7 +1485,7 @@ def run_daemon(max_days=3, force_first_cycle=False):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  USER LIST
+#  USER LIST — ALL KOLs kept, tiering is dynamic from state DB
 # ═══════════════════════════════════════════════════════════════════════
 
 DEFAULT_USERS = [
