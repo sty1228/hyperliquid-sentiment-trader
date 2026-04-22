@@ -1,6 +1,6 @@
 """
-Max Gain Updater (2026-04-23)
-==============================
+Max Gain Updater (2026-04-23) — Standalone Version
+====================================================
 Computes the maximum favorable excursion (peak gain) for each signal
 from tweet_time to now, using HyperLiquid historical klines.
 
@@ -10,6 +10,8 @@ For bearish/short: max_gain = (entry - min_low) / entry * 100  (always positive)
 Monotonic — only updated when the new value exceeds the stored one.
 Batches by ticker to minimize API calls (one klines request per unique coin).
 
+This is SELF-CONTAINED — does not import from bybit_price_tracker.
+
 Usage:
     python -m backend.services.max_gain_updater          # loop mode (every 5 min)
     python -m backend.services.max_gain_updater --once   # single run (cron mode)
@@ -17,31 +19,71 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Any
 
+import requests as http_requests
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from backend.database import SessionLocal
 from backend.models.signal import Signal
-from backend.services.bybit_price_tracker import HLPriceClient
 
 log = logging.getLogger(__name__)
 
 # ── Tunables ──────────────────────────────────────────────
-PCT_SANITY_CAP = 500.0      # Same as bybit_price_tracker
+HL_BASE_URL = os.getenv("HL_BASE_URL", "https://api.hyperliquid.xyz")
+PCT_SANITY_CAP = 500.0      # max reasonable % gain; beyond this = bad entry price
 MAX_LOOKBACK_DAYS = 14      # Only process signals from last N days
 MIN_AGE_MINUTES = 3         # Skip signals < 3 min old (no data yet)
 SLEEP_BETWEEN_TICKERS = 0.05
 LOOP_INTERVAL_SECONDS = 300 # 5 min
 
 
+# ═══════════════════════════════════════════════════════════════
+# Self-contained HyperLiquid price client
+# ═══════════════════════════════════════════════════════════════
+
+class HLClient:
+    """Minimal HL price client for candle fetching."""
+
+    def __init__(self, base_url: str = HL_BASE_URL):
+        self.base_url = base_url
+
+    def _post(self, payload: dict, timeout: int = 15) -> Any:
+        r = http_requests.post(f"{self.base_url}/info", json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def get_klines_range(self, symbol: str, start_ms: int, end_ms: int,
+                         interval: str = "1h") -> list[dict]:
+        """Get candles in a time range. Returns list of {t, o, h, l, c, v}."""
+        try:
+            data = self._post({
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": symbol.upper(),
+                    "interval": interval,
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                }
+            })
+            return data if data else []
+        except Exception as e:
+            log.debug(f"HL klines fetch failed for {symbol}: {e}")
+            return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# Core logic
+# ═══════════════════════════════════════════════════════════════
+
 def _pick_interval(hours_elapsed: float) -> str:
-    """Pick HL candle interval based on signal age (balance granularity vs coverage)."""
+    """Pick HL candle interval based on signal age."""
     if hours_elapsed <= 24:
         return "15m"
     if hours_elapsed <= 168:   # 7 days
@@ -61,8 +103,7 @@ def _compute_from_candles(
     signal: Signal,
     candles: list[dict],
 ) -> tuple[float | None, datetime | None]:
-    """Given pre-fetched candles, compute max_gain for this signal.
-    Candles must cover [tweet_time, now]."""
+    """Given pre-fetched candles, compute max_gain for this signal."""
     if not signal.entry_price or signal.entry_price <= 0:
         return None, None
 
@@ -119,15 +160,7 @@ def _compute_from_candles(
 
 
 def update_max_gains(db: Optional[Session] = None, max_signals: int = 2000) -> dict:
-    """Run one update cycle.
-
-    Strategy:
-      1. Query active signals from last N days
-      2. Group by ticker
-      3. For each ticker, fetch HL klines ONCE covering [oldest_tweet, now]
-      4. Compute max_gain for each signal in that ticker
-      5. Bulk commit
-    """
+    """Run one update cycle."""
     owned_db = db is None
     if owned_db:
         db = SessionLocal()
@@ -135,7 +168,7 @@ def update_max_gains(db: Optional[Session] = None, max_signals: int = 2000) -> d
     stats = {"processed": 0, "updated": 0, "skipped_no_data": 0, "skipped_too_new": 0, "errors": 0}
 
     try:
-        hl = HLPriceClient()
+        hl = HLClient()
         now_utc = datetime.now(timezone.utc)
         cutoff = now_utc - timedelta(days=MAX_LOOKBACK_DAYS)
         min_age = now_utc - timedelta(minutes=MIN_AGE_MINUTES)
@@ -202,7 +235,7 @@ def update_max_gains(db: Optional[Session] = None, max_signals: int = 2000) -> d
                         continue
 
                     current = sig.max_gain_pct or 0.0
-                    if new_gain > current + 0.01:  # 0.01% threshold to avoid noise writes
+                    if new_gain > current + 0.01:
                         sig.max_gain_pct = new_gain
                         sig.max_gain_at = peak_at
                         stats["updated"] += 1
