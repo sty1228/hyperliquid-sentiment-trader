@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
@@ -29,11 +28,18 @@ class Signal(Base):
     current_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     pct_change: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # ★ NEW: Max favorable excursion since tweet (2026-04-23)
+    # For bullish: (max_high - entry) / entry * 100 (always positive)
+    # For bearish: (entry - min_low) / entry * 100 (always positive)
+    # Monotonic — only grows, never retracts
+    max_gain_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_gain_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     status: Mapped[str] = mapped_column(String(20), default="active")
     likes: Mapped[int] = mapped_column(Integer, default=0)
     retweets: Mapped[int] = mapped_column(Integer, default=0)
     replies: Mapped[int] = mapped_column(Integer, default=0)
-    tweet_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)  # ← NEW
+    tweet_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     tweet_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

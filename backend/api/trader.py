@@ -46,11 +46,13 @@ class BestWorstSignal(BaseModel):
     token: str
     pnl: float
     date: str
-    # ★ NEW — needed by frontend SignalDetailSheet
     signal_id: str | None = None
     direction: str | None = None
     tweet_text: str | None = None
     tweet_image_url: str | None = None
+    # ★ NEW (2026-04-23)
+    max_gain_pct: float | None = None
+    max_gain_at: str | None = None
 
 
 class SignalItemResponse(BaseModel):
@@ -70,7 +72,10 @@ class SignalItemResponse(BaseModel):
     retweetsCount: int = 0
     likesCount: int = 0
     change_since_tweet: float = 0.0
-    tweet_image_url: str | None = None  # ★ NEW
+    tweet_image_url: str | None = None
+    # ★ NEW (2026-04-23) — Max favorable excursion since tweet
+    max_gain_pct: float | None = None
+    max_gain_at: str | None = None  # ISO8601 string
 
 
 class UserSignalResponse(BaseModel):
@@ -89,7 +94,6 @@ class TraderProfileResponse(BaseModel):
     is_verified: bool = False
     followers_count: int = 0
     following_count: int = 0
-    # Stats (for requested window)
     total_signals: int = 0
     win_rate: float = 0.0
     avg_return_pct: float = 0.0
@@ -100,13 +104,10 @@ class TraderProfileResponse(BaseModel):
     rank: int | None = None
     copiers_count: int = 0
     signal_to_noise: float = 0.0
-    # Radar (8 dimensions, 0-100 each)
     radar: RadarData = RadarData()
-    # Follow state (requires auth, else false)
     is_followed: bool = False
     is_copy_trading: bool = False
     is_counter_trading: bool = False
-    # Best / worst signal
     best_signal: BestWorstSignal | None = None
     worst_signal: BestWorstSignal | None = None
 
@@ -128,15 +129,12 @@ def _compute_radar(
     if not signals and not any([s24, s7, s30]):
         return RadarData()
 
-    # ── 1. Accuracy (30d > 7d > 24h fallback) ──
     acc_stat = s30 or s7 or s24
     accuracy = _clamp(acc_stat.win_rate * 100) if acc_stat else 0
 
-    # ── 2. Win Rate (7d > 30d > 24h fallback) ──
     wr_stat = s7 or s30 or s24
     win_rate = _clamp(wr_stat.win_rate * 100) if wr_stat else 0
 
-    # ── 3. R/R Ratio ──
     wins = [s for s in signals if s.pct_change is not None and s.pct_change > 0]
     losses = [s for s in signals if s.pct_change is not None and s.pct_change < 0]
     avg_w = (sum(s.pct_change for s in wins) / len(wins)) if wins else 0
@@ -144,7 +142,6 @@ def _compute_radar(
     raw_rr = avg_w / max(avg_l, 0.01)
     rr_score = _clamp(raw_rr / 3.0 * 100)
 
-    # ── 4. Consistency ──
     rates = [st.win_rate for st in [s24, s7, s30] if st and st.total_signals > 0]
     if len(rates) >= 2:
         std = stats_lib.stdev(rates)
@@ -154,7 +151,6 @@ def _compute_radar(
     else:
         consistency = 0
 
-    # ── 5. Timing ──
     now = datetime.now(timezone.utc)
     w_sum = w_tot = 0.0
     for sig in signals:
@@ -171,7 +167,6 @@ def _compute_radar(
         w_tot += w
     timing = _clamp((w_sum / w_tot) * 100) if w_tot > 0 else 0
 
-    # ── 6. Transparency ──
     if signals:
         n = len(signals)
         entry_pts = sum(1 for s in signals if s.entry_price is not None) * 25 / n
@@ -185,7 +180,6 @@ def _compute_radar(
     else:
         transparency = 0
 
-    # ── 7. Engagement ──
     if signals:
         scores = [
             math.log10(s.likes + 1)
@@ -198,7 +192,6 @@ def _compute_radar(
     else:
         engagement = 0
 
-    # ── 8. Track Record ──
     total_n = len(signals)
     dates = [
         s.tweet_time or s.created_at
@@ -224,10 +217,6 @@ def _compute_radar(
 
 # ── Helpers ──────────────────────────────────────────────
 
-def _clamp(v: float, lo: float = 0, hi: float = 100) -> int:
-    return int(max(lo, min(hi, v)))
-
-
 def _get_trader_or_404(db: Session, x_handle: str) -> Trader:
     t = db.query(Trader).filter(Trader.username == x_handle).first()
     if not t:
@@ -235,17 +224,9 @@ def _get_trader_or_404(db: Session, x_handle: str) -> Trader:
     return t
 
 
-# ★ Cap must match PCT_SANITY_CAP=200 in bybit_price_tracker.py
-# 200% is the practical ceiling — values beyond this indicate a bad entry_price
-# (e.g. historical price fetch failed and fell back to current price on a stale tweet)
 PCT_SANITY_CAP = 200.0
 
 def _sanitize_pct(v: float | None, cap: float = PCT_SANITY_CAP) -> float:
-    """
-    Spot prices cannot realistically move ±500% in any reasonable window.
-    Values outside this range indicate a bad entry_price in the DB.
-    Return 0.0 so the UI shows a neutral value instead of a nonsense number.
-    """
     if v is None:
         return 0.0
     return v if abs(v) <= cap else 0.0
@@ -276,11 +257,13 @@ def _best_worst(
             token=s.ticker,
             pnl=round(s.pct_change, 1),
             date=dt.strftime("%b %d") if dt else "",
-            # ★ NEW fields for frontend click-to-detail
             signal_id=s.id,
             direction=s.direction or s.sentiment,
             tweet_text=s.tweet_text,
             tweet_image_url=s.tweet_image_url,
+            # ★ NEW
+            max_gain_pct=s.max_gain_pct,
+            max_gain_at=s.max_gain_at.isoformat() if s.max_gain_at else None,
         )
 
     return (
@@ -417,7 +400,10 @@ def get_user_signals(
             retweetsCount=s.retweets,
             likesCount=s.likes,
             change_since_tweet=_sanitize_pct(s.pct_change),
-            tweet_image_url=s.tweet_image_url,  # ★ NEW
+            tweet_image_url=s.tweet_image_url,
+            # ★ NEW (2026-04-23)
+            max_gain_pct=s.max_gain_pct,
+            max_gain_at=s.max_gain_at.isoformat() if s.max_gain_at else None,
         ))
 
     return UserSignalResponse(
@@ -431,7 +417,7 @@ def get_user_signals(
 # ── Manual Signal Trade ──────────────────────────────────
 
 class SignalTradeRequest(BaseModel):
-    side: str  # "copy" | "counter"
+    side: str
 
 class SignalTradeResponse(BaseModel):
     status: str
@@ -471,7 +457,6 @@ def place_signal_trade(
     if equity < 5.0:
         raise HTTPException(400, "insufficient_balance")
 
-    # Per-trader settings → fallback to default
     trader = db.query(Trader).filter(Trader.id == signal.trader_id).first()
     settings = None
     if trader:
@@ -498,7 +483,6 @@ def place_signal_trade(
     if equity < usd_alloc:
         raise HTTPException(400, "insufficient_balance")
 
-    # Fetch current price
     coin = signal.ticker
     try:
         mid = float(
@@ -510,7 +494,6 @@ def place_signal_trade(
     if not mid:
         raise HTTPException(503, "Price unavailable for this asset")
 
-    # sz_decimals
     try:
         sz_decimals = {
             a["name"]: a.get("szDecimals", 2)
