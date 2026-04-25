@@ -24,6 +24,15 @@ HyperCopy is a copy-trading platform on top of HyperLiquid perp DEX. A Twitter/X
 
 **Two execution paths exist; only one is live.** `backend/services/` is production (Postgres + SQLAlchemy + HL SDK). `execution/` is an older SQLite path (`data/execution.sqlite`) kept for reference and listed in `.claudeignore` — do not extend it.
 
+**Supporting service modules** (not long-running, used by the workers above):
+
+- `bybit_price_tracker.py` — HL-first price tracker with Bybit fallback for klines; used by signal price updates.
+- `enhanced_price_database.py` — SQLite-backed price cache (`data/crypto_tracker.db`); stores and retrieves OHLCV data.
+- `hyperliquid_broker.py` — FastAPI router (`/api/hl`) wrapping the HL SDK; handles order placement and account queries.
+- `price_source_base.py` — abstract `PriceSource` interface implemented by concrete sources.
+- `rewards_engine.py` — KOL points computation and weekly fee-share distribution; called by the trading engine every 10 min.
+- `sources/` — price-source implementations: `bybit_source.py` (Bybit REST) and `hyperliquid_sdk_source.py` (HL allMids).
+
 ## 3. API surface
 
 All routers live in `backend/api/`. Prefix is `/api` unless noted.
@@ -50,7 +59,7 @@ All routers live in `backend/api/`. Prefix is `/api` unless noted.
 - `users` — `id` (uuid str), `wallet_address` (unique), `twitter_username` (indexed, used for dual-account merge), `referral_code_used`, `free_copy_trades_used`.
 - `traders` — KOLs. `username` unique. `avatar_url`, `is_verified`, follower counts.
 - `trader_stats` — pre-computed leaderboard rows. Unique `(trader_id, window)` where `window ∈ {24h, 7d, 30d}`. Recomputed every 10 min.
-- `signals` — one row per labeled tweet. `(trader_id, ticker, direction, sentiment)` core; `entry_price` / `current_price` / `pct_change` updated every tick; `max_gain_pct` + `max_gain_at` monotonic peak-favorable-excursion. `tweet_id` unique. `status ∈ {active, processed, expired, skipped}`. **Always order by `coalesce(tweet_time, created_at)`** — tweet_time is preferred but nullable.
+- `signals` — one row per labeled tweet. `(trader_id, ticker, direction, sentiment)` core; `entry_price` / `current_price` / `pct_change` updated every tick; `max_gain_pct` + `max_gain_at` monotonic peak-favorable-excursion. `tweet_id` unique. `tweet_image_url` (Text, nullable) — attached image URL passed to the vision pass. `status ∈ {active, processed, expired, skipped}`. **Always order by `coalesce(tweet_time, created_at)`** — tweet_time is preferred but nullable.
 - `follows` — unique `(user_id, trader_id)`. `is_copy_trading` and `is_counter_trading` are mutually exclusive (validated in API and DB defaults).
 - `trades` — one row per opened position. `signal_id` nullable (manual trades). `status ∈ {open, closed}`, `source ∈ {copy, counter, manual}`, `fee_usd` + `is_fee_free` for affiliate accounting.
 - `copy_settings` — unique `(user_id, trader_id)` with `trader_id NULL` = the user's default. `size_type ∈ {percent, fixed_usd}`, `margin_mode ∈ {cross, isolated}`, `tp_value` / `sl_value` in percent.
@@ -117,7 +126,7 @@ Tightening `EXPLICIT_TRADE_PHRASES`, `CONFIDENCE_THRESHOLD`, or the noise filter
 
 - **Dedicated user wallet.** On first use we generate an EOA, encrypt the private key with Fernet using `WALLET_ENCRYPTION_KEY`, and persist `(address, encrypted_private_key, withdraw_address)` in `user_wallets`. The address is the deposit destination on Arbitrum; the trading engine signs HL orders with the decrypted key in-memory only.
 - **Master wallet** (`GAS_STATION_KEY` / `GAS_STATION_ADDRESS`). Two roles: (1) gas station — tops user wallets up with ETH on Arbitrum so they can pay for the HL bridge tx (`ensure_gas`); (2) USDC liquidity pool for low-fee withdrawals — `hl_internal_transfer` moves USDC from user's HL account to master's HL account (free, instant), then `master_transfer_usdc` sends Arbitrum USDC out to the user's external wallet. If master Arbitrum USDC is short, fall back to `withdraw_from_hl` ($1 HL fee).
-- **Multi-chain withdraw** via Stargate V2 (`stargate_bridge_out`) — destinations in `CHAIN_ID_TO_LZ_EID` (ETH, OP, Polygon, Base, Avalanche, Mantle, Scroll). `MASTER_LOW_BALANCE_WARN = $10` triggers a log warning.
+- **Multi-chain withdraw** via Stargate V2 (`stargate_bridge_out`) — destinations in `CHAIN_ID_TO_LZ_EID` (ETH, OP, Polygon, Base, Avalanche, Mantle, Scroll).
 - **Builder fee** — every new wallet must `approve_builder_fee_for_wallet(pk)` before the first trade. `BUILDER_ADDRESS` receives `HL_DEFAULT_BUILDER_BPS` (default 10 bps = 0.10%) on every trade. Trading engine auto-approves on the first failure and caches success in process.
 - **Encryption**: `WALLET_ENCRYPTION_KEY` must be a 32-byte urlsafe base64 Fernet key. Rotating it without a re-encrypt step bricks every existing wallet — never overwrite without a migration.
 
@@ -155,9 +164,9 @@ There is no test runner wired up (`tests/` is empty) and no linter config.
 ### Env vars (names only — values live in `.env`, never commit)
 
 - DB / auth: `DATABASE_URL`, `JWT_SECRET`, `JWT_ALGO`, `JWT_EXPIRE_HOURS`, `CORS_ORIGINS`.
-- Hyperliquid: `HL_MAINNET`, `HL_BASE_URL`, `HL_ACCOUNT_ADDRESS`, `HL_API_SECRET_KEY`, `HL_API_WALLET_ADDRESS`, `HL_BUILDER_ADDRESS`, `HL_DEFAULT_LEVERAGE`, `HL_DEFAULT_BUILDER_BPS`.
+- Hyperliquid: `HL_MAINNET`, `HL_BASE_URL`, `HL_ACCOUNT_ADDRESS`, `HL_API_SECRET_KEY`, `HL_BUILDER_ADDRESS`, `HL_DEFAULT_LEVERAGE`, `HL_DEFAULT_BUILDER_BPS`.
 - Wallet system: `WALLET_ENCRYPTION_KEY`, `GAS_STATION_KEY`, `GAS_STATION_ADDRESS`.
-- Ingestor: `X_BEARER_TOKEN`, `X_USERNAME`, `OPENAI_API_KEY`, `LLM_MODEL`, `VISION_MODEL`, `VISION_ENABLED`, `CONFIDENCE_THRESHOLD`, `CYCLE_INTERVAL_S`, `MAX_CONSECUTIVE_FAILURES`, `SCRAPE_USERS`.
+- Ingestor: `X_BEARER_TOKEN`, `OPENAI_API_KEY`, `LLM_MODEL`, `VISION_MODEL`, `VISION_ENABLED`, `CONFIDENCE_THRESHOLD`, `CYCLE_INTERVAL_S`, `MAX_CONSECUTIVE_FAILURES`, `SCRAPE_USERS`.
 - Paths: `DATA_DIR`, `LOG_DIR`.
 
 ### Deploy workflow
@@ -205,4 +214,5 @@ tail -f logs/*.log
 
 ## 10. Changelog
 
+- 2026-04-26 — TODO: WARM tier boundary off-by-one (code: >5 tw/d, spec: 5-20). Decide whether to fix code or spec.
 - 2026-04-26 — Initial spec generated by /init.
