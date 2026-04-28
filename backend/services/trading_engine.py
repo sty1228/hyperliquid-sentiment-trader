@@ -51,6 +51,7 @@ from backend.services.wallet_manager import (
     decrypt_key, execute_copy_trade, get_hl_balance,
     approve_builder_fee_for_wallet,
 )
+from backend.services.events import publish as _publish_event
 
 log = logging.getLogger("trading_engine")
 
@@ -302,6 +303,7 @@ def _dispatch_signal(db: Session, sig: Signal, coins: dict, mids: dict):
             _execute_for_user(
                 db, fol.user_id, sig, coin, mid, coins[coin],
                 is_counter=fol.is_counter_trading,
+                follow=fol,
             )
         except Exception as e:
             log.error(f"  ✗ user {fol.user_id[:8]}… : {e}")
@@ -315,6 +317,7 @@ def _execute_for_user(
     mid: float,
     sz_decimals: int,
     is_counter: bool = False,
+    follow: Follow | None = None,
 ):
     """
     Execute a copy (or counter) trade for one user.
@@ -324,6 +327,8 @@ def _execute_for_user(
     ★ Referral boost      → first FREE_COPY_TRADES_LIMIT trades are fee-free.
     ★ Ghost prevention    → if DB fails after HL fill, closes position on HL.
     ★ Auto builder fee    → if HL rejects for missing approval, approve + retry.
+    ★ Copy Next (2026-04-28) → if follow.copy_mode=='next', decrement remaining_copies
+                                after a successful fill; auto-disable when it hits 0.
     """
 
     # ── ★ P0: Same-ticker conflict guard ──────────────────
@@ -522,6 +527,34 @@ def _execute_for_user(
             f"({FREE_COPY_TRADES_LIMIT - free_trades_left + 1}/{FREE_COPY_TRADES_LIMIT})"
         )
 
+    # ★ Copy Next (2026-04-28): consume the slot only after a confirmed fill.
+    # Skips earlier in this function (same-ticker, margin, max-positions) do NOT burn it.
+    if follow is not None and getattr(follow, "copy_mode", "all") == "next":
+        follow.remaining_copies = (follow.remaining_copies or 1) - 1
+        if follow.remaining_copies <= 0:
+            follow.is_copy_trading = False
+            follow.is_counter_trading = False
+            follow.copy_mode = "all"
+            follow.remaining_copies = None
+            log.info(f"  🎯 Copy Next consumed — user {user_id[:8]}… auto-disabled on @{trader.username if trader else '?'}")
+
+    # ★ Network event for graph viz pulse
+    try:
+        _publish_event(
+            db, user_id, "trade_opened",
+            {
+                "trader_username": trade.trader_username,
+                "ticker": coin,
+                "direction": effective_direction,
+                "source": "counter" if is_counter else "copy",
+                "size_usd": round(usd_alloc, 2),
+                "pnl_usd": None,
+                "reason": None,
+            },
+        )
+    except Exception as e:
+        log.warning(f"  publish trade_opened failed: {e}")
+
     log.info(
         f"  ✅ {'COUNTER' if is_counter else 'COPY'} {effective_direction.upper()} {coin} "
         f"user {user_id[:8]}… qty={qty} @ {fill_price:.2f} "
@@ -570,8 +603,8 @@ def _manage_user_positions(db: Session, user_id: str, trades: list, mids: dict):
         .filter(CopySetting.user_id == user_id, CopySetting.trader_id.is_(None))
         .first()
     )
-    tp_pct = settings.tp_value if settings else 15.0
-    sl_pct = settings.sl_value if settings else 50.0
+    default_tp = settings.tp_value if settings else 15.0
+    default_sl = settings.sl_value if settings else 50.0
 
     for trade in trades:
         mid = mids.get(trade.ticker)
@@ -590,19 +623,47 @@ def _manage_user_positions(db: Session, user_id: str, trades: list, mids: dict):
             trade.status    = "closed"
             trade.exit_price= mid
             trade.closed_at = datetime.now(timezone.utc)
+            try:
+                _publish_event(
+                    db, trade.user_id, "trade_closed",
+                    {
+                        "trader_username": trade.trader_username,
+                        "ticker": trade.ticker,
+                        "direction": trade.direction,
+                        "source": trade.source,
+                        "size_usd": round(trade.size_usd, 2),
+                        "pnl_usd": trade.pnl_usd,
+                        "reason": "external",
+                    },
+                )
+            except Exception as e:
+                log.warning(f"  publish external close event failed: {e}")
             log.info(
                 f"  ↩ {trade.ticker} closed externally, "
                 f"user {user_id[:8]}… PnL ${trade.pnl_usd:.2f}"
             )
             continue
 
+        # ★ Per-trade TP/SL overrides (manual trades) layer on top of CopySetting defaults.
+        eff_tp = trade.tp_override_pct if trade.tp_override_pct is not None else default_tp
+        eff_sl = trade.sl_override_pct if trade.sl_override_pct is not None else default_sl
+
         reason = ""
-        if pnl_pct >= tp_pct:
+        if pnl_pct >= eff_tp:
             reason = "TP"
-        elif pnl_pct <= -sl_pct:
+        elif pnl_pct <= -eff_sl:
             reason = "SL"
         if reason:
             _close_trade(db, trade, wallet, mid, reason)
+
+
+_CLOSE_REASON_TO_EVENT = {
+    "TP":              "tp_hit",
+    "SL":              "sl_hit",
+    "EQUITY_PROTECT":  "equity_protect",
+    "EXTERNAL":        "trade_closed",
+    "MANUAL":          "trade_closed",
+}
 
 
 def _close_trade(db: Session, trade: Trade, wallet: UserWallet, mid: float, reason: str):
@@ -634,6 +695,23 @@ def _close_trade(db: Session, trade: Trade, wallet: UserWallet, mid: float, reas
             f"  ✅ CLOSE {trade.ticker} ({reason}) "
             f"user {trade.user_id[:8]}… PnL {trade.pnl_pct:+.1f}%"
         )
+
+        try:
+            event_type = _CLOSE_REASON_TO_EVENT.get(reason, "trade_closed")
+            _publish_event(
+                db, trade.user_id, event_type,
+                {
+                    "trader_username": trade.trader_username,
+                    "ticker": trade.ticker,
+                    "direction": trade.direction,
+                    "source": trade.source,
+                    "size_usd": round(trade.size_usd, 2),
+                    "pnl_usd": trade.pnl_usd,
+                    "reason": reason.lower(),
+                },
+            )
+        except Exception as e:
+            log.warning(f"  publish {reason} close event failed: {e}")
     except Exception as e:
         log.error(f"  ✗ close {trade.ticker} failed: {e}")
 
@@ -676,6 +754,23 @@ def check_equity_protection(db: Session, mids: dict[str, float]):
                         trade.status = "closed"
                         trade.exit_price = trade.entry_price
                         trade.closed_at = datetime.now(timezone.utc)
+                        trade.pnl_pct = 0.0
+                        trade.pnl_usd = 0.0
+                        try:
+                            _publish_event(
+                                db, trade.user_id, "equity_protect",
+                                {
+                                    "trader_username": trade.trader_username,
+                                    "ticker": trade.ticker,
+                                    "direction": trade.direction,
+                                    "source": trade.source,
+                                    "size_usd": round(trade.size_usd, 2),
+                                    "pnl_usd": 0.0,
+                                    "reason": "equity_protect",
+                                },
+                            )
+                        except Exception as e:
+                            log.warning(f"  publish equity_protect (no-mid) failed: {e}")
                         log.warning(
                             f"  ⚠️ {trade.ticker} no mid price available — "
                             f"closed at entry price ${trade.entry_price}"

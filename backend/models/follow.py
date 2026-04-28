@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import uuid
 
-from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, String, Integer, Boolean, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from backend.database import Base
@@ -26,6 +26,11 @@ class Follow(Base):
     is_copy_trading = Column(Boolean, default=False, nullable=False)
     # ★ NEW — reverse-direction copy trading (mutually exclusive with is_copy_trading)
     is_counter_trading = Column(Boolean, default=False, nullable=False, server_default="false")
+
+    # ★ NEW (2026-04-28) — one-shot "Copy Next" mode
+    # copy_mode: "all" = continuous (legacy behavior); "next" = consume remaining_copies then auto-disable
+    copy_mode = Column(String(10), default="all", nullable=False, server_default="all")
+    remaining_copies = Column(Integer, nullable=True)
 
     created_at = Column(
         DateTime(timezone=True),

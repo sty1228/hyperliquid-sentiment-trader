@@ -40,6 +40,8 @@ class TokenSignalRow(BaseModel):
     entry_price: float | None = None
     current_price: float | None = None
     pct_change: float | None = None
+    max_gain_pct: float | None = None
+    max_gain_at: str | None = None
     tweet_text: str | None = None
     tweet_image_url: str | None = None
     likes: int | None = None
@@ -207,6 +209,8 @@ def get_token_detail(
                 entry_price=sig.entry_price,
                 current_price=sig.current_price,
                 pct_change=round(float(sig.pct_change), 2) if sig.pct_change is not None else None,
+                max_gain_pct=round(float(sig.max_gain_pct), 2) if sig.max_gain_pct is not None else None,
+                max_gain_at=sig.max_gain_at.isoformat() if sig.max_gain_at else None,
                 tweet_text=sig.tweet_text or None,
                 tweet_image_url=sig.tweet_image_url or None,
                 likes=sig.likes,

@@ -36,6 +36,14 @@ class Trade(Base):
     fee_usd: Mapped[float] = mapped_column(Float, default=0.0)
     is_fee_free: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # ★ NEW (2026-04-28) — per-trade TP/SL overrides for manual trading.
+    # Null = fall back to user's CopySetting (default 15%/50%).
+    tp_override_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sl_override_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # ★ NEW (2026-04-28) — accumulates partial-close realized PnL on a still-open trade.
+    realized_pnl_usd: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
+
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

@@ -1,9 +1,16 @@
 """
 Follow API — follow/unfollow traders + copy/counter trading toggles.
 Copy and Counter are mutually exclusive — enforced at every write path.
+
+★ 2026-04-28 — Copy Next mode:
+  copy_mode='all'  → continuous (legacy behavior)
+  copy_mode='next' → consume one fill (remaining_copies) then auto-disable.
+  Skips (same-ticker, margin, max-positions) do NOT consume the slot —
+  decrement happens only after a successful fill in trading_engine.
 """
 from __future__ import annotations
 from datetime import datetime
+from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, model_validator
 from sqlalchemy.orm import Session
@@ -15,6 +22,8 @@ from backend.models.follow import Follow
 
 router = APIRouter(prefix="/api", tags=["follow"])
 
+CopyMode = Literal["all", "next"]
+
 
 # ── Request / Response models ────────────────────────────────
 
@@ -22,11 +31,14 @@ class FollowRequest(BaseModel):
     trader_username: str
     is_copy_trading: bool = False
     is_counter_trading: bool = False  # ★ NEW
+    copy_mode: CopyMode = "all"        # ★ NEW (Copy Next)
 
     @model_validator(mode="after")
     def check_mutual_exclusivity(self) -> "FollowRequest":
         if self.is_copy_trading and self.is_counter_trading:
             raise ValueError("is_copy_trading and is_counter_trading are mutually exclusive")
+        if self.copy_mode == "next" and not (self.is_copy_trading or self.is_counter_trading):
+            raise ValueError("copy_mode='next' requires is_copy_trading or is_counter_trading")
         return self
 
 
@@ -35,6 +47,8 @@ class FollowResponse(BaseModel):
     trader_username: str
     is_copy_trading: bool
     is_counter_trading: bool  # ★ NEW
+    copy_mode: str = "all"
+    remaining_copies: int | None = None
     created_at: datetime
 
 
@@ -45,6 +59,8 @@ class FollowListItem(BaseModel):
     avatar_url: str | None = None
     is_copy_trading: bool
     is_counter_trading: bool  # ★ NEW
+    copy_mode: str = "all"
+    remaining_copies: int | None = None
     created_at: datetime
     win_rate: float = 0.0
     total_profit_usd: float = 0.0
@@ -57,6 +73,12 @@ class FollowStatusResponse(BaseModel):
     is_following: bool
     is_copy_trading: bool
     is_counter_trading: bool  # ★ NEW
+    copy_mode: str = "all"
+    remaining_copies: int | None = None
+
+
+class CopyModeRequest(BaseModel):
+    copy_mode: CopyMode
 
 
 # ── Helpers ─────────────────────────────────────────────────
@@ -82,6 +104,8 @@ def _to_response(follow: Follow, trader: Trader) -> FollowResponse:
         trader_username=trader.username,
         is_copy_trading=follow.is_copy_trading,
         is_counter_trading=follow.is_counter_trading,
+        copy_mode=follow.copy_mode or "all",
+        remaining_copies=follow.remaining_copies,
         created_at=follow.created_at,
     )
 
@@ -104,13 +128,17 @@ def follow_trader(
 
     if existing:
         # Update trading mode if anything changed
+        new_remaining = 1 if body.copy_mode == "next" else None
         changed = (
             existing.is_copy_trading != body.is_copy_trading
             or existing.is_counter_trading != body.is_counter_trading
+            or (existing.copy_mode or "all") != body.copy_mode
         )
         if changed:
             existing.is_copy_trading = body.is_copy_trading
             existing.is_counter_trading = body.is_counter_trading
+            existing.copy_mode = body.copy_mode
+            existing.remaining_copies = new_remaining
             db.commit()
             db.refresh(existing)
         return _to_response(existing, trader)
@@ -121,6 +149,8 @@ def follow_trader(
         trader_id=trader.id,
         is_copy_trading=body.is_copy_trading,
         is_counter_trading=body.is_counter_trading,
+        copy_mode=body.copy_mode,
+        remaining_copies=1 if body.copy_mode == "next" else None,
     )
     db.add(follow)
     trader.followers_count = (trader.followers_count or 0) + 1
@@ -144,6 +174,8 @@ def check_follow_status(
         is_following=follow is not None,
         is_copy_trading=follow.is_copy_trading if follow else False,
         is_counter_trading=follow.is_counter_trading if follow else False,
+        copy_mode=(follow.copy_mode or "all") if follow else "all",
+        remaining_copies=follow.remaining_copies if follow else None,
     )
 
 
@@ -193,6 +225,8 @@ def get_my_follows(
             avatar_url=trader.avatar_url,
             is_copy_trading=f.is_copy_trading,
             is_counter_trading=f.is_counter_trading,
+            copy_mode=f.copy_mode or "all",
+            remaining_copies=f.remaining_copies,
             created_at=f.created_at,
             win_rate=stats.win_rate if stats else 0.0,
             total_profit_usd=stats.total_profit_usd if stats else 0.0,
@@ -209,7 +243,7 @@ def toggle_copy_trading(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Toggle copy trading on/off. Turning ON clears counter trading."""
+    """Toggle copy trading on/off. Turning ON clears counter trading and resets mode to 'all'."""
     trader = _get_trader_or_404(db, trader_username)
     follow = _get_follow(db, current_user.id, trader.id)
     if not follow:
@@ -218,9 +252,17 @@ def toggle_copy_trading(
     follow.is_copy_trading = not follow.is_copy_trading
     if follow.is_copy_trading:
         follow.is_counter_trading = False  # mutual exclusivity
+        # Re-enabling copy is a fresh decision — clear any pending Copy Next.
+        follow.copy_mode = "all"
+        follow.remaining_copies = None
     db.commit()
     db.refresh(follow)
-    return {"is_copy_trading": follow.is_copy_trading, "is_counter_trading": follow.is_counter_trading}
+    return {
+        "is_copy_trading": follow.is_copy_trading,
+        "is_counter_trading": follow.is_counter_trading,
+        "copy_mode": follow.copy_mode or "all",
+        "remaining_copies": follow.remaining_copies,
+    }
 
 
 @router.patch("/follow/{trader_username}/counter-trading")
@@ -229,7 +271,7 @@ def toggle_counter_trading(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """★ NEW — Toggle counter trading on/off. Turning ON clears copy trading."""
+    """★ NEW — Toggle counter trading on/off. Turning ON clears copy trading and resets mode to 'all'."""
     trader = _get_trader_or_404(db, trader_username)
     follow = _get_follow(db, current_user.id, trader.id)
     if not follow:
@@ -238,6 +280,43 @@ def toggle_counter_trading(
     follow.is_counter_trading = not follow.is_counter_trading
     if follow.is_counter_trading:
         follow.is_copy_trading = False  # mutual exclusivity
+        follow.copy_mode = "all"
+        follow.remaining_copies = None
     db.commit()
     db.refresh(follow)
-    return {"is_counter_trading": follow.is_counter_trading, "is_copy_trading": follow.is_copy_trading}
+    return {
+        "is_counter_trading": follow.is_counter_trading,
+        "is_copy_trading": follow.is_copy_trading,
+        "copy_mode": follow.copy_mode or "all",
+        "remaining_copies": follow.remaining_copies,
+    }
+
+
+@router.patch("/follow/{trader_username}/copy-mode")
+def set_copy_mode(
+    trader_username: str,
+    body: CopyModeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    ★ NEW — Switch between continuous (`all`) and one-shot (`next`) copy.
+    `next` requires copy or counter trading to be active first.
+    """
+    trader = _get_trader_or_404(db, trader_username)
+    follow = _get_follow(db, current_user.id, trader.id)
+    if not follow:
+        raise HTTPException(404, "Not following this trader")
+    if body.copy_mode == "next" and not (follow.is_copy_trading or follow.is_counter_trading):
+        raise HTTPException(400, "copy_mode='next' requires copy or counter trading to be enabled")
+
+    follow.copy_mode = body.copy_mode
+    follow.remaining_copies = 1 if body.copy_mode == "next" else None
+    db.commit()
+    db.refresh(follow)
+    return {
+        "copy_mode": follow.copy_mode,
+        "remaining_copies": follow.remaining_copies,
+        "is_copy_trading": follow.is_copy_trading,
+        "is_counter_trading": follow.is_counter_trading,
+    }

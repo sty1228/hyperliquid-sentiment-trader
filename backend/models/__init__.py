@@ -5,8 +5,10 @@ from backend.models.follow import Follow
 from backend.models.trade import Trade
 from backend.models.alert import Alert
 from backend.models.setting import CopySetting, BalanceSnapshot
+from backend.models.network_event import NetworkEvent
 
 __all__ = [
     "User", "Trader", "TraderStats", "Signal",
     "Follow", "Trade", "Alert", "CopySetting", "BalanceSnapshot",
+    "NetworkEvent",
 ]

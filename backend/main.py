@@ -1,4 +1,8 @@
 from __future__ import annotations
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
 import sentry_sdk
 sentry_sdk.init(
     dsn="https://8ec3ec7c2d0d95a793c6357e47ead90f@o4510965336113152.ingest.us.sentry.io/4510965338537984",
@@ -24,6 +28,10 @@ from backend.api.deposit import router as deposit_router
 from backend.api.wallet import router as wallet_router
 from backend.api.explore import router as explore_router
 from backend.api.rewards import router as rewards_router
+from backend.api.network import router as network_router
+from backend.api.events import router as events_router, listen_network_events_task
+
+log = logging.getLogger("main")
 
 # referral_api is optional — skip gracefully if file doesn't exist
 try:
@@ -36,7 +44,22 @@ settings = get_settings()
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 
-app = FastAPI(title="HyperCopy API", version="3.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ★ Start the LISTEN/NOTIFY bridge that fans NetworkEvent rows to SSE clients.
+    listen_task = asyncio.create_task(listen_network_events_task())
+    try:
+        yield
+    finally:
+        listen_task.cancel()
+        try:
+            await listen_task
+        except (asyncio.CancelledError, Exception) as e:
+            log.info(f"LISTEN task shutdown: {type(e).__name__}")
+
+
+app = FastAPI(title="HyperCopy API", version="3.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -61,6 +84,8 @@ app.include_router(deposit_router)
 app.include_router(wallet_router)
 app.include_router(explore_router)
 app.include_router(rewards_router)
+app.include_router(network_router)
+app.include_router(events_router)
 
 if _has_referral:
     app.include_router(referral_router)
