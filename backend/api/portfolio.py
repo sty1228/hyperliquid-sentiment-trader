@@ -19,6 +19,7 @@ from backend.models.follow import Follow
 from backend.models.trader import Trader
 from backend.models.setting import BalanceSnapshot, BalanceEvent
 from backend.models.wallet import UserWallet
+from backend.models.network_event import NetworkEvent
 from backend.services.wallet_manager import get_hl_balance
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
@@ -531,3 +532,263 @@ def get_pnl_history(
         range_pnl_pct=range_pnl_pct,
         total_pnl=all_time_pnl,
     )
+
+
+# ═══════════════════════════════════════════════════════════
+#  ★ WELCOME-BACK SUMMARY (2026-04-28)
+#  Frontend calls POST /api/portfolio/welcome-back on app boot.
+#  If the user was away >= 24h AND has a prior last_seen_at, returns
+#  a recap of account performance during the absence. Otherwise
+#  returns {"summary": null}. Always updates last_seen_at to now().
+# ═══════════════════════════════════════════════════════════
+
+WELCOME_BACK_MIN_GAP_HOURS = 24
+WELCOME_BACK_MAX_WINDOW_DAYS = 30
+
+
+class WelcomeBackTradeRef(BaseModel):
+    id: str
+    ticker: str
+    direction: str
+    pnl_usd: float
+    pnl_pct: float | None = None
+    trader_username: str | None = None
+
+
+class WelcomeBackTopTrader(BaseModel):
+    trader_username: str
+    pnl_usd: float
+    trade_count: int
+
+
+class WelcomeBackSummary(BaseModel):
+    since: datetime
+    until: datetime
+    duration_hours: float
+    capped_at_30d: bool
+
+    starting_balance_usd: float
+    current_balance_usd: float
+    balance_delta_usd: float
+    balance_delta_pct: float
+
+    realized_pnl_usd: float
+    unrealized_pnl_usd_now: float
+
+    trades_opened: int
+    trades_closed: int
+    wins: int
+    losses: int
+    win_rate: float
+
+    best_trade: WelcomeBackTradeRef | None = None
+    worst_trade: WelcomeBackTradeRef | None = None
+    top_trader: WelcomeBackTopTrader | None = None
+
+    events: dict[str, int] = {}
+
+
+class WelcomeBackResponse(BaseModel):
+    summary: WelcomeBackSummary | None = None
+
+
+def _starting_balance_at(db: Session, user_id: str, since: datetime, fallback: float) -> float:
+    """
+    Best-effort historical balance just before `since`. Prefers a BalanceEvent
+    (intraday granularity) and falls back to the most recent BalanceSnapshot
+    on or before `since`. Returns `fallback` (current balance) if neither exists.
+    """
+    evt = (
+        db.query(BalanceEvent)
+        .filter(BalanceEvent.user_id == user_id, BalanceEvent.created_at <= since)
+        .order_by(desc(BalanceEvent.created_at))
+        .first()
+    )
+    if evt is not None:
+        return float(evt.balance_after)
+    snap = (
+        db.query(BalanceSnapshot)
+        .filter(
+            BalanceSnapshot.user_id == user_id,
+            BalanceSnapshot.snapshot_date <= since.date(),
+        )
+        .order_by(desc(BalanceSnapshot.snapshot_date))
+        .first()
+    )
+    if snap is not None:
+        return float(snap.balance)
+    return float(fallback)
+
+
+@router.post("/portfolio/welcome-back", response_model=WelcomeBackResponse)
+def welcome_back(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    now = datetime.now(timezone.utc)
+    prev = current_user.last_seen_at
+
+    # Always touch last_seen_at — even if we won't show the popup.
+    current_user.last_seen_at = now
+    db.commit()
+
+    # First visit ever, or returning within 24h → no popup.
+    if prev is None:
+        return WelcomeBackResponse(summary=None)
+    # Normalize to UTC if a naive timestamp slipped in (shouldn't, but defensive).
+    if prev.tzinfo is None:
+        prev = prev.replace(tzinfo=timezone.utc)
+    gap_hours = (now - prev).total_seconds() / 3600.0
+    if gap_hours < WELCOME_BACK_MIN_GAP_HOURS:
+        return WelcomeBackResponse(summary=None)
+
+    # Clamp window start at 30 days ago to bound the queries.
+    max_window_start = now - timedelta(days=WELCOME_BACK_MAX_WINDOW_DAYS)
+    capped = prev < max_window_start
+    since = max(prev, max_window_start)
+
+    user_id = current_user.id
+
+    # ── Balances ──
+    current_balance = _get_realtime_balance(db, user_id)
+    starting_balance = _starting_balance_at(db, user_id, since, fallback=current_balance)
+    balance_delta = round(current_balance - starting_balance, 2)
+    balance_delta_pct = (
+        round(balance_delta / starting_balance * 100, 2) if starting_balance > 0 else 0.0
+    )
+
+    # ── Realized PnL during the window ──
+    realized = float(
+        db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0))
+        .filter(
+            Trade.user_id == user_id,
+            Trade.status == "closed",
+            Trade.closed_at >= since,
+        )
+        .scalar()
+        or 0.0
+    )
+
+    # ── Unrealized (current open positions) ──
+    unrealized = float(
+        db.query(func.coalesce(func.sum(Trade.pnl_usd), 0.0))
+        .filter(Trade.user_id == user_id, Trade.status == "open")
+        .scalar()
+        or 0.0
+    )
+
+    # ── Trade counts ──
+    trades_opened = (
+        db.query(func.count(Trade.id))
+        .filter(Trade.user_id == user_id, Trade.opened_at >= since)
+        .scalar()
+        or 0
+    )
+    closed_window_q = db.query(Trade).filter(
+        Trade.user_id == user_id,
+        Trade.status == "closed",
+        Trade.closed_at >= since,
+    )
+    trades_closed_rows = closed_window_q.all()
+    trades_closed = len(trades_closed_rows)
+    wins = sum(1 for t in trades_closed_rows if (t.pnl_usd or 0) > 0)
+    losses = sum(1 for t in trades_closed_rows if (t.pnl_usd or 0) <= 0)
+    win_rate = round(wins / trades_closed, 3) if trades_closed > 0 else 0.0
+
+    # ── Best / worst trade in the window ──
+    def _ref(t: Trade | None) -> WelcomeBackTradeRef | None:
+        if t is None or t.pnl_usd is None:
+            return None
+        return WelcomeBackTradeRef(
+            id=t.id,
+            ticker=t.ticker,
+            direction=t.direction,
+            pnl_usd=round(float(t.pnl_usd), 2),
+            pnl_pct=round(float(t.pnl_pct), 2) if t.pnl_pct is not None else None,
+            trader_username=t.trader_username,
+        )
+
+    best_trade = (
+        db.query(Trade)
+        .filter(
+            Trade.user_id == user_id,
+            Trade.status == "closed",
+            Trade.closed_at >= since,
+            Trade.pnl_usd.isnot(None),
+        )
+        .order_by(desc(Trade.pnl_usd))
+        .first()
+    )
+    worst_trade = (
+        db.query(Trade)
+        .filter(
+            Trade.user_id == user_id,
+            Trade.status == "closed",
+            Trade.closed_at >= since,
+            Trade.pnl_usd.isnot(None),
+        )
+        .order_by(Trade.pnl_usd.asc())
+        .first()
+    )
+
+    # ── Top performing trader ──
+    top_row = (
+        db.query(
+            Trade.trader_username,
+            func.coalesce(func.sum(Trade.pnl_usd), 0.0).label("pnl_usd"),
+            func.count(Trade.id).label("trade_count"),
+        )
+        .filter(
+            Trade.user_id == user_id,
+            Trade.status == "closed",
+            Trade.closed_at >= since,
+            Trade.trader_username.isnot(None),
+        )
+        .group_by(Trade.trader_username)
+        .order_by(desc("pnl_usd"))
+        .first()
+    )
+    top_trader = (
+        WelcomeBackTopTrader(
+            trader_username=top_row.trader_username,
+            pnl_usd=round(float(top_row.pnl_usd), 2),
+            trade_count=int(top_row.trade_count),
+        )
+        if top_row is not None and top_row.trader_username is not None
+        else None
+    )
+
+    # ── Event counts ──
+    event_rows = (
+        db.query(NetworkEvent.type, func.count(NetworkEvent.id))
+        .filter(
+            NetworkEvent.user_id == user_id,
+            NetworkEvent.created_at >= since,
+        )
+        .group_by(NetworkEvent.type)
+        .all()
+    )
+    events: dict[str, int] = {t: int(c) for (t, c) in event_rows}
+
+    summary = WelcomeBackSummary(
+        since=since,
+        until=now,
+        duration_hours=round((now - since).total_seconds() / 3600.0, 1),
+        capped_at_30d=capped,
+        starting_balance_usd=round(starting_balance, 2),
+        current_balance_usd=round(current_balance, 2),
+        balance_delta_usd=balance_delta,
+        balance_delta_pct=balance_delta_pct,
+        realized_pnl_usd=round(realized, 2),
+        unrealized_pnl_usd_now=round(unrealized, 2),
+        trades_opened=int(trades_opened),
+        trades_closed=trades_closed,
+        wins=wins,
+        losses=losses,
+        win_rate=win_rate,
+        best_trade=_ref(best_trade),
+        worst_trade=_ref(worst_trade),
+        top_trader=top_trader,
+        events=events,
+    )
+    return WelcomeBackResponse(summary=summary)

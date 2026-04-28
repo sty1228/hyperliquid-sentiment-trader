@@ -25,6 +25,11 @@ class User(Base):
     referral_code_used: Mapped[str | None] = mapped_column(String(20), nullable=True)
     free_copy_trades_used: Mapped[int] = mapped_column(Integer, default=0)
 
+    # ★ NEW (2026-04-28) — Welcome-back popup trigger.
+    # Set on every POST /api/portfolio/welcome-back call; the previous value drives
+    # whether the popup fires (gap >= 24h).
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Relationships
     follows = relationship("Follow", back_populates="user", cascade="all, delete-orphan")
     trades = relationship("Trade", back_populates="user", cascade="all, delete-orphan")
