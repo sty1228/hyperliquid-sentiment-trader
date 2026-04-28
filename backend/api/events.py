@@ -143,11 +143,27 @@ async def _event_generator(
 @router.get("/events/stream")
 async def events_stream(
     request: Request,
-    token: str = Query(..., description="Stream token from POST /api/auth/stream-token"),
+    token: str | None = Query(
+        None,
+        description="Stream token from POST /api/auth/stream-token. "
+                    "Required as a query param because browser EventSource "
+                    "cannot set Authorization headers.",
+    ),
     last_id: int | None = Query(None, description="Resume after this event id"),
     db: Session = Depends(get_db),
 ):
     """SSE stream of network events for the authenticated user."""
+    # Custom 422 instead of the default Pydantic "field required" message —
+    # the hint about EventSource header limitations saves a round of FE debugging.
+    if not token:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "missing required query param 'token' "
+                "(browser EventSource cannot set Authorization header; "
+                "mint via POST /api/auth/stream-token then pass as ?token=...)"
+            ),
+        )
     user_id = _decode_stream_token(token)
     return StreamingResponse(
         _event_generator(request, user_id, last_id, db),
