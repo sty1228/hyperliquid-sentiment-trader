@@ -65,6 +65,10 @@ class PositionItem(BaseModel):
     pnl_usd: float | None = None
     pnl_pct: float | None = None
     trader_username: str | None = None
+    # ★ Per-trade TP/SL overrides (manual trades or PATCH /api/trades/{id}/tp-sl).
+    # Null = no override, fall back to the user's CopySetting default.
+    tp_override_pct: float | None = None
+    sl_override_pct: float | None = None
     opened_at: datetime
 
 
@@ -319,6 +323,8 @@ def get_open_positions(
             pnl_usd=t.pnl_usd,
             pnl_pct=t.pnl_pct,
             trader_username=t.trader_username,
+            tp_override_pct=t.tp_override_pct,
+            sl_override_pct=t.sl_override_pct,
             opened_at=t.opened_at,
         )
         for t in positions
