@@ -61,7 +61,7 @@ All routers live in `backend/api/`. Prefix is `/api` unless noted.
 - `trader_stats` — pre-computed leaderboard rows. Unique `(trader_id, window)` where `window ∈ {24h, 7d, 30d}`. Recomputed every 10 min.
 - `signals` — one row per labeled tweet. `(trader_id, ticker, direction, sentiment)` core; `entry_price` / `current_price` / `pct_change` updated every tick; `max_gain_pct` + `max_gain_at` monotonic peak-favorable-excursion. `tweet_id` unique. `tweet_image_url` (Text, nullable) — attached image URL passed to the vision pass. `status ∈ {active, processed, expired, skipped}`. **Always order by `coalesce(tweet_time, created_at)`** — tweet_time is preferred but nullable.
 - `follows` — unique `(user_id, trader_id)`. `is_copy_trading` and `is_counter_trading` are mutually exclusive (validated in API and DB defaults).
-- `trades` — one row per opened position. `signal_id` nullable (manual trades). `status ∈ {open, closed}`, `source ∈ {copy, counter, manual}`, `fee_usd` + `is_fee_free` for affiliate accounting.
+- `trades` — one row per opened position. `signal_id` nullable (manual trades). `status ∈ {open, closed}`, `source ∈ {copy, counter, manual}`, `fee_usd` + `is_fee_free` for affiliate accounting. `pnl_usd` is **HL-authoritative** — set from `clearinghouseState.assetPositions[].position.unrealizedPnl` while open, and from `userFills[].closedPnl` summed over closing fills at close time; never locally computed. `pnl_pct` is asset-price % change used for TP/SL threshold comparison only, not USD-PnL-derived. Note: a `realized_pnl_usd` column existed briefly (2026-04-28 → 2026-05-01) as a partial-close accumulator; dropped (migration `acb0b86b0ff2`) because HL fill history is the source of truth.
 - `copy_settings` — unique `(user_id, trader_id)` with `trader_id NULL` = the user's default. `size_type ∈ {percent, fixed_usd}`, `margin_mode ∈ {cross, isolated}`, `tp_value` / `sl_value` in percent.
 - `balance_snapshots` — daily equity per user (unique on `snapshot_date`); written by `sync_balances`.
 - `balance_events` — intraday deposit/withdraw events with `balance_after` for charting.
@@ -85,7 +85,7 @@ Migrations live under `alembic/versions/`. Every model change requires `alembic 
 
 1. `process_new_signals` — `signals` where `status='active'` AND `created_at >= now-5min`, batched 50, dispatched to all matching `follows`.
 2. `expire_old_signals` — anything `active` older than 5 min → `expired`.
-3. `update_positions` — pull HL `clearinghouseState`, update `pnl_pct` / `pnl_usd`, fire TP/SL closes.
+3. `update_positions` — pull HL `clearinghouseState` once per user; for each open trade set `pnl_usd = position.unrealizedPnl` (HL-authoritative, no local math) and `pnl_pct = (mid - entry) / entry * 100` for TP/SL threshold comparison only. On detected external close (HL position size ~0), set `pnl_usd` from `userFills[].closedPnl` aggregated since `opened_at` — one extra HL call per close event, never per tick. Fire TP/SL via `_close_trade`, which uses the same `userFills` lookup post-fill. Helpers: `hl_user_fills`, `_aggregate_close_pnl`, `_fetch_close_pnl_for_trade`.
 4. `check_equity_protection` — force-close all of a user's positions if HL equity < `MIN_EQUITY_CLOSE_ALL` (`$2`).
 5. `update_signal_prices` — refresh `current_price` and `pct_change` on signals from last 30d. Backfills missing `entry_price` from current mid.
 6. `sync_balances` — every 5 min, upsert `BalanceSnapshot` for the day.
@@ -102,6 +102,7 @@ Migrations live under `alembic/versions/`. Every model change requires `alembic 
 - **Ghost-position prevention.** If the HL order fills but the SQLAlchemy commit fails, `_emergency_close_position` immediately fires a reduce-only close on HL using the same key. Do not move the `db.flush()` after the HL call without preserving this safety net.
 - **Builder-fee auto-approve.** First trade on a wallet may fail with `"Builder fee has not been approved"`; the engine calls `approve_builder_fee_for_wallet` and retries once. Approved wallets are cached in process memory (`_approved_wallets`) — restart clears the cache.
 - **Price rounding.** HL requires 5 significant figures; use `_round_price`, not `round(x, n)`.
+- **PnL is HL-authoritative.** Never set `trade.pnl_usd` from a local formula. Open: read `clearinghouseState.assetPositions[].position.unrealizedPnl`. Closed: sum `userFills[].closedPnl` for that ticker over the trade's lifetime (`opened_at` → `closed_at`). The previous local formula (`pnl_pct/100 * size_usd * leverage`) double-counted leverage when `size_usd` drifted from margin to notional semantics, inflating results by ~leverage (observed 5.4× on one account).
 
 For deeper detail on order-result parsing, leverage updates, and HL meta refresh, read `trading_engine.py` end-to-end — it's ~1000 lines and self-documenting.
 
@@ -235,5 +236,6 @@ sudo systemctl start hypercopy-api
 
 ## 10. Changelog
 
+- 2026-05-01 — PnL switched to HL-authoritative (engine `_manage_user_positions` + `_close_trade`, manual/partial close in `trades.py`); dropped `trades.realized_pnl_usd`; added `scripts/backfill_pnl_from_hl.py`. Migration `acb0b86b0ff2`.
 - 2026-04-26 — Initial spec generated by /init.
 - 2026-04-26 — Added §8 "Recovering from migration state drift" (alembic stamp procedure) and §9 port-8000 orphan uvicorn recovery commands; both surfaced during prod deploy of commits `2cd2c52` + `2e7b387`.
