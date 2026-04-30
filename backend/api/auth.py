@@ -12,6 +12,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 import jwt  # pyjwt
 import logging
+import uuid
 
 from backend.config import get_settings
 from backend.deps import get_db, get_current_user
@@ -119,8 +120,13 @@ def connect_wallet(body: ConnectWalletRequest, db: Session = Depends(get_db)):
                     f"— wallet now belongs to {user.id[:8]}…"
                 )
                 other.is_active = False
-                # Clear wallet to avoid unique constraint violation if applicable
-                other.wallet_address = f"merged-into-{user.id}-{other.wallet_address}"
+                # ★ 2026-05-01 — replace the prior 96-byte marker
+                # ("merged-into-<new_user_id>-<old_wallet>") with a fixed-shape
+                # 38-byte token. Preserves the UNIQUE constraint and fits
+                # comfortably even in the legacy VARCHAR(42); the merge target
+                # is now reconstructable from is_active=False + log line, not
+                # from the marker itself.
+                other.wallet_address = f"deact_{uuid.uuid4().hex}"
 
             user.wallet_address = body.wallet_address
             db.commit()

@@ -13,7 +13,10 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    wallet_address: Mapped[str] = mapped_column(String(42), unique=True, nullable=False, index=True)
+    # Wider than the EOA 0x + 40-hex (42) so the dual-account merge can
+    # write a soft-deactivation marker (`deact_<uuid>`) into orphaned rows
+    # without overflowing the column. See migration 2225cbed80a6 (2026-05-01).
+    wallet_address: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     display_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     twitter_username: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
     sub_account_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
