@@ -127,7 +127,12 @@ def _backfill_user(
                 log.info(f"  OPEN   {t.id[:8]} {t.ticker:>6} no HL position (will close on next engine tick)")
                 totals["open_orphan"] += 1
                 continue
-            new_pnl = round(float(hp["upnl"]), 2)
+            upnl = hp.get("upnl")
+            if upnl is None:
+                log.info(f"  OPEN   {t.id[:8]} {t.ticker:>6} HL omitted unrealizedPnl — skipped")
+                totals["open_skipped_no_upnl"] += 1
+                continue
+            new_pnl = round(float(upnl), 2)
             old_pnl = float(t.pnl_usd or 0.0)
             if abs(new_pnl - old_pnl) > 0.01:
                 log.info(

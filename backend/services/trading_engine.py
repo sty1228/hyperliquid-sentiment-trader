@@ -106,16 +106,28 @@ def hl_clearinghouse(address: str) -> dict:
 
 
 def hl_parse_positions(state: dict) -> dict[str, dict]:
+    """
+    Normalize HL clearinghouseState.assetPositions[].position into a
+    coin-keyed dict. `upnl` is None when HL omits `unrealizedPnl` so the
+    caller can distinguish "missing" from a real zero value (matters for
+    pnl_usd — silently zero-filling would overwrite a prior good value).
+    """
     out = {}
     for ap in state.get("assetPositions", []):
         p = ap.get("position", {})
         coin = p.get("coin")
-        if coin:
-            out[coin] = {
-                "szi":     float(p.get("szi", "0")),
-                "entryPx": float(p.get("entryPx", "0")),
-                "upnl":    float(p.get("unrealizedPnl", "0")),
-            }
+        if not coin:
+            continue
+        upnl_raw = p.get("unrealizedPnl")
+        try:
+            upnl_val = float(upnl_raw) if upnl_raw is not None else None
+        except (TypeError, ValueError):
+            upnl_val = None
+        out[coin] = {
+            "szi":     float(p.get("szi", "0")),
+            "entryPx": float(p.get("entryPx", "0")),
+            "upnl":    upnl_val,
+        }
     return out
 
 
@@ -727,8 +739,16 @@ def _manage_user_positions(db: Session, user_id: str, trades: list, mids: dict):
 
         # Open position — trust HL's unrealizedPnl. Reuses the clearinghouseState
         # response we already pulled at line `state = hl_clearinghouse(...)` above:
-        # zero extra HL calls per tick.
-        trade.pnl_usd = round(hp["upnl"], 2)
+        # zero extra HL calls per tick. On a missing field we keep the prior
+        # value rather than zero-filling — a stale tick is better than wiping pnl.
+        upnl = hp.get("upnl")
+        if upnl is not None:
+            trade.pnl_usd = round(upnl, 2)
+        else:
+            log.warning(
+                f"  {trade.ticker} HL position has no unrealizedPnl field — "
+                f"keeping prior pnl_usd=${trade.pnl_usd or 0:.2f}"
+            )
 
         # ★ Per-trade TP/SL overrides (manual trades) layer on top of CopySetting defaults.
         eff_tp = trade.tp_override_pct if trade.tp_override_pct is not None else default_tp
