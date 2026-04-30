@@ -119,6 +119,76 @@ def hl_parse_positions(state: dict) -> dict[str, dict]:
     return out
 
 
+# ═══════════════════════════════════════════════════════════════
+#  ★ AUTHORITATIVE PnL FROM HL  (2026-05-01)
+#  We never compute PnL locally anymore — open trades read
+#  unrealizedPnl from clearinghouseState (already fetched per
+#  tick in update_positions; reuse without extra HL calls), and
+#  closing trades pull closedPnl + fee from userFills once at
+#  close time. This eliminates the size_usd-vs-notional
+#  multiplication chain that was inflating values by ~leverage.
+# ═══════════════════════════════════════════════════════════════
+
+def hl_user_fills(address: str, since_ms: int | None = None) -> list[dict]:
+    """
+    Fetch the authenticated wallet's recent fills. HL returns up to
+    ~2000 most recent fills; pass `since_ms` to use the time-bounded
+    endpoint when we need older history (backfill).
+    """
+    payload: dict = {"user": address.lower()}
+    if since_ms is None:
+        payload["type"] = "userFills"
+    else:
+        payload["type"] = "userFillsByTime"
+        payload["startTime"] = int(since_ms)
+    return _hl_post(payload, timeout=15) or []
+
+
+def _aggregate_close_pnl(
+    fills: list[dict],
+    ticker: str,
+    since_ms: int,
+    until_ms: int | None = None,
+) -> tuple[float, float]:
+    """
+    Sum closedPnl and fee from `fills` for `ticker` within [since_ms, until_ms].
+    `closedPnl` is non-zero only on closing fills. Returns (pnl_usd, fee_usd).
+    """
+    pnl = 0.0
+    fee = 0.0
+    for f in fills:
+        if f.get("coin") != ticker:
+            continue
+        ts = int(f.get("time", 0))
+        if ts < since_ms:
+            continue
+        if until_ms is not None and ts > until_ms:
+            continue
+        cp = f.get("closedPnl")
+        if cp is None or float(cp) == 0:
+            continue
+        pnl += float(cp)
+        fee += float(f.get("fee", "0") or "0")
+    return round(pnl, 2), round(fee, 6)
+
+
+def _fetch_close_pnl_for_trade(
+    address: str, ticker: str, opened_at: datetime, lookback_pad_sec: int = 30
+) -> tuple[float, float] | None:
+    """
+    For a trade that just closed (or closed externally), pull recent fills
+    and aggregate the closedPnl across all closing fills since `opened_at`.
+    Returns None on HL error (caller decides fallback).
+    """
+    try:
+        since_ms = int(opened_at.timestamp() * 1000) - lookback_pad_sec * 1000
+        fills = hl_user_fills(address, since_ms=since_ms)
+        return _aggregate_close_pnl(fills, ticker, since_ms)
+    except Exception as e:
+        log.warning(f"HL userFills lookup failed for {ticker}@{address[:10]}…: {e}")
+        return None
+
+
 def _hl_set_leverage(private_key: str, coin: str, leverage: int, cross: bool = True):
     try:
         from hyperliquid.exchange import Exchange
@@ -610,19 +680,30 @@ def _manage_user_positions(db: Session, user_id: str, trades: list, mids: dict):
         mid = mids.get(trade.ticker)
         if not mid:
             continue
+
+        # pnl_pct stays as asset-price % change — that's what TP/SL thresholds compare against.
         if trade.direction == "long":
             pnl_pct = (mid - trade.entry_price) / trade.entry_price * 100
         else:
             pnl_pct = (trade.entry_price - mid) / trade.entry_price * 100
-        pnl_usd        = pnl_pct / 100 * trade.size_usd * trade.leverage
-        trade.pnl_pct  = round(pnl_pct, 2)
-        trade.pnl_usd  = round(pnl_usd, 2)
+        trade.pnl_pct = round(pnl_pct, 2)
 
         hp = hl_pos.get(trade.ticker)
         if not hp or abs(hp["szi"]) < 1e-10:
+            # External close — position no longer on HL. Pull realized PnL from
+            # userFills since this trade opened (sum of closedPnl on closing fills).
             trade.status    = "closed"
             trade.exit_price= mid
             trade.closed_at = datetime.now(timezone.utc)
+
+            agg = _fetch_close_pnl_for_trade(wallet.address, trade.ticker, trade.opened_at)
+            if agg is not None:
+                pnl_usd, fee_usd = agg
+                trade.pnl_usd = pnl_usd
+                if fee_usd > 0:
+                    trade.fee_usd = round(fee_usd, 6)
+            # else: leave whatever pnl_usd was last computed; backfill script can fix later.
+
             try:
                 _publish_event(
                     db, trade.user_id, "trade_closed",
@@ -640,9 +721,14 @@ def _manage_user_positions(db: Session, user_id: str, trades: list, mids: dict):
                 log.warning(f"  publish external close event failed: {e}")
             log.info(
                 f"  ↩ {trade.ticker} closed externally, "
-                f"user {user_id[:8]}… PnL ${trade.pnl_usd:.2f}"
+                f"user {user_id[:8]}… PnL ${trade.pnl_usd or 0:.2f}"
             )
             continue
+
+        # Open position — trust HL's unrealizedPnl. Reuses the clearinghouseState
+        # response we already pulled at line `state = hl_clearinghouse(...)` above:
+        # zero extra HL calls per tick.
+        trade.pnl_usd = round(hp["upnl"], 2)
 
         # ★ Per-trade TP/SL overrides (manual trades) layer on top of CopySetting defaults.
         eff_tp = trade.tp_override_pct if trade.tp_override_pct is not None else default_tp
@@ -685,15 +771,25 @@ def _close_trade(db: Session, trade: Trade, wallet: UserWallet, mid: float, reas
         trade.exit_price= exit_px
         trade.closed_at = datetime.now(timezone.utc)
 
+        # pnl_pct = asset-price % change at exit (display-only; never used for $ math).
         if trade.direction == "long":
             trade.pnl_pct = round((exit_px - trade.entry_price) / trade.entry_price * 100, 2)
         else:
             trade.pnl_pct = round((trade.entry_price - exit_px) / trade.entry_price * 100, 2)
-        trade.pnl_usd = round(trade.pnl_pct / 100 * trade.size_usd * trade.leverage, 2)
+
+        # pnl_usd: trust HL. Sum closedPnl from fills since this trade opened.
+        agg = _fetch_close_pnl_for_trade(wallet.address, trade.ticker, trade.opened_at)
+        if agg is not None:
+            pnl_usd, fee_usd = agg
+            trade.pnl_usd = pnl_usd
+            if fee_usd > 0:
+                trade.fee_usd = round(fee_usd, 6)
+        # else: HL fetch failed; pnl_usd stays at whatever update_positions wrote
+        # last tick (HL's unrealizedPnl, which is a close approximation at close time).
 
         log.info(
             f"  ✅ CLOSE {trade.ticker} ({reason}) "
-            f"user {trade.user_id[:8]}… PnL {trade.pnl_pct:+.1f}%"
+            f"user {trade.user_id[:8]}… PnL ${trade.pnl_usd or 0:+.2f} ({trade.pnl_pct:+.1f}%)"
         )
 
         try:

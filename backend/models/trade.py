@@ -41,8 +41,10 @@ class Trade(Base):
     tp_override_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     sl_override_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    # ★ NEW (2026-04-28) — accumulates partial-close realized PnL on a still-open trade.
-    realized_pnl_usd: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
+    # NOTE (2026-05-01): `realized_pnl_usd` was removed. pnl_usd is now the single
+    # source of truth and is populated directly from HL (unrealizedPnl while open,
+    # closedPnl from userFills on close). Partial-close realized PnL is
+    # discoverable via HL fill history but not mirrored locally.
 
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

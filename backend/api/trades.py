@@ -4,7 +4,7 @@ Trades API — 交易历史 + 手动平仓 + 手动下单 (2026-04-28)
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field, model_validator
@@ -349,6 +349,7 @@ def close_trade(
     trade.exit_price = exit_price
     trade.closed_at = datetime.now(timezone.utc)
 
+    # pnl_pct = asset-price % change at exit (display-only).
     if trade.direction == "long":
         trade.pnl_pct = round(
             (exit_price - trade.entry_price) / trade.entry_price * 100, 2
@@ -357,9 +358,19 @@ def close_trade(
         trade.pnl_pct = round(
             (trade.entry_price - exit_price) / trade.entry_price * 100, 2
         )
-    trade.pnl_usd = round(
-        trade.pnl_pct / 100 * trade.size_usd * trade.leverage, 2
-    )
+
+    # pnl_usd: trust HL — sum closedPnl from fills since this trade opened.
+    # Avoids the size_usd × leverage chain that was inflating local math.
+    try:
+        from backend.services.trading_engine import _fetch_close_pnl_for_trade
+        agg = _fetch_close_pnl_for_trade(wallet.address, trade.ticker, trade.opened_at)
+        if agg is not None:
+            pnl_usd_hl, fee_usd_hl = agg
+            trade.pnl_usd = pnl_usd_hl
+            if fee_usd_hl > 0:
+                trade.fee_usd = round(fee_usd_hl, 6)
+    except Exception as e:
+        log.warning(f"HL closedPnl lookup failed for trade {trade.id}: {e}")
 
     try:
         _publish_event(
@@ -383,7 +394,7 @@ def close_trade(
     log.info(
         f"✅ MANUAL CLOSE {trade.ticker} {trade.direction} "
         f"user {current_user.id[:8]}… "
-        f"exit={exit_price:.2f} PnL={trade.pnl_pct:+.1f}% (${trade.pnl_usd:+.2f})"
+        f"exit={exit_price:.2f} PnL={trade.pnl_pct:+.1f}% (${(trade.pnl_usd or 0):+.2f})"
     )
 
     return CloseTradeResponse(
@@ -675,8 +686,10 @@ def partial_close_trade(
 ):
     """
     Close `pct`% of an open position. The remaining qty/size_usd is decremented
-    in place; realized PnL accumulates into `realized_pnl_usd`; the row stays
-    status='open' until pct=100 (which routes to a full close).
+    in place; the row stays status='open' until pct=100 (which routes to a full
+    close). The next update_positions tick refreshes pnl_usd from HL's
+    unrealizedPnl on the remaining position; the realized portion of the partial
+    close lives in HL fill history (queryable but no longer mirrored locally).
     """
     trade = (
         db.query(Trade)
@@ -743,17 +756,24 @@ def partial_close_trade(
 
     exit_px = avg_px if avg_px > 0 else mid
 
-    # Realized PnL for the closed slice
-    if trade.direction == "long":
-        slice_pct = (exit_px - trade.entry_price) / trade.entry_price * 100
-    else:
-        slice_pct = (trade.entry_price - exit_px) / trade.entry_price * 100
+    # Pull the slice's realized PnL from HL fills (most recent closing fill on this ticker).
     slice_size_usd = trade.size_usd * pct / 100.0
-    slice_pnl_usd = round(slice_pct / 100 * slice_size_usd * trade.leverage, 2)
+    slice_pnl_usd: float | None = None
+    try:
+        from backend.services.trading_engine import (
+            hl_user_fills, _aggregate_close_pnl,
+        )
+        # Look back to just before this partial-close was submitted.
+        since_ms = int((datetime.now(timezone.utc) - timedelta(seconds=30)).timestamp() * 1000)
+        fills = hl_user_fills(wallet.address, since_ms=since_ms)
+        slice_pnl_usd, _slice_fee = _aggregate_close_pnl(fills, trade.ticker, since_ms)
+    except Exception as e:
+        log.warning(f"HL slice pnl lookup failed for trade {trade.id}: {e}")
 
+    # Decrement the remaining position. pnl_usd will be refreshed by the next
+    # update_positions tick from HL's unrealizedPnl on the smaller position.
     trade.size_qty = round(trade.size_qty - close_qty, sz_decimals)
     trade.size_usd = round(trade.size_usd - slice_size_usd, 6)
-    trade.realized_pnl_usd = round((trade.realized_pnl_usd or 0.0) + slice_pnl_usd, 2)
 
     try:
         _publish_event(
@@ -777,7 +797,7 @@ def partial_close_trade(
 
     log.info(
         f"✅ PARTIAL CLOSE {pct:.0f}% {trade.ticker} {trade.direction} "
-        f"user {current_user.id[:8]}… slice PnL=${slice_pnl_usd:+.2f} "
+        f"user {current_user.id[:8]}… slice PnL=${(slice_pnl_usd or 0):+.2f} "
         f"remaining qty={trade.size_qty}"
     )
 
