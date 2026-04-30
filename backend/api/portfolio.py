@@ -91,6 +91,7 @@ class PnlHistoryResponse(BaseModel):
     range_pnl: float = 0.0
     range_pnl_pct: float = 0.0
     total_pnl: float = 0.0
+    cost_basis: float = 0.0  # net deposits − withdrawals; 0 if user never deposited
 
 
 class TraderPnlItem(BaseModel):
@@ -117,6 +118,40 @@ def _calc_trade_pnl(db: Session, user_id: str, since: datetime | None = None) ->
         ).scalar()
     )
     return round(realized + unrealized, 2)
+
+
+def _calc_cost_basis(db: Session, user_id: str) -> float:
+    """Net deposits minus withdrawals from balance_events.
+    The ROI denominator. Returns 0.0 if user has never deposited."""
+    deposits = float(
+        db.query(func.coalesce(func.sum(BalanceEvent.amount), 0.0))
+        .filter(BalanceEvent.user_id == user_id, BalanceEvent.event_type == "deposit")
+        .scalar()
+    )
+    withdrawals = float(
+        db.query(func.coalesce(func.sum(BalanceEvent.amount), 0.0))
+        .filter(BalanceEvent.user_id == user_id, BalanceEvent.event_type == "withdraw")
+        .scalar()
+    )
+    return max(0.0, deposits - withdrawals)
+
+
+def _earliest_activity(db: Session, user_id: str) -> datetime | None:
+    """Earliest BalanceEvent.created_at, falling back to earliest Trade.opened_at.
+    Used to clamp the ALL-range chart so we don't draw years of leading zeros."""
+    ev = (
+        db.query(BalanceEvent.created_at)
+        .filter(BalanceEvent.user_id == user_id)
+        .order_by(BalanceEvent.created_at).first()
+    )
+    if ev:
+        return ev[0]
+    tr = (
+        db.query(Trade.opened_at)
+        .filter(Trade.user_id == user_id)
+        .order_by(Trade.opened_at).first()
+    )
+    return tr[0] if tr else None
 
 
 def _get_realtime_balance(db: Session, user_id: str) -> float:
@@ -440,7 +475,12 @@ def get_pnl_history(
     elif timeRange == "YTD":
         since = datetime(now.year, 1, 1, tzinfo=timezone.utc)
     else:
-        since = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        # Clamp ALL-range to first user activity to avoid years of leading-zero
+        # points that flatten + spike the chart on first trade close.
+        earliest = _earliest_activity(db, user_id)
+        since = earliest if earliest else datetime(2020, 1, 1, tzinfo=timezone.utc)
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
 
     closed_trades = (
         db.query(Trade)
@@ -526,17 +566,18 @@ def get_pnl_history(
         pnl_points.insert(0, PnlHistoryItem(timestamp=since_ts, pnl=round(pnl_before, 2)))
 
     range_pnl, range_pnl_pct = 0.0, 0.0
+    cost_basis = _calc_cost_basis(db, user_id)
     if len(pnl_points) >= 2:
         range_pnl = round(pnl_points[-1].pnl - pnl_points[0].pnl, 2)
-        balance = _get_realtime_balance(db, user_id)
-        if balance > 0:
-            range_pnl_pct = round(range_pnl / balance * 100, 2)
+        if cost_basis > 0:
+            range_pnl_pct = round(range_pnl / cost_basis * 100, 2)
 
     return PnlHistoryResponse(
         data=pnl_points,
         range_pnl=range_pnl,
         range_pnl_pct=range_pnl_pct,
         total_pnl=all_time_pnl,
+        cost_basis=cost_basis,
     )
 
 
