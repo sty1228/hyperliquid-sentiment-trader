@@ -390,6 +390,35 @@ LLM_FEW_SHOT_EXAMPLES = [
     # iii. Quote tweet WITH the author's own directional commentary — IS a signal.
     {"tweet": "this is bearish, BTC dumps to 60k by Friday https://t.co/abc",
      "label": {"is_signal": True, "ticker": "BTC", "sentiment": "bearish", "direction": "short", "confidence": 80}},
+
+    # ★ 2026-05-02 — semantic-inversion guardrails. Two failure modes seen in
+    # prod: liquidation-news read as a directional call, and "took profit /
+    # closed" read as a new entry. Keyword-only fixes over-match — these are
+    # LLM-judgment cases.
+
+    # Liquidation-news (a): shorts liquidated reads bearish-keyword but is a
+    # bullish event AND, more importantly, it's news/reportage — not a call.
+    {"tweet": "💥 BREAKING: $270M of short positions liquidated in the last hour after Trump comments",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    # Liquidation-news (b): symmetric — longs liquidated is also news, not a
+    # short call. Keeps the LLM from pattern-matching "shorts liquidated = noise"
+    # specifically while still labeling "longs liquidated" as a signal.
+    {"tweet": "Massive long liquidation cascade — $850M wiped out as $BTC dumps to 60k",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    # Close-not-open (c): the KOL is announcing they took profit on an existing
+    # short — not opening a new one. The "Want in?" CTA is for a paid service,
+    # not a position to copy.
+    {"tweet": "Full TP on our $ETH short. Want in? 👇",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    # Close-not-open (d): scaling out / "out of" / past-tense framing of an
+    # entry are all close announcements, not new positions.
+    {"tweet": "Scaled out of my $SOL position — nice ride from $98 🙏",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+
+    # Anti-regression: bullish vibes expressed naturally (no explicit "longed
+    # at X") still count as a long signal. Don't let the new negatives bleed.
+    {"tweet": "$HYPE to the moon, this is the most bullish setup I've seen in months",
+     "label": {"is_signal": True, "ticker": "HYPE", "sentiment": "bullish", "direction": "long", "confidence": 75}},
 ]
 
 
@@ -950,6 +979,10 @@ def llm_batch_label(items):
             "Factual observations about on-chain flows, exchange transfers, liquidations, listings, "
             "or news events are NOT signals unless the author adds clear directional trading commentary. "
             "A retweet or quote without the author's own opinion is never a signal. "
+            # ★ 2026-05-02 — semantic-inversion guardrail
+            "Reports of past trades, liquidations, or position closes describe events that already "
+            "happened — they are not new trade calls. A signal requires the author to be opening or "
+            "currently holding a directional position. "
             "Always return strict JSON. No markdown, no commentary."
         )},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
