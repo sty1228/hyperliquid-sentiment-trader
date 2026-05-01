@@ -5,10 +5,22 @@
   connect-wallet now looks up by twitter_username FIRST, then wallet_address.
   If a user with the same twitter_username exists, update their wallet_address
   instead of creating a duplicate account.
+
+★ 2026-05-02: Resilient to uq_users_twitter_username partial unique index.
+  Manual SQL on prod added:
+    CREATE UNIQUE INDEX uq_users_twitter_username
+      ON users (twitter_username) WHERE twitter_username IS NOT NULL;
+  Two commit sites can now raise IntegrityError on a twitter_username
+  collision: (a) Step 2's UPDATE that attaches a twitter_username to an
+  existing user matched by wallet_address, and (b) Step 3's INSERT in a
+  race between two near-simultaneous connect-wallet calls. Both are caught
+  and resolved by issuing the JWT for the canonical (oldest active) user
+  with that twitter_username — no data mutation on collision.
 """
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 import jwt  # pyjwt
 import logging
@@ -77,6 +89,41 @@ def create_jwt_token(user_id: str) -> str:
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGO)
 
 
+def _is_twitter_username_conflict(err: IntegrityError) -> bool:
+    """
+    Distinguish the partial unique index `uq_users_twitter_username` from the
+    other UNIQUE constraints on `users` (wallet_address, sub_account_address).
+    psycopg2 surfaces the constraint name in `err.orig.diag.constraint_name`
+    on most failures; we check both the constraint name and a fallback string
+    match to stay robust across psycopg2 versions and Postgres minor releases.
+    """
+    diag_name = getattr(getattr(err.orig, "diag", None), "constraint_name", None) or ""
+    msg = str(err.orig).lower()
+    return (
+        diag_name == "uq_users_twitter_username"
+        or "uq_users_twitter_username" in msg
+        or ("twitter_username" in msg and "duplicate" in msg)
+    )
+
+
+def _resolve_canonical_by_twitter(db: Session, twitter_username: str) -> User | None:
+    """
+    On twitter_username collision, the oldest active user wins as canonical.
+    Older `created_at` reflects "this user was here first". Inactive rows
+    (deactivated orphans from prior merges) are excluded — never auth as a
+    deactivated account.
+    """
+    return (
+        db.query(User)
+        .filter(
+            User.twitter_username == twitter_username,
+            User.is_active.is_(True),
+        )
+        .order_by(User.created_at.asc())
+        .first()
+    )
+
+
 # ── API 端点 ─────────────────────────────────────────────
 
 @router.post("/connect-wallet", response_model=AuthResponse)
@@ -141,8 +188,32 @@ def connect_wallet(body: ConnectWalletRequest, db: Session = Depends(get_db)):
         )
         if user and body.twitter_username and user.twitter_username != body.twitter_username:
             user.twitter_username = body.twitter_username
-            db.commit()
-            db.refresh(user)
+            try:
+                db.commit()
+                db.refresh(user)
+            except IntegrityError as e:
+                # Another user already owns this twitter_username (partial
+                # unique index). Roll back the rename, resolve canonical,
+                # auth as them. The wallet-matched user keeps their existing
+                # twitter_username (or NULL); we don't reassign.
+                db.rollback()
+                if not _is_twitter_username_conflict(e):
+                    raise
+                canonical = _resolve_canonical_by_twitter(db, body.twitter_username)
+                if not canonical:
+                    raise HTTPException(
+                        409,
+                        f"twitter_username={body.twitter_username} is in use but its "
+                        "owner is inactive — contact support",
+                    )
+                log.warning(
+                    f"⚠️ TWITTER_CONFLICT (Step 2): wallet={body.wallet_address[:10]}… "
+                    f"matched user={user.id[:8]}… (twitter={user.twitter_username}); "
+                    f"requested twitter={body.twitter_username} already owned by "
+                    f"canonical={canonical.id[:8]}… (wallet={canonical.wallet_address[:10]}…) "
+                    f"— issuing JWT for canonical, no data change"
+                )
+                user = canonical
 
     # ── Step 3: Create new user ──
     if not user:
@@ -151,8 +222,34 @@ def connect_wallet(body: ConnectWalletRequest, db: Session = Depends(get_db)):
             twitter_username=body.twitter_username,
         )
         db.add(user)
-        db.commit()
-        db.refresh(user)
+        try:
+            db.commit()
+            db.refresh(user)
+        except IntegrityError as e:
+            # Race: between Step 1's lookup and the INSERT, another request
+            # inserted a user with the same twitter_username. Roll back, find
+            # the canonical, auth as them.
+            db.rollback()
+            if not _is_twitter_username_conflict(e):
+                raise
+            if not body.twitter_username:
+                # Cannot have hit twitter_username conflict without one being set.
+                raise
+            canonical = _resolve_canonical_by_twitter(db, body.twitter_username)
+            if not canonical:
+                raise HTTPException(
+                    409,
+                    f"twitter_username={body.twitter_username} is in use but its "
+                    "owner is inactive — contact support",
+                )
+            log.warning(
+                f"⚠️ TWITTER_CONFLICT (Step 3, race): attempted insert "
+                f"wallet={body.wallet_address[:10]}… twitter={body.twitter_username}; "
+                f"already owned by canonical={canonical.id[:8]}… "
+                f"(wallet={canonical.wallet_address[:10]}…) — issuing JWT for canonical, "
+                f"requested wallet stays external"
+            )
+            user = canonical
 
     token = create_jwt_token(user.id)
 
