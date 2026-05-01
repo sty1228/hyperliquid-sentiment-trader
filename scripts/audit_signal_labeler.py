@@ -13,6 +13,26 @@ Usage:
 
 The cost is one llm_batch_label call (one round-trip, batched), typically a
 few cents at most.
+
+═══════════════════════════════════════════════════════════════════════
+Validation receipts (newest first)
+═══════════════════════════════════════════════════════════════════════
+
+[PENDING] 2026-05-02 — covers commits 7167b10 + 62be76c
+  Two semantic-inversion fixes shipped (liquidation-news rejection +
+  close-not-open rejection, plus a bullish-vibes anti-regression
+  positive). Local audit could NOT run: dev OPENAI_API_KEY in `.env`
+  was rejected with 401. Run on the prod host before re-enabling the
+  ingestor unit:
+      cd /opt/hypercopy
+      git fetch origin && git reset --hard origin/main
+      /opt/hypercopy/venv/bin/python -m scripts.audit_signal_labeler
+  Acceptance: all 13 cases pass (3 liq-news → NOISE, 3 close-not-open
+  → NOISE, 4 bullish-vibe → SIGNAL with correct direction, 3 noise
+  → NOISE). If any anti-regression positive flips to NOISE, add
+  another bullish-vibe few-shot, re-run, repeat until clean. Then
+  REPLACE this PENDING block with the matrix output and commit
+  `docs(audit): record passing matrix for 62be76c`.
 """
 from __future__ import annotations
 
