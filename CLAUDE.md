@@ -182,7 +182,7 @@ There is no test runner wired up (`tests/` is empty) and no linter config.
 
 ### Deploy workflow
 
-- Production runs the API + four workers as separate systemd units (`hypercopy-api`, `hypercopy-engine`, `hypercopy-ingestor`, `hypercopy-monitor`, `hypercopy-maxgain` — exact unit names per the deploy host). `deposit_monitor.py`'s docstring is the canonical reference for the `hypercopy-monitor` unit.
+- Production runs the API + four workers as separate systemd units (`hypercopy-api`, `hypercopy-engine`, `hypercopy-ingestor`, `hypercopy-monitor`, `hypercopy-maxgain` — exact unit names per the deploy host). `deposit_monitor.py`'s docstring is the canonical reference for the `hypercopy-monitor` unit. **`hypercopy-ingestor` is currently stopped and disabled on prod** (`systemctl disable hypercopy-ingestor`) pending Apify integration. Re-enable with `systemctl enable --now hypercopy-ingestor` after the Apify path is live and `OPENAI_API_KEY` is healthy.
 - Project root on the deploy host is `/opt/hypercopy` (referenced in `scripts/seed_and_sync.py`).
 - Sentry is initialized at import time in `backend/main.py` with a hardcoded DSN — that's intentional. Gate with env if you need silence in a non-prod context, don't remove the call.
 - After model edits: write migration → `alembic upgrade head` on the host before restarting the API or trading-engine units.
@@ -245,6 +245,32 @@ sudo systemctl start hypercopy-api
 ```
 
 ## 10. Changelog
+
+- 2026-05-02 — session wrap
+
+  Code:
+  - Ingestor: RT/QT detection + whale-alert filter + --dry-run flag
+    (commit fb6e7c2)
+  - Ingestor: semantic-inversion few-shots — liquidation-news +
+    close-not-open (long & short) (commits 62be76c, f544c61)
+  - Audit script with [PASSING 13/13] receipt
+    (commits 9223d8d, 3371e5d)
+  - auth.py: graceful merge on twitter_username conflict via
+    IntegrityError catch (commit 8bc9fa8)
+  - Migration: uq_users_twitter_username partial unique index,
+    idempotent (commit 790d0f0)
+
+  Data / ops:
+  - 168 historical whale-alert signals → status='skipped' (manual)
+  - 5 dual-account user rows merged into 2 (Kevin, Amelia) (manual)
+  - hypercopy-ingestor systemd unit stopped + disabled
+
+  Known follow-ups (NOT done — for next session):
+  - Apify integration (replaces stopped ingestor's X API path)
+  - Airtable sync from Master Frequency List (~10k KOLs from Ethan)
+  - Frequency-score-based tier assignment (HOT/WARM/COLD)
+  - LLM signal quality remains imperfect — re-tune prompt + raise
+    confidence threshold when Apify ingestor goes live
 
 - 2026-05-02 — `auth.py` is now resilient to the new `uq_users_twitter_username` partial unique index. Two commit sites (Step 2 attach, Step 3 INSERT race) wrapped in `try/IntegrityError`; on collision, JWT issued for the oldest active canonical user, no data mutation. Helpers: `_is_twitter_username_conflict`, `_resolve_canonical_by_twitter`. Manual SQL prerequisite: index creation + dedup of MomentumKevin/Ameliachenssmy rows (5 → 2).
 - 2026-05-02 — Ingestor LLM guardrails: 4 negative + 1 positive few-shot examples for liquidation-news and close-not-open semantic inversions; one-line system-prompt clarifier; `scripts/audit_signal_labeler.py` for prompt-change validation. No threshold change, no regex change.
