@@ -410,6 +410,11 @@ LLM_FEW_SHOT_EXAMPLES = [
     # not a position to copy.
     {"tweet": "Full TP on our $ETH short. Want in? 👇",
      "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    # Close-not-open (e): "closed" past-tense framing of a long
+    # — completed exit, not a new entry. Symmetric to the ETH
+    # short-close example above.
+    {"tweet": "Closed my $BTC long at 72k, locking in profits 🙏",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
     # Close-not-open (d): scaling out / "out of" / past-tense framing of an
     # entry are all close announcements, not new positions.
     {"tweet": "Scaled out of my $SOL position — nice ride from $98 🙏",
