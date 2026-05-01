@@ -113,14 +113,21 @@ For deeper detail on order-result parsing, leverage updates, and HL meta refresh
 
 1. **Tier-based polling decision.** `_get_user_tier_interval` reads `avg_tweets_per_day` from `ingestor_state.sqlite`: HOT (>20 tw/d, every 3h), WARM (6–20, 8h), COLD (≤5, 24h). `force_first_cycle=True` polls everyone on startup.
 2. **Incremental fetch.** Use stored `since_id` to fetch only new tweets via the X API v2 (`X_BEARER_TOKEN`).
-3. **Cheap pre-filter.** `_is_noise_tweet`, ticker regex (`$XXX`, `#XXX`, all-caps), `_has_explicit_trade_language` — drop obvious noise without paying for LLM calls.
+3. **Cheap pre-filter.** Several gates run in order, all before any LLM call:
+   - **RT/QT detection** (`_detect_retweet_quote`): pure retweets are dropped at fetch time (never reach LLM, never hit label cache, never accrue cost). `referenced_tweets` is included in `tweet.fields` so the X v2 response carries the signal; falls back to `text.startswith("RT @")`. The `is_quote` flag is propagated to downstream steps.
+   - **QT commentary gate**: quote tweets whose author commentary — isolated by `_qt_commentary(text)` (strips trailing `t.co` preview link) — is shorter than `MIN_QT_COMMENTARY_CHARS` (env-tunable, default 15) are dropped as bare reposts. `skipped_qt_short` counter incremented.
+   - **Whale-alert filter**: `_is_noise_tweet` gains a 3-condition AND check: (a) `WHALE_FLOW_RE` matches a token-amount + flow verb (`transferred|moved|deposited|withdrawn|withdrew|sent`), AND (b) tweet text contains an exchange/custodian name from `EXCHANGE_NAMES` (`binance, coinbase, kraken, okx, bybit, cumberland, wintermute, robinhood, gemini, bitfinex, upbit, bitstamp, htx, kucoin`), AND (c) tweet contains 🚨 or 3+ emoji-ish characters (`_has_three_plus_emoji`). All three must fire. `skipped_whale_alert` counter incremented.
+   - Existing `NOISE_PATTERNS` + `_has_explicit_trade_language` heuristics remain.
+   - Per-cycle observability: `_filter_counters` is reset at the top of `_run_cycle_inner` and logged at the bottom as a single line: `Filters this cycle — skipped_retweet=N, skipped_qt_short=N, skipped_whale_alert=N`.
 4. **Label cache lookup.** Hash tweet text with `_stable_tweet_hash`; if hit in `label_cache.sqlite`, reuse the label.
-5. **LLM call** (`LLM_MODEL`, default `gpt-4o-mini`) returns `{is_signal, ticker, sentiment, direction, confidence}`. Few-shot examples bundled inline. Optional vision pass (`VISION_ENABLED`, `VISION_MODEL`) on attached images.
+5. **LLM call** (`LLM_MODEL`, default `gpt-4o-mini`) returns `{is_signal, ticker, sentiment, direction, confidence}`. Few-shot examples bundled inline. Optional vision pass (`VISION_ENABLED`, `VISION_MODEL`) on attached images. The system prompt explicitly instructs the model that factual observations about on-chain flows, exchange transfers, liquidations, listings, or news events are NOT signals unless the author adds clear directional commentary, and that a bare retweet or quote without the author's own opinion is never a signal. Three reinforcing few-shot examples: (i) factual whale-alert → `is_signal: false`, (ii) `RT @whale_alert: ...` → `is_signal: false`, (iii) QT with explicit directional commentary → `is_signal: true`.
 6. **Confidence gate** — store only when `is_signal=true` AND `confidence ≥ CONFIDENCE_THRESHOLD` (default 60) AND `sentiment != neutral` AND `ticker ∈ HL meta whitelist` (refreshed hourly from `/info type=meta` + `spotMeta`; falls back to `COMMON_CRYPTO_FALLBACK` if HL is unreachable).
 7. **Per-user atomic commit.** Each labeled signal is written immediately; one user's failure never loses another's data. Exponential backoff on transients; circuit breaker after `MAX_CONSECUTIVE_FAILURES` (default 10).
 8. **Graceful shutdown.** SIGTERM/SIGINT sets a flag; the current user finishes, then exit.
 
-Tightening `EXPLICIT_TRADE_PHRASES`, `CONFIDENCE_THRESHOLD`, or the noise filter directly trades signal volume against signal quality — change with intent.
+**`--dry-run` CLI flag.** Runs a single cycle (like `--once`), logs every labeling decision per tweet with the verdict and reason, but suppresses all `Signal` row writes and does not advance `last_polled_at` or `since_id` in `ingestor_state.sqlite`. Use before deploying filter-config changes to validate that the new thresholds behave as expected without touching prod data.
+
+Tightening `EXPLICIT_TRADE_PHRASES`, `CONFIDENCE_THRESHOLD`, `MIN_QT_COMMENTARY_CHARS`, or the noise filter directly trades signal volume against signal quality — change with intent.
 
 ## 7. Wallet management
 
@@ -237,6 +244,7 @@ sudo systemctl start hypercopy-api
 
 ## 10. Changelog
 
+- 2026-05-01 — Ingestor: drop pure retweets at fetch time; gate quote tweets on `MIN_QT_COMMENTARY_CHARS` (env-tunable, default 15); 3-condition AND whale-alert filter (token+flow + exchange name + 🚨/emoji); LLM prompt + 3 few-shots reinforcing factual-observation rule. `--dry-run` CLI flag suppresses DB writes and state advances.
 - 2026-05-01 — PROD HOTFIX: `users.wallet_address` widened VARCHAR(42) → VARCHAR(128) (migration `2225cbed80a6`). Dual-account merge marker shortened from `merged-into-<uuid>-<wallet>` (96B) to `deact_<uuid-hex>` (38B). Login was breaking with `StringDataRightTruncation` whenever the merge path fired.
 - 2026-05-01 — `/api/portfolio/pnl-history`: switched ROI denominator to cost basis (net deposits − withdrawals); clamped ALL-range to first user activity; added `cost_basis` field to response. Helpers: `_calc_cost_basis`, `_earliest_activity` in `backend/api/portfolio.py`.
 - 2026-05-01 — PnL switched to HL-authoritative (engine `_manage_user_positions` + `_close_trade`, manual/partial close in `trades.py`); dropped `trades.realized_pnl_usd`; added `scripts/backfill_pnl_from_hl.py`. Migration `acb0b86b0ff2`. Bug attribution corrected: the formula `pnl_pct/100 × size_usd × leverage` multiplied by leverage one extra time — `size_usd` was always margin, not notional; nothing drifted in the schema.
