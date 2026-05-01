@@ -67,6 +67,10 @@ HL_BASE_URL = _env("HL_BASE_URL", "https://api.hyperliquid.xyz")
 
 # ★ Signal quality gate
 CONFIDENCE_THRESHOLD = int(_env("CONFIDENCE_THRESHOLD", "60"))
+# ★ NEW (2026-05-01) — Minimum length of a quote tweet's own commentary
+# (after stripping the trailing t.co preview link). Below this, the QT is
+# treated as a bare repost and skipped before the LLM.
+MIN_QT_COMMENTARY_CHARS = int(_env("MIN_QT_COMMENTARY_CHARS", "15"))
 
 # ── regex / constants ──────────────────────────────────────────────────
 ALNUM_RE         = re.compile(r"[^A-Z0-9]")
@@ -286,6 +290,27 @@ ALERT_BOT_USERNAMES = {
     "smartestmoney", "OnChainWizard",
 }
 
+# ★ NEW (2026-05-01) — Exchanges/custodians named in whale-alert posts. Used by
+# _is_noise_tweet's three-condition AND filter to drop on-chain flow reports
+# that the LLM otherwise interprets as directional ("→ exchange = will sell").
+EXCHANGE_NAMES = {
+    "binance", "coinbase", "kraken", "okx", "bybit", "cumberland", "wintermute",
+    "robinhood", "gemini", "bitfinex", "upbit", "bitstamp", "htx", "kucoin",
+}
+
+# Token-amount + flow verb (transferred / moved / deposited / withdrawn / sent).
+# Allows leading $ or # on the symbol, optional commas/dots in the amount.
+WHALE_FLOW_RE = re.compile(
+    r"\b\d[\d,\.]*\s*(?:#|\$)?[A-Z]{2,6}\b.{0,100}\b"
+    r"(?:transferred|moved|deposited|withdrawn|withdrew|sent)\b",
+    re.I,
+)
+# Three or more emoji-ish (non-ASCII pictographic) characters in the tweet.
+# Approximation: count chars outside the BMP basic ASCII range. Cheap and
+# correlates well with whale-alert content peppered with sirens / arrows.
+def _has_three_plus_emoji(text: str) -> bool:
+    return sum(1 for ch in text if ord(ch) > 0x2300) >= 3
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ★ FEW-SHOT EXAMPLES
@@ -354,6 +379,17 @@ LLM_FEW_SHOT_EXAMPLES = [
      "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 15}},
     {"tweet": "Seems that $HYPE is preparing for a correction. Price action started to slow down and is locally breaking down.",
      "label": {"is_signal": True, "ticker": "HYPE", "sentiment": "bearish", "direction": "short", "confidence": 70}},
+    # ★ 2026-05-01 — anti-noise reinforcement examples
+    # i. Factual on-chain flow report (no author commentary) — never a signal,
+    #    even if the destination is an exchange.
+    {"tweet": "🚨 5,000 BTC transferred from unknown wallet to #Binance",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    # ii. Bare retweet (RT-prefix) of someone else's content — never a signal.
+    {"tweet": "RT @whale_alert: 799 BTC moved from Robinhood to Cumberland",
+     "label": {"is_signal": False, "ticker": "NOISE", "sentiment": "neutral", "direction": "long", "confidence": 0}},
+    # iii. Quote tweet WITH the author's own directional commentary — IS a signal.
+    {"tweet": "this is bearish, BTC dumps to 60k by Friday https://t.co/abc",
+     "label": {"is_signal": True, "ticker": "BTC", "sentiment": "bearish", "direction": "short", "confidence": 80}},
 ]
 
 
@@ -365,6 +401,20 @@ class ShutdownRequested(Exception):
     pass
 
 _shutdown = threading.Event()
+
+# ★ NEW (2026-05-01) — In-process counters for the new RT / QT / whale-alert
+# filters. Reset at the top of each cycle in `_run_cycle_inner`, logged at the
+# bottom. No persistence; observability only.
+_filter_counters: dict[str, int] = {
+    "skipped_retweet": 0,
+    "skipped_qt_short": 0,
+    "skipped_whale_alert": 0,
+}
+
+# ★ NEW (2026-05-01) — Dry-run gate. Set by `--dry-run` on the CLI; when
+# True, the cycle logs every labeling decision but does NOT write Signal rows
+# nor advance `last_polled_at` / `since_id` in ingestor_state.sqlite.
+_DRY_RUN: bool = False
 
 def _handle_signal(signum, frame):
     sig_name = signal.Signals(signum).name
@@ -455,6 +505,22 @@ def _is_noise_tweet(text: str, username: str = "") -> bool:
     for pattern in NOISE_PATTERNS:
         if pattern.search(text):
             return True
+
+    # ★ 2026-05-01 — Whale-alert / on-chain flow filter (3-condition AND):
+    # (a) token-amount adjacent to a flow verb,
+    # (b) names a known exchange/custodian,
+    # (c) carries 🚨 OR 3+ emoji-ish chars.
+    # Catches whale-alert content even when the KOL copy-pastes it as their
+    # own original tweet (so the per-username bot filter above doesn't fire).
+    if WHALE_FLOW_RE.search(text):
+        t_lower = text.lower()
+        if any(name in t_lower for name in EXCHANGE_NAMES):
+            if "🚨" in text or _has_three_plus_emoji(text):
+                _filter_counters["skipped_whale_alert"] += 1
+                if _DRY_RUN:
+                    log.info(f"    [dry-run] SKIP whale-alert pattern @{username}: {text[:80]!r}")
+                return True
+
     return False
 
 
@@ -880,6 +946,10 @@ def llm_batch_label(items):
             "Be STRICT. Most tweets that mention crypto are NOT trading signals. "
             "A signal requires the author to be TAKING or RECOMMENDING a specific directional position. "
             "Casual discussion, news, memes, questions, on-chain alerts, and vague bullishness are NOT signals. "
+            # ★ 2026-05-01 — anti-noise reinforcement
+            "Factual observations about on-chain flows, exchange transfers, liquidations, listings, "
+            "or news events are NOT signals unless the author adds clear directional trading commentary. "
+            "A retweet or quote without the author's own opinion is never a signal. "
             "Always return strict JSON. No markdown, no commentary."
         )},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
@@ -1057,6 +1127,57 @@ def _resolve_user_profile(username, state_con):
         return None
 
 
+def _detect_retweet_quote(tw: dict, text: str) -> tuple[bool, bool]:
+    """
+    Return (is_retweet, is_quote) for a raw tweet dict from any of the supported
+    sources. Defensive across the X v2 schema and the Apify field-name
+    variations we may wire later. Pure-text "RT @" prefix is the last-resort
+    detector — X v2 normally strips that, but third-party scrapers don't.
+    """
+    is_retweet = False
+    is_quote = False
+
+    # X API v2 — referenced_tweets is a list of {type, id} where type ∈
+    # {retweeted, quoted, replied_to}.
+    refs = tw.get("referenced_tweets") or []
+    for r in refs:
+        rtype = (r.get("type") or "").lower() if isinstance(r, dict) else ""
+        if rtype == "retweeted":
+            is_retweet = True
+        elif rtype == "quoted":
+            is_quote = True
+
+    # Apify-style fields (defensive — names vary between scrapers).
+    if not is_retweet and (
+        tw.get("isRetweet") is True
+        or tw.get("retweetedStatus")
+        or tw.get("retweetedTweet")
+    ):
+        is_retweet = True
+    if not is_quote and (
+        tw.get("isQuote") is True
+        or tw.get("quotedStatus")
+        or tw.get("quotedTweet")
+    ):
+        is_quote = True
+
+    # Final fallback: literal "RT @<handle>" prefix.
+    if not is_retweet and text.lstrip().startswith("RT @"):
+        is_retweet = True
+
+    return is_retweet, is_quote
+
+
+# Strips the trailing `https://t.co/...` preview link X auto-appends to a
+# quote tweet's text — what's left is the KOL's own added commentary.
+_QT_TRAILING_TCO_RE = re.compile(r"\s*https?://t\.co/\S+\s*$")
+
+
+def _qt_commentary(text: str) -> str:
+    """Best-effort isolation of the author's added text on a quote tweet."""
+    return _QT_TRAILING_TCO_RE.sub("", text).strip()
+
+
 def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
                        max_results_per_page=None, max_pages=3):
     """★ COST OPTIMIZATION: smaller pages (10 incremental / 20 backfill), max 3 pages."""
@@ -1064,9 +1185,12 @@ def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
         max_results_per_page = 10 if since_id else 20
     params = {
         "max_results": max_results_per_page,
-        "tweet.fields": "created_at,author_id,public_metrics,attachments",
+        # ★ 2026-05-01 — referenced_tweets lets us detect RT/QT at fetch time.
+        "tweet.fields": "created_at,author_id,public_metrics,attachments,referenced_tweets",
         "expansions": "attachments.media_keys",
         "media.fields": "url,preview_image_url,type",
+        # `exclude=retweets` already drops most pure RTs at the API layer; the
+        # detection below is defensive (third-party scrapers, edge cases).
         "exclude": "retweets,replies",
     }
     if since_id:
@@ -1094,6 +1218,19 @@ def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
             text = tw.get("text", "").strip()
             if not text:
                 continue
+
+            # ★ Drop pure retweets before they leave the fetcher. They never
+            # reach the LLM, never hit the label cache, never accrue cost.
+            is_retweet, is_quote = _detect_retweet_quote(tw, text)
+            if is_retweet:
+                _filter_counters["skipped_retweet"] += 1
+                if _DRY_RUN:
+                    log.info(
+                        f"    [dry-run] SKIP RT @{username} id={tw.get('id','')[:18]} "
+                        f"text={text[:60]!r}"
+                    )
+                continue
+
             created = tw.get("created_at", "")
             try:
                 dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
@@ -1110,6 +1247,7 @@ def _fetch_user_tweets(user_id, username, since_id=None, max_days=7,
                 "retweets": metrics.get("retweet_count", 0),
                 "replies": metrics.get("reply_count", 0),
                 "author_username": username,
+                "is_quote": is_quote,
             })
         next_token = meta.get("next_token")
         if not next_token:
@@ -1135,6 +1273,25 @@ def _label_tweets(tweets, cache_con, username="", batch_size=20):
     for i, tw in enumerate(tweets):
         text = tw["text"]
         author = tw.get("author_username", username)
+
+        # ★ Quote-tweet gate: drop QTs whose own commentary is too short to be
+        # a real trade call. The KOL's added text on a QT is the tweet's
+        # `text` minus the trailing t.co preview link.
+        if tw.get("is_quote"):
+            commentary = _qt_commentary(text)
+            if len(commentary) < MIN_QT_COMMENTARY_CHARS:
+                _filter_counters["skipped_qt_short"] += 1
+                if _DRY_RUN:
+                    log.info(
+                        f"    [dry-run] SKIP QT-bare @{author} "
+                        f"id={tw.get('tweet_id','')[:18]} "
+                        f"commentary={commentary!r} (<{MIN_QT_COMMENTARY_CHARS} chars)"
+                    )
+                results.append({**tw, "ticker": "NOISE", "sentiment": "neutral",
+                                "direction": "long", "confidence": 0, "is_signal": False})
+                noise_filtered += 1
+                continue
+
         if _is_noise_tweet(text, author):
             results.append({**tw, "ticker": "NOISE", "sentiment": "neutral",
                             "direction": "long", "confidence": 0, "is_signal": False})
@@ -1316,15 +1473,29 @@ def _process_user(username, state_con, cache_con, max_days=3):
     tweets = _fetch_user_tweets(uid, username, since_id=since_id, max_days=max_days)
 
     if not tweets:
-        _state_save(state_con, username, uid, tweets_found=0)
+        if not _DRY_RUN:
+            _state_save(state_con, username, uid, tweets_found=0)
         return {"username": username, "fetched": 0, "inserted": 0, "skipped": 0, "noise": 0}
 
     labeled, token_stats = _label_tweets(tweets, cache_con, username=username)
 
-    inserted, skipped, noise = _write_user_signals(username, labeled, profile=profile)
-
-    newest_id = max(tweets, key=lambda t: t["tweet_id"])["tweet_id"]
-    _state_save(state_con, username, uid, last_tweet_id=newest_id, tweets_found=len(tweets))
+    if _DRY_RUN:
+        # Log every labeling decision; no DB writes; no state advance.
+        for r in labeled:
+            verdict = (
+                f"SIGNAL {r['ticker']} {r['direction']} (conf={r.get('confidence',0)})"
+                if r.get("is_signal")
+                else f"NOISE (conf={r.get('confidence',0)})"
+            )
+            log.info(
+                f"    [dry-run] @{username} id={r.get('tweet_id','')[:18]:>18} "
+                f"qt={int(bool(r.get('is_quote')))} → {verdict} :: {r['text'][:80]!r}"
+            )
+        inserted, skipped, noise = 0, 0, sum(1 for r in labeled if not r.get("is_signal"))
+    else:
+        inserted, skipped, noise = _write_user_signals(username, labeled, profile=profile)
+        newest_id = max(tweets, key=lambda t: t["tweet_id"])["tweet_id"]
+        _state_save(state_con, username, uid, last_tweet_id=newest_id, tweets_found=len(tweets))
 
     return {
         "username": username,
@@ -1355,6 +1526,11 @@ def _run_cycle_inner(state_con, cache_con, users, max_days, force_all):
     hl_tokens = get_hl_tokens()
     log.info(f"📋 HL tradeable tokens: {len(hl_tokens)} loaded")
     log.info(f"🎯 Confidence threshold: {CONFIDENCE_THRESHOLD}")
+    if _DRY_RUN:
+        log.info("🧪 DRY-RUN — no signals will be written; last_polled_at will not advance")
+    # ★ Reset RT/QT/whale-alert filter counters per cycle.
+    for k in _filter_counters:
+        _filter_counters[k] = 0
 
     # ★ Log tier distribution at cycle start
     tier_counts = {"hot": 0, "warm": 0, "cold": 0}
@@ -1415,6 +1591,13 @@ def _run_cycle_inner(state_con, cache_con, users, max_days, force_all):
         if i < len(users) - 1:
             time.sleep(0.5)
 
+    # ★ Per-cycle filter telemetry.
+    log.info(
+        f"🧹 Filters this cycle — "
+        f"skipped_retweet={_filter_counters['skipped_retweet']}, "
+        f"skipped_qt_short={_filter_counters['skipped_qt_short']}, "
+        f"skipped_whale_alert={_filter_counters['skipped_whale_alert']}"
+    )
     return stats
 
 
@@ -1744,13 +1927,22 @@ if __name__ == "__main__":
                    help="Run a single cycle then exit (for testing)")
     p.add_argument("--force-all", action="store_true",
                    help="Force poll all users (implies --once)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Log every labeling decision but do not write Signal "
+                        "rows or advance last_polled_at / since_id. Implies "
+                        "single-cycle behavior; combine with --force-all to "
+                        "exercise every user regardless of poll cadence.")
     args = p.parse_args()
+
+    if args.dry_run:
+        _DRY_RUN = True
+        log.info("🧪 --dry-run enabled — no DB writes, no state advance")
 
     if args.force_all:
         users = _resolve_user_list()
         stats = run_cycle(users, max_days=args.max_days, force_all=True)
         log.info(f"Done: {stats}")
-    elif args.once:
+    elif args.once or args.dry_run:
         users = _resolve_user_list()
         stats = run_cycle(users, max_days=args.max_days, force_all=False)
         log.info(f"Done: {stats}")
