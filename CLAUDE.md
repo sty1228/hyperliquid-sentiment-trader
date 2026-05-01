@@ -38,7 +38,7 @@ HyperCopy is a copy-trading platform on top of HyperLiquid perp DEX. A Twitter/X
 All routers live in `backend/api/`. Prefix is `/api` unless noted.
 
 - `health.py` — `/health` DB + HL + master wallet liveness (no prefix).
-- `auth.py` — `/api/auth/*` wallet-connect → JWT issuance, dual-account merge by `twitter_username`. When the merge deactivates an orphan user owning the same wallet, that orphan's `wallet_address` is overwritten with `deact_<uuid-hex>` (38 bytes, preserves the UNIQUE constraint, no payload encoded — the merge target is recoverable from logs).
+- `auth.py` — `/api/auth/*` wallet-connect → JWT issuance, dual-account merge by `twitter_username`. When the merge deactivates an orphan user owning the same wallet, that orphan's `wallet_address` is overwritten with `deact_<uuid-hex>` (38 bytes, preserves the UNIQUE constraint, no payload encoded — the merge target is recoverable from logs). Resilient to the `uq_users_twitter_username` partial unique index (added by manual SQL on prod 2026-05-02): if a twitter_username collision raises `IntegrityError` at the Step 2 attach or the Step 3 INSERT, the handler rolls back, resolves the **oldest active** user with that twitter_username as canonical, and issues the JWT for that user (no data mutation; secondary wallet stays external; logs a `TWITTER_CONFLICT` WARN with both wallet addresses). Helpers: `_is_twitter_username_conflict`, `_resolve_canonical_by_twitter`.
 - `leaderboard.py` — KOL leaderboard reads from `trader_stats`.
 - `trader.py` — KOL profile, signals list, radar score, follow context.
 - `follow.py` — follow/unfollow + `is_copy_trading` / `is_counter_trading` (mutually exclusive).
@@ -56,7 +56,7 @@ All routers live in `backend/api/`. Prefix is `/api` unless noted.
 
 **Postgres (canonical store, `hypercopy` db).** Tables, with the columns/constraints worth knowing:
 
-- `users` — `id` (uuid str), `wallet_address` (VARCHAR(128), unique — wider than EOA hex to accommodate `deact_<uuid>` deactivation markers from dual-account merges), `twitter_username` (indexed, used for dual-account merge), `referral_code_used`, `free_copy_trades_used`.
+- `users` — `id` (uuid str), `wallet_address` (VARCHAR(128), unique — wider than EOA hex to accommodate `deact_<uuid>` deactivation markers from dual-account merges), `twitter_username` (indexed; partial UNIQUE index `uq_users_twitter_username` WHERE `twitter_username IS NOT NULL` enforces one active row per username — added by manual SQL 2026-05-02 alongside a one-time cleanup of 3 dual-account duplicates), `referral_code_used`, `free_copy_trades_used`.
 - `traders` — KOLs. `username` unique. `avatar_url`, `is_verified`, follower counts.
 - `trader_stats` — pre-computed leaderboard rows. Unique `(trader_id, window)` where `window ∈ {24h, 7d, 30d}`. Recomputed every 10 min.
 - `signals` — one row per labeled tweet. `(trader_id, ticker, direction, sentiment)` core; `entry_price` / `current_price` / `pct_change` updated every tick; `max_gain_pct` + `max_gain_at` monotonic peak-favorable-excursion. `tweet_id` unique. `tweet_image_url` (Text, nullable) — attached image URL passed to the vision pass. `status ∈ {active, processed, expired, skipped}`. **Always order by `coalesce(tweet_time, created_at)`** — tweet_time is preferred but nullable.
@@ -246,6 +246,7 @@ sudo systemctl start hypercopy-api
 
 ## 10. Changelog
 
+- 2026-05-02 — `auth.py` is now resilient to the new `uq_users_twitter_username` partial unique index. Two commit sites (Step 2 attach, Step 3 INSERT race) wrapped in `try/IntegrityError`; on collision, JWT issued for the oldest active canonical user, no data mutation. Helpers: `_is_twitter_username_conflict`, `_resolve_canonical_by_twitter`. Manual SQL prerequisite: index creation + dedup of MomentumKevin/Ameliachenssmy rows (5 → 2).
 - 2026-05-02 — Ingestor LLM guardrails: 4 negative + 1 positive few-shot examples for liquidation-news and close-not-open semantic inversions; one-line system-prompt clarifier; `scripts/audit_signal_labeler.py` for prompt-change validation. No threshold change, no regex change.
 - 2026-05-01 — Ingestor: drop pure retweets at fetch time; gate quote tweets on `MIN_QT_COMMENTARY_CHARS` (env-tunable, default 15); 3-condition AND whale-alert filter (token+flow + exchange name + 🚨/emoji); LLM prompt + 3 few-shots reinforcing factual-observation rule. `--dry-run` CLI flag suppresses DB writes and state advances.
 - 2026-05-01 — PROD HOTFIX: `users.wallet_address` widened VARCHAR(42) → VARCHAR(128) (migration `2225cbed80a6`). Dual-account merge marker shortened from `merged-into-<uuid>-<wallet>` (96B) to `deact_<uuid-hex>` (38B). Login was breaking with `StringDataRightTruncation` whenever the merge path fired.
