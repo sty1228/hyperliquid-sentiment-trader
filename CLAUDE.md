@@ -44,7 +44,7 @@ All routers live in `backend/api/`. Prefix is `/api` unless noted.
 - `follow.py` — follow/unfollow + `is_copy_trading` / `is_counter_trading` (mutually exclusive).
 - `settings.py` — copy-trade defaults and per-trader overrides (size, leverage, TP/SL, max positions).
 - `portfolio.py` — balance, open positions, PnL curve, per-KOL realised PnL. `pnl-history` percentage uses cost basis (net deposits − withdrawals from `balance_events`) as the ROI denominator, not current balance — current-balance denominators shrink artificially as PnL grows. ALL-range queries clamp the chart start to the user's first `BalanceEvent` or `Trade` rather than 2020-01-01. Response includes `cost_basis: float`; returns 0 when the user has no deposit history (frontend treats 0 as "—").
-- `trades.py` — trade history + manual close.
+- `trades.py` — trade history + manual close. `GET /api/trades` eager-loads `Trade.signal` (LEFT JOIN, no N+1) and embeds a nested `signal` object on each `TradeResponse` row: `{tweet_id, tweet_text, tweet_image_url, tweet_time, likes, retweets, replies, sentiment, max_gain_pct}`. `signal` is `null` for `source='manual'` trades (which have `signal_id IS NULL`). Helper: `_signal_summary` in `backend/api/trades.py`.
 - `alerts.py` — in-app notifications (trades / social / system).
 - `wallet.py` — dedicated-wallet address, on-chain balance, withdraw initiation (multi-chain via Stargate V2).
 - `deposit.py` — **deprecated** (returns 410); legacy ledger endpoints replaced by wallet flow.
@@ -245,6 +245,8 @@ sudo systemctl start hypercopy-api
 ```
 
 ## 10. Changelog
+
+- 2026-05-02 — `GET /api/trades` now embeds a nested `signal` object per trade (`tweet_id, tweet_text, tweet_image_url, tweet_time, likes, retweets, replies, sentiment, max_gain_pct`) so the FE can render "this trade came from THIS tweet" in the expanded card. `null` for manual trades. Eager-loaded via `joinedload(Trade.signal)` — single LEFT JOIN, no N+1. Helper: `_signal_summary`. New Pydantic model: `SignalSummary`.
 
 - 2026-05-02 — session wrap
 

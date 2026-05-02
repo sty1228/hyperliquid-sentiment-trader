@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import desc
 import requests as http_requests
 import math
@@ -16,6 +16,7 @@ from backend.deps import get_db, get_current_user
 from backend.models.user import User
 from backend.models.trade import Trade
 from backend.models.trader import Trader
+from backend.models.signal import Signal
 from backend.models.wallet import UserWallet
 from backend.services.wallet_manager import decrypt_key, execute_copy_trade
 from backend.services.events import publish as _publish_event
@@ -107,6 +108,18 @@ def _get_sz_decimals(ticker: str) -> int | None:
 # ── Response 模型 ────────────────────────────────────────
 
 
+class SignalSummary(BaseModel):
+    tweet_id: str | None = None
+    tweet_text: str | None = None
+    tweet_image_url: str | None = None
+    tweet_time: datetime | None = None
+    likes: int = 0
+    retweets: int = 0
+    replies: int = 0
+    sentiment: str
+    max_gain_pct: float | None = None
+
+
 class TradeResponse(BaseModel):
     id: str
     ticker: str
@@ -123,6 +136,23 @@ class TradeResponse(BaseModel):
     trader_username: str | None = None
     opened_at: datetime
     closed_at: datetime | None = None
+    signal: SignalSummary | None = None
+
+
+def _signal_summary(sig: Signal | None) -> SignalSummary | None:
+    if sig is None:
+        return None
+    return SignalSummary(
+        tweet_id=sig.tweet_id,
+        tweet_text=sig.tweet_text,
+        tweet_image_url=sig.tweet_image_url,
+        tweet_time=sig.tweet_time,
+        likes=sig.likes or 0,
+        retweets=sig.retweets or 0,
+        replies=sig.replies or 0,
+        sentiment=sig.sentiment,
+        max_gain_pct=sig.max_gain_pct,
+    )
 
 
 class TradesSummary(BaseModel):
@@ -189,6 +219,7 @@ def get_trades(
 
     trades = (
         query
+        .options(joinedload(Trade.signal))
         .order_by(desc(Trade.opened_at))
         .offset(offset)
         .limit(limit)
@@ -234,6 +265,7 @@ def get_trades(
                 trader_username=t.trader_username,
                 opened_at=t.opened_at,
                 closed_at=t.closed_at,
+                signal=_signal_summary(t.signal),
             )
             for t in trades
         ],
