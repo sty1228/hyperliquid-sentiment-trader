@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 1. Overview
 
-HyperCopy is a copy-trading platform on top of HyperLiquid perp DEX. A Twitter/X ingestor turns KOL tweets into LLM-labeled trading signals, and a trading engine fans those signals out as real perp orders on Hyperliquid for every follower's custodial wallet. A FastAPI app serves auth, leaderboard, follow toggles, copy settings, portfolio, deposit/withdraw, and rewards to web/mobile clients.
+HyperCopy is a copy-trading platform on top of HyperLiquid perp DEX. An ingestor pulls tweets from KOL handles via the Apify `apidojo/tweet-scraper` actor (legacy X API v2 path still selectable via `INGESTOR_SOURCE=x_api` for one deploy cycle), turns them into LLM-labeled trading signals, and a trading engine fans those signals out as real perp orders on Hyperliquid for every follower's custodial wallet. A FastAPI app serves auth, leaderboard, follow toggles, copy settings, portfolio, deposit/withdraw, and rewards to web/mobile clients.
 
 ## 2. Architecture
 
@@ -16,11 +16,11 @@ HyperCopy is a copy-trading platform on top of HyperLiquid perp DEX. A Twitter/X
 | --- | --- | --- |
 | API | `backend.main:app` (via `run.py` / uvicorn) | HTTP API |
 | Trading engine | `backend.services.trading_engine` | signals → trades, TP/SL, equity guard, balance/stats sync — 15s loop |
-| Ingestor | `backend.ingestor.main` (or `backend.services.ingestor_loop`) | X scrape → LLM label → `signals` rows |
+| Ingestor | `backend.ingestor.main` (or `backend.services.ingestor_loop`) | Apify scrape (or X v2, legacy) → LLM label → `signals` rows |
 | Deposit monitor | `backend.services.deposit_monitor` | watches user wallets for USDC, bridges to HL, processes withdrawals — 15s loop |
 | Max-gain updater | `backend.services.max_gain_updater` | recomputes `signals.max_gain_pct` from HL klines — 5 min loop or `--once` |
 
-**Data flow:** X API → ingestor (LLM + HL token whitelist + confidence gate) → `signals` (Postgres) → trading engine reads `signals` + `follows` → submits orders via `wallet_manager.execute_copy_trade` → `trades` rows + HL fills → engine reconciles position state from HL `clearinghouseState` each tick.
+**Data flow:** Apify `apidojo/tweet-scraper` (or X API v2 when `INGESTOR_SOURCE=x_api`) → ingestor (LLM + HL token whitelist + confidence gate) → `signals` (Postgres) → trading engine reads `signals` + `follows` → submits orders via `wallet_manager.execute_copy_trade` → `trades` rows + HL fills → engine reconciles position state from HL `clearinghouseState` each tick.
 
 **Two execution paths exist; only one is live.** `backend/services/` is production (Postgres + SQLAlchemy + HL SDK). `execution/` is an older SQLite path (`data/execution.sqlite`) kept for reference and listed in `.claudeignore` — do not extend it.
 
@@ -73,7 +73,7 @@ All routers live in `backend/api/`. Prefix is `/api` unless noted.
 
 **SQLite ingestor state (`data/`, not in git):**
 
-- `ingestor_state.sqlite` — per-user `since_id` for incremental X polling, `last_polled_at`, `avg_tweets_per_day`, `empty_polls`, `consecutive_errors`. Drives the 3-tier polling cadence.
+- `ingestor_state.sqlite` — `user_state` table: per-user `since_id` for legacy X polling, `last_polled_at`, `avg_tweets_per_day`, `empty_polls`, `consecutive_errors`. Drives the 3-tier polling cadence. Also `apify_budget` table: per-UTC-date `tweets_used` counter for the Apify daily-cost guard (cost USD computed in-process at read time as `tweets_used * 0.0004`).
 - `label_cache.sqlite` — content-addressed cache of LLM labels keyed by `_stable_tweet_hash(text)`. Prevents paying OpenAI twice for the same tweet.
 - `execution.sqlite` — used by the dormant `execution/` path only.
 
@@ -109,10 +109,12 @@ For deeper detail on order-result parsing, leverage updates, and HL meta refresh
 
 ## 6. Ingestor
 
-`backend/ingestor/main.py::run_daemon` — long-running. Per-cycle, per-user pipeline:
+`backend/ingestor/main.py::run_daemon` — long-running. Per-cycle pipeline (shape depends on `INGESTOR_SOURCE`):
 
 1. **Tier-based polling decision.** `_get_user_tier_interval` reads `avg_tweets_per_day` from `ingestor_state.sqlite`: HOT (>20 tw/d, every 3h), WARM (6–20, 8h), COLD (≤5, 24h). `force_first_cycle=True` polls everyone on startup.
-2. **Incremental fetch.** Use stored `since_id` to fetch only new tweets via the X API v2 (`X_BEARER_TOKEN`).
+2. **Incremental fetch.**
+   - `INGESTOR_SOURCE=apify` (current): one batched POST per tier to Apify `apidojo/tweet-scraper` (`backend/ingestor/apify_source.py::fetch_tweets_for_handles`). `since` = `min(last_polled_at)` across the tier's due handles minus a `APIFY_SINCE_BUFFER_S=1s` safety buffer; cold-start uses `APIFY_COLDSTART_LOOKBACK_H` (default 6h). `maxItems` per tier: `APIFY_HOT_BATCH_MAX` / `APIFY_WARM_BATCH_MAX` / `APIFY_COLD_BATCH_MAX` (5000 / 3000 / 2000 default; @ $0.0004/tweet → ≤$2.00 / $1.20 / $0.80 per cycle worst case). Auth via `Authorization: Bearer $APIFY_TOKEN` header — never URL `?token=`. One retry on 5xx/ConnectionError with exponential backoff + jitter (`_apify_post_with_retry`). Items grouped by lowercased `author_username` (parsed from item `url`), then handed to the per-user pipeline. Pure retweets dropped at the fetcher; `is_quote` propagated. **Daily cost guard:** `apify_budget` table tracks `tweets_used` per UTC date; WARN at 80%, skip cycle at 100% until next UTC day. Cost in USD is computed in-process at read time as `tweets_used * 0.0004`.
+   - `INGESTOR_SOURCE=x_api` (legacy, default for one deploy cycle): per-user X v2 `/users/{id}/tweets` with `since_id` pagination via `_fetch_user_tweets`.
 3. **Cheap pre-filter.** Several gates run in order, all before any LLM call:
    - **RT/QT detection** (`_detect_retweet_quote`): pure retweets are dropped at fetch time (never reach LLM, never hit label cache, never accrue cost). `referenced_tweets` is included in `tweet.fields` so the X v2 response carries the signal; falls back to `text.startswith("RT @")`. The `is_quote` flag is propagated to downstream steps.
    - **QT commentary gate**: quote tweets whose author commentary — isolated by `_qt_commentary(text)` (strips trailing `t.co` preview link) — is shorter than `MIN_QT_COMMENTARY_CHARS` (env-tunable, default 15) are dropped as bare reposts. `skipped_qt_short` counter incremented.
@@ -128,6 +130,10 @@ For deeper detail on order-result parsing, leverage updates, and HL meta refresh
 **`--dry-run` CLI flag.** Runs a single cycle (like `--once`), logs every labeling decision per tweet with the verdict and reason, but suppresses all `Signal` row writes and does not advance `last_polled_at` or `since_id` in `ingestor_state.sqlite`. Use before deploying filter-config changes to validate that the new thresholds behave as expected without touching prod data.
 
 **Prompt-change validation.** `scripts/audit_signal_labeler.py` runs the real `llm_batch_label` against a fixture of 13 cases covering both the liquidation-news and close-not-open failure modes, anti-regression positives, and unambiguous noise. Output is a confusion matrix. Use to validate any prompt or few-shot change before re-enabling the ingestor systemd unit.
+
+**Apify probes.** `scripts/probe_apify_media.py` confirms whether the actor exposes media URLs (drives whether `VISION_ENABLED` is meaningful under `INGESTOR_SOURCE=apify`). `scripts/probe_apify_image_rate.py` reports a coarse upper/lower bound on the raw image-bearing rate of fetched items. Run both with `APIFY_TOKEN` set; cost is < $0.05 per probe.
+
+**Seed handle list (temporary).** Under `INGESTOR_SOURCE=apify`, `_resolve_user_list()` returns `APIFY_SEED_HANDLES` from `backend/ingestor/seed_handles.py` (curated alpha-leaning subset of `DEFAULT_USERS`, ~100 handles, lowercased at import). `SCRAPE_USERS` env var overrides if set. Replaced in a follow-up PR by a `SELECT username FROM traders WHERE frequency_score >= X` query once Ethan's Master Frequency List Airtable sync lands.
 
 Tightening `EXPLICIT_TRADE_PHRASES`, `CONFIDENCE_THRESHOLD`, `MIN_QT_COMMENTARY_CHARS`, or the noise filter directly trades signal volume against signal quality — change with intent.
 
@@ -177,12 +183,14 @@ There is no test runner wired up (`tests/` is empty) and no linter config.
 - DB / auth: `DATABASE_URL`, `JWT_SECRET`, `JWT_ALGO`, `JWT_EXPIRE_HOURS`, `CORS_ORIGINS`.
 - Hyperliquid: `HL_MAINNET`, `HL_BASE_URL`, `HL_ACCOUNT_ADDRESS`, `HL_API_SECRET_KEY`, `HL_BUILDER_ADDRESS`, `HL_DEFAULT_LEVERAGE`, `HL_DEFAULT_BUILDER_BPS`.
 - Wallet system: `WALLET_ENCRYPTION_KEY`, `GAS_STATION_KEY`, `GAS_STATION_ADDRESS`.
-- Ingestor: `X_BEARER_TOKEN`, `OPENAI_API_KEY`, `LLM_MODEL`, `VISION_MODEL`, `VISION_ENABLED`, `CONFIDENCE_THRESHOLD`, `CYCLE_INTERVAL_S`, `MAX_CONSECUTIVE_FAILURES`, `SCRAPE_USERS`.
+- Ingestor: `INGESTOR_SOURCE` (`apify` | `x_api`, default `x_api` for one deploy cycle), `OPENAI_API_KEY`, `LLM_MODEL`, `VISION_MODEL`, `VISION_ENABLED`, `CONFIDENCE_THRESHOLD`, `CYCLE_INTERVAL_S`, `MAX_CONSECUTIVE_FAILURES`, `SCRAPE_USERS`.
+- Apify path (required when `INGESTOR_SOURCE=apify`): `APIFY_TOKEN`, `APIFY_TIMEOUT_S` (default 300), `APIFY_COLDSTART_LOOKBACK_H` (default 6), `APIFY_HOT_BATCH_MAX` / `APIFY_WARM_BATCH_MAX` / `APIFY_COLD_BATCH_MAX` (5000 / 3000 / 2000), `APIFY_DAILY_BUDGET_TWEETS` (default 50000).
+- Legacy X path (required when `INGESTOR_SOURCE=x_api`): `X_BEARER_TOKEN`. **Deprecated — pending removal in PR2.**
 - Paths: `DATA_DIR`, `LOG_DIR`.
 
 ### Deploy workflow
 
-- Production runs the API + four workers as separate systemd units (`hypercopy-api`, `hypercopy-engine`, `hypercopy-ingestor`, `hypercopy-monitor`, `hypercopy-maxgain` — exact unit names per the deploy host). `deposit_monitor.py`'s docstring is the canonical reference for the `hypercopy-monitor` unit. **`hypercopy-ingestor` is currently stopped and disabled on prod** (`systemctl disable hypercopy-ingestor`) pending Apify integration. Re-enable with `systemctl enable --now hypercopy-ingestor` after the Apify path is live and `OPENAI_API_KEY` is healthy.
+- Production runs the API + four workers as separate systemd units (`hypercopy-api`, `hypercopy-engine`, `hypercopy-ingestor`, `hypercopy-monitor`, `hypercopy-maxgain` — exact unit names per the deploy host). `deposit_monitor.py`'s docstring is the canonical reference for the `hypercopy-monitor` unit. **`hypercopy-ingestor` is currently stopped and disabled on prod** (`systemctl disable hypercopy-ingestor`) pending Apify cutover. Re-enable order: (1) set `APIFY_TOKEN` and `INGESTOR_SOURCE=apify` in `/opt/hypercopy/.env`; (2) run a single dry cycle: `cd /opt/hypercopy && python -m backend.ingestor.main --once --dry-run --force-all`; (3) inspect logs for the `📡 Source: apify` banner and a sane `Apify batch:` line; (4) `systemctl enable --now hypercopy-ingestor`. PR2 (which deletes the legacy x_api path) requires ≥7 calendar days uninterrupted Apify-source production, zero rollbacks to `x_api`, a passing 13/13 `audit_signal_labeler.py` run extended with ≥5 Apify-sourced fixtures, and no observed daily-budget pause events.
 - Project root on the deploy host is `/opt/hypercopy` (referenced in `scripts/seed_and_sync.py`).
 - Sentry is initialized at import time in `backend/main.py` with a hardcoded DSN — that's intentional. Gate with env if you need silence in a non-prod context, don't remove the call.
 - After model edits: write migration → `alembic upgrade head` on the host before restarting the API or trading-engine units.
@@ -228,6 +236,9 @@ journalctl -u hypercopy-api --since today
 sqlite3 data/ingestor_state.sqlite "SELECT username, last_polled_at, since_id, avg_tweets_per_day, empty_polls FROM user_state ORDER BY last_polled_at DESC LIMIT 20;"
 sqlite3 data/label_cache.sqlite    "SELECT count(*) FROM label_cache;"
 
+# Apify daily-cost guard (under INGESTOR_SOURCE=apify)
+sqlite3 data/ingestor_state.sqlite "SELECT utc_date, tweets_used, printf('\$%.2f', tweets_used * 0.0004) AS cost FROM apify_budget ORDER BY utc_date DESC LIMIT 7;"
+
 # HL spot-checks
 curl -s -X POST https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' -d '{"type":"meta"}' | jq '.universe[].name' | head
 curl -s -X POST https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' -d '{"type":"clearinghouseState","user":"0x..."}' | jq
@@ -245,6 +256,8 @@ sudo systemctl start hypercopy-api
 ```
 
 ## 10. Changelog
+
+- 2026-05-03 — Ingestor source is selectable via `INGESTOR_SOURCE` (`x_api` default for one deploy cycle, then flipped to `apify`). Apify path: `backend/ingestor/apify_source.py` (Apify `apidojo/tweet-scraper`, bearer-header auth, one batched POST per HOT/WARM/COLD tier with `min(last_polled_at) - 1s` as `onlyTweetsNewer`, cold-start = `now - APIFY_COLDSTART_LOOKBACK_H`). Items grouped by lowercased `author_username` (regex on `url` field), then handed to a new shared `_process_user_with_tweets` helper that the legacy X path also delegates to. Pure retweets dropped at fetch; `is_quote` propagated. Daily-cost guard via new `apify_budget` table in `ingestor_state.sqlite` (WARN at 80%, skip cycle at 100%). Seed list temporarily in `backend/ingestor/seed_handles.py` (~100 alpha-leaning handles, lowercased at import) — replaced by Airtable-driven query in a follow-up. New env vars: `INGESTOR_SOURCE`, `APIFY_TOKEN`, `APIFY_TIMEOUT_S`, `APIFY_COLDSTART_LOOKBACK_H`, `APIFY_HOT_BATCH_MAX` / `WARM` / `COLD`, `APIFY_DAILY_BUDGET_TWEETS`. Probe scripts: `scripts/probe_apify_media.py`, `scripts/probe_apify_image_rate.py`. `X_BEARER_TOKEN` deprecated; PR2 deletes the legacy path after ≥7 days of stable Apify-source production.
 
 - 2026-05-02 — `GET /api/trades` now embeds a nested `signal` object per trade (`tweet_id, tweet_text, tweet_image_url, tweet_time, likes, retweets, replies, sentiment, max_gain_pct`) so the FE can render "this trade came from THIS tweet" in the expanded card. `null` for manual trades. Eager-loaded via `joinedload(Trade.signal)` — single LEFT JOIN, no N+1. Helper: `_signal_summary`. New Pydantic model: `SignalSummary`.
 

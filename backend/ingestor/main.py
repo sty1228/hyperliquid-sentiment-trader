@@ -51,8 +51,18 @@ OPENAI_API_KEY = _env("OPENAI_API_KEY")
 X_BEARER_TOKEN = _env("X_BEARER_TOKEN")
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
-if not X_BEARER_TOKEN:
-    raise RuntimeError("Missing X_BEARER_TOKEN")
+
+# ★ 2026-05-03 — Source toggle. "x_api" (default, legacy) hits Twitter v2;
+# "apify" hits apidojo/tweet-scraper. Both paths coexist for one deploy
+# cycle so we can flip without redeploying. PR2 deletes the x_api path
+# after ≥7 days of stable Apify production.
+INGESTOR_SOURCE = _env("INGESTOR_SOURCE", "x_api").lower()
+if INGESTOR_SOURCE not in ("x_api", "apify"):
+    raise RuntimeError(f"Invalid INGESTOR_SOURCE={INGESTOR_SOURCE!r} (expected 'x_api' or 'apify')")
+if INGESTOR_SOURCE == "x_api" and not X_BEARER_TOKEN:
+    raise RuntimeError("Missing X_BEARER_TOKEN (required when INGESTOR_SOURCE=x_api)")
+if INGESTOR_SOURCE == "apify" and not _env("APIFY_TOKEN"):
+    raise RuntimeError("Missing APIFY_TOKEN (required when INGESTOR_SOURCE=apify)")
 openai.api_key = OPENAI_API_KEY
 
 SCRAPE_USERS_ENV = _env("SCRAPE_USERS", "")
@@ -591,6 +601,10 @@ def _state_db_connect() -> sqlite3.Connection:
             con.execute(f"ALTER TABLE user_state ADD COLUMN {col} {defn}")
         except Exception:
             pass
+    # ★ 2026-05-03 — Apify daily-cost guard. Always created; only written
+    # when INGESTOR_SOURCE=apify. cost_usd is computed in-process at read time.
+    from backend.ingestor.apify_source import init_budget_table
+    init_budget_table(con)
     con.commit()
     return con
 
@@ -1493,6 +1507,8 @@ def _write_user_signals(username, labeled_tweets, profile=None):
 # ═══════════════════════════════════════════════════════════════════════
 
 def _process_user(username, state_con, cache_con, max_days=3):
+    """X v2 path. Resolves uid + since_id, fetches via X API, then delegates
+    label/write/state-advance to _process_user_with_tweets."""
     cached_uid = _state_get_user_id(state_con, username)
     needs_profile = _state_needs_profile_refresh(state_con, username)
 
@@ -1509,16 +1525,26 @@ def _process_user(username, state_con, cache_con, max_days=3):
 
     since_id = _state_get_since_id(state_con, username)
     tweets = _fetch_user_tweets(uid, username, since_id=since_id, max_days=max_days)
+    return _process_user_with_tweets(
+        username, tweets, state_con, cache_con, uid=uid, profile=profile,
+    )
 
+
+def _process_user_with_tweets(
+    username, tweets, state_con, cache_con, uid="", profile=None,
+):
+    """Source-agnostic: label → write → advance state. `tweets` is a list of
+    pipeline dicts (X path: from _fetch_user_tweets; Apify path:
+    ApifyTweet.to_pipeline_dict()). `uid` is optional and only stored on
+    state rows when present (Apify path passes "")."""
     if not tweets:
         if not _DRY_RUN:
-            _state_save(state_con, username, uid, tweets_found=0)
+            _state_save(state_con, username, uid or "", tweets_found=0)
         return {"username": username, "fetched": 0, "inserted": 0, "skipped": 0, "noise": 0}
 
     labeled, token_stats = _label_tweets(tweets, cache_con, username=username)
 
     if _DRY_RUN:
-        # Log every labeling decision; no DB writes; no state advance.
         for r in labeled:
             verdict = (
                 f"SIGNAL {r['ticker']} {r['direction']} (conf={r.get('confidence',0)})"
@@ -1533,7 +1559,7 @@ def _process_user(username, state_con, cache_con, max_days=3):
     else:
         inserted, skipped, noise = _write_user_signals(username, labeled, profile=profile)
         newest_id = max(tweets, key=lambda t: t["tweet_id"])["tweet_id"]
-        _state_save(state_con, username, uid, last_tweet_id=newest_id, tweets_found=len(tweets))
+        _state_save(state_con, username, uid or "", last_tweet_id=newest_id, tweets_found=len(tweets))
 
     return {
         "username": username,
@@ -1564,11 +1590,15 @@ def _run_cycle_inner(state_con, cache_con, users, max_days, force_all):
     hl_tokens = get_hl_tokens()
     log.info(f"📋 HL tradeable tokens: {len(hl_tokens)} loaded")
     log.info(f"🎯 Confidence threshold: {CONFIDENCE_THRESHOLD}")
+    log.info(f"📡 Source: {INGESTOR_SOURCE}")
     if _DRY_RUN:
         log.info("🧪 DRY-RUN — no signals will be written; last_polled_at will not advance")
     # ★ Reset RT/QT/whale-alert filter counters per cycle.
     for k in _filter_counters:
         _filter_counters[k] = 0
+
+    if INGESTOR_SOURCE == "apify":
+        return _run_cycle_apify(state_con, cache_con, users, force_all)
 
     # ★ Log tier distribution at cycle start
     tier_counts = {"hot": 0, "warm": 0, "cold": 0}
@@ -1640,18 +1670,199 @@ def _run_cycle_inner(state_con, cache_con, users, max_days, force_all):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  ★ APIFY CYCLE — one batched POST per tier, group by author, then
+#  per-user atomic commit using the shared _process_user_with_tweets path.
+# ═══════════════════════════════════════════════════════════════════════
+
+def _tier_for_username(state_con, username) -> str:
+    """Returns 'hot' / 'warm' / 'cold' for batching purposes. Mirrors the
+    label used by _get_user_tier_label but reads state in one call."""
+    row = state_con.execute(
+        "SELECT avg_tweets_per_day, empty_polls FROM user_state WHERE username=?",
+        (username,),
+    ).fetchone()
+    if not row:
+        return "cold"
+    avg_td = row[0] or 0.0
+    empty = row[1] or 0
+    return _get_user_tier_label(avg_td, empty)
+
+
+def _tier_since(state_con, handles) -> "Optional[datetime]":
+    """min(last_polled_at) across the handles, or None for cold-start."""
+    if not handles:
+        return None
+    placeholders = ",".join("?" * len(handles))
+    row = state_con.execute(
+        f"SELECT MIN(last_polled_at) FROM user_state WHERE username IN ({placeholders})",
+        tuple(handles),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        return datetime.fromisoformat(row[0])
+    except Exception:
+        return None
+
+
+def _run_cycle_apify(state_con, cache_con, users, force_all):
+    """One Apify call per tier, dedup by tweet_id (Signal UNIQUE), group by
+    author, then run the existing per-user pipeline. last_polled_at advances
+    per-user only after that user's _write_user_signals succeeds."""
+    from collections import defaultdict
+    from backend.ingestor import apify_source as apify
+
+    # Pre-flight: daily budget.
+    allowed, used_today, pct = apify.budget_check(state_con)
+    if not allowed:
+        cost = used_today * apify.APIFY_PER_TWEET_USD
+        log.error(
+            f"💰 Apify daily budget hit "
+            f"({used_today}/{apify.APIFY_DAILY_BUDGET_TWEETS} tweets, "
+            f"~${cost:.2f}) — skipping cycle until next UTC day"
+        )
+        return {"processed": 0, "skipped_not_due": 0, "skipped_circuit": 0,
+                "failed": 0, "total_inserted": 0, "total_fetched": 0,
+                "budget_paused": True}
+
+    # Filter to due (or force_all) handles, bucket by tier.
+    by_tier: dict[str, list[str]] = defaultdict(list)
+    skipped_not_due = 0
+    skipped_circuit = 0
+    for u in users:
+        if not force_all:
+            should, reason = _state_should_poll(state_con, u)
+            if not should:
+                if "circuit" in reason:
+                    skipped_circuit += 1
+                else:
+                    skipped_not_due += 1
+                continue
+        by_tier[_tier_for_username(state_con, u)].append(u)
+
+    log.info(
+        f"👥 Apify cycle — due hot={len(by_tier.get('hot',[]))}, "
+        f"warm={len(by_tier.get('warm',[]))}, cold={len(by_tier.get('cold',[]))}, "
+        f"skipped_not_due={skipped_not_due}, skipped_circuit={skipped_circuit}, "
+        f"budget_used={used_today} ({pct:.0f}%)"
+    )
+
+    tier_caps = {
+        "hot":  apify.HOT_BATCH_MAX_TWEETS,
+        "warm": apify.WARM_BATCH_MAX_TWEETS,
+        # "cold(quiet)" gets the same cap as "cold".
+        "cold": apify.COLD_BATCH_MAX_TWEETS,
+    }
+
+    stats = {
+        "processed": 0, "skipped_not_due": skipped_not_due,
+        "skipped_circuit": skipped_circuit,
+        "failed": 0, "total_inserted": 0, "total_fetched": 0,
+    }
+
+    for tier_label, handles in by_tier.items():
+        if not handles:
+            continue
+        _check_shutdown()
+        cap_key = "cold" if tier_label.startswith("cold") else tier_label
+        max_total = tier_caps.get(cap_key, apify.COLD_BATCH_MAX_TWEETS)
+        since = _tier_since(state_con, handles)
+        if since is None:
+            since = datetime.now(timezone.utc) - timedelta(hours=apify.APIFY_COLDSTART_LOOKBACK_H)
+            log.info(f"  tier={tier_label} cold-start since={since.isoformat()} ({apify.APIFY_COLDSTART_LOOKBACK_H}h)")
+
+        try:
+            fetched, fetch_stats = apify.fetch_tweets_for_handles(handles, since=since, max_total=max_total)
+        except ShutdownRequested:
+            raise
+        except Exception as e:
+            log.error(f"  ✗ Apify batch failed for tier={tier_label}: {e}")
+            for u in handles:
+                _state_record_error(state_con, u, "")
+            stats["failed"] += len(handles)
+            continue
+
+        # Reflect the fetcher's RT drops in the shared per-cycle counter so
+        # the "Filters this cycle" telemetry stays consistent across sources.
+        _filter_counters["skipped_retweet"] += fetch_stats.dropped_retweet
+
+        # Cost is the items the actor returned (incl. retweets we drop locally),
+        # not what we kept downstream — Apify charges by result.
+        try:
+            apify.budget_increment(state_con, max(fetch_stats.raw, 0))
+        except Exception as e:
+            log.warning(f"  ⚠ Could not record budget usage: {e}")
+
+        # Group kept items by lowercased author.
+        by_user: dict[str, list[dict]] = defaultdict(list)
+        for t in fetched:
+            by_user[t.author_username].append(t.to_pipeline_dict())
+
+        for username in handles:
+            _check_shutdown()
+            user_tweets = by_user.get(username.lower(), [])
+            try:
+                result = _process_user_with_tweets(
+                    username, user_tweets, state_con, cache_con,
+                    uid="", profile=None,
+                )
+                if result:
+                    stats["processed"] += 1
+                    stats["total_inserted"] += result["inserted"]
+                    stats["total_fetched"]  += result["fetched"]
+                    if result["inserted"] > 0 or result["fetched"] > 0:
+                        log.info(
+                            f"  ✓ @{username}: {result['fetched']} fetched, "
+                            f"{result['inserted']} inserted, {result['skipped']} dup, "
+                            f"{result['noise']} noise"
+                        )
+                else:
+                    stats["failed"] += 1
+            except ShutdownRequested:
+                log.info(f"  Shutdown during @{username} — state is safe")
+                raise
+            except openai.AuthenticationError as e:
+                log.error(f"🔑 OpenAI auth error — aborting cycle: {e}")
+                raise
+            except Exception as e:
+                stats["failed"] += 1
+                _state_record_error(state_con, username, "")
+                log.error(f"  ✗ @{username} failed: {e}")
+
+    log.info(
+        f"🧹 Filters this cycle — "
+        f"skipped_retweet={_filter_counters['skipped_retweet']}, "
+        f"skipped_qt_short={_filter_counters['skipped_qt_short']}, "
+        f"skipped_whale_alert={_filter_counters['skipped_whale_alert']}"
+    )
+    final_used = apify.budget_used_today(state_con)
+    final_cost = final_used * apify.APIFY_PER_TWEET_USD
+    log.info(f"💰 Apify budget today: {final_used} tweets (~${final_cost:.2f})")
+    return stats
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  DAEMON LOOP
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_daemon(max_days=3, force_first_cycle=False):
     users = _resolve_user_list()
     log.info(f"🐦 Ingestor daemon starting — {len(users)} KOLs (all kept, dynamic tiering)")
+    log.info(f"   📡 Source: {INGESTOR_SOURCE}")
     log.info(f"   cycle interval={CYCLE_INTERVAL_S}s, max_days={max_days}")
     log.info(f"   LLM={LLM_MODEL}, Vision={VISION_ENABLED} ({VISION_MODEL})")
     log.info(f"   HL endpoint={HL_BASE_URL}")
     log.info(f"   🎯 Confidence threshold={CONFIDENCE_THRESHOLD}")
     log.info(f"   💰 COST MODE: hot={HOT_POLL_H}h, warm={WARM_POLL_H}h, cold={COLD_POLL_H}h")
-    log.info(f"   💰 Fetch: max_results=10(incr)/20(backfill), max_pages=3, profile_refresh={PROFILE_REFRESH_DAYS}d")
+    if INGESTOR_SOURCE == "apify":
+        from backend.ingestor import apify_source as apify
+        log.info(
+            f"   💰 Apify caps: hot={apify.HOT_BATCH_MAX_TWEETS}, "
+            f"warm={apify.WARM_BATCH_MAX_TWEETS}, cold={apify.COLD_BATCH_MAX_TWEETS} "
+            f"per cycle (daily budget {apify.APIFY_DAILY_BUDGET_TWEETS})"
+        )
+    else:
+        log.info(f"   💰 Fetch: max_results=10(incr)/20(backfill), max_pages=3, profile_refresh={PROFILE_REFRESH_DAYS}d")
 
     hl_tokens = get_hl_tokens()
     log.info(f"   📋 {len(hl_tokens)} tradeable tokens from HL")
@@ -1948,6 +2159,12 @@ def _resolve_user_list() -> List[str]:
         parts = [p.strip() for p in SCRAPE_USERS_ENV.split(",") if p.strip()]
         if parts:
             return parts
+    if INGESTOR_SOURCE == "apify":
+        # Temporary: curated alpha-leaning list. Replaced by an Airtable-driven
+        # `SELECT username FROM traders WHERE frequency_score >= X` query in a
+        # follow-up PR once Ethan's Master Frequency List sync lands.
+        from backend.ingestor.seed_handles import APIFY_SEED_HANDLES
+        return list(APIFY_SEED_HANDLES)
     return DEFAULT_USERS
 
 
